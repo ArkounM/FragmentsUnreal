@@ -17,13 +17,23 @@
 		{
 			"Name": "FragmentsUnreal",
 			"Type": "Runtime",
-			"LoadingPhase": "Default"
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"ProceduralMeshComponent",
+				"GeometryScriptingCore",
+				"GeometryCore"
+			]
 		}
 	],
-	"AdditionalDependencies": [
-		"ProceduralMeshComponent",
-		"GeometryScriptingCore",
-		"GeometryCore"
+	"Plugins": [
+		{
+			"Name": "ProceduralMeshComponent",
+			"Enabled": true
+		},
+		{
+			"Name": "GeometryScripting",
+			"Enabled": true
+		}
 	],
 	"Content": [
 		{
