@@ -32,6 +32,10 @@ public:
 	UFUNCTION(BlueprintCallable)
 	TArray<int32> GetElementsByCategory(const FString& InCategory, const FString& ModelGuid);
 
+	// Update Subsystem to use async
+	UFUNCTION(BlueprintCallable, Category = "Fragments")
+	void ProcessFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete);
+
 	FFragmentItem* GetFragmentItemByLocalId(int32 InLocalId, const FString& InModelGuid);
 	void GetItemData(FFragmentItem* InFragmentItem);
 

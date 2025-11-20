@@ -20,8 +20,40 @@
 #include "Importer/FragmentModelWrapper.h"
 #include "UObject/SavePackage.h"
 #include "Misc/ScopedSlowTask.h"
+#include "Importer/FragmentsAsyncLoader.h"
 
 
+void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete)
+{
+	// Create async loader if needed
+	if (!AsyncLoader)
+	{
+		AsyncLoader = NewObject<UFragmentsAsyncLoader>(this);
+	}
+
+	// Store callback
+	PendingCallback = OnComplete;
+
+	// Start Async Load
+	FOnFragmentLoadComplete LoadCallback;
+	LoadCallback.BindUFunction(this, FName("OnAsyncLoadComplete"));
+	AsyncLoader->LoadFragmentAsync(FragmentPath, LoadCallback);
+}
+
+void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& ErrorMessage, const FString& ModelGuid)
+{
+	if (!bSuccess)
+	{
+		UE_LOG(LogFragments, Error, TEXT("Async load failed: %s"), *ErrorMessage);
+		PendingCallback.ExecuteIfBound(false, ErrorMessage, TEXT(""));
+		return;
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("Async load complete: %s"), *ModelGuid);
+
+	// Just notify success for now
+	PendingCallback.ExecuteIfBound(true, TEXT(""), ModelGuid);
+}
 
 DEFINE_LOG_CATEGORY(LogFragments);
 

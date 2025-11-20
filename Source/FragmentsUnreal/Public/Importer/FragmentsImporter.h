@@ -7,13 +7,21 @@
 #include "Index/index_generated.h"
 #include "Utils/FragmentsUtils.h"
 #include "Importer/DeferredPackageSaveManager.h"
+#include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
 
 #include "FragmentsImporter.generated.h"
 
 
 FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
+
+// Forward Declarations
+class UFragmentsAsyncLoader;
+
+// Use FlatBuffers Model type
+using Model = ::Model;
+
 /**
- * 
+ * Core Fragments Importer
  */
 UCLASS()
 class FRAGMENTSUNREAL_API UFragmentsImporter :public UObject
@@ -21,6 +29,9 @@ class FRAGMENTSUNREAL_API UFragmentsImporter :public UObject
 	GENERATED_BODY()
 
 public:
+	// Adding new async loading function
+	UFUNCTION(BlueprintCallable, Category = "Fragments")
+	void ProcessFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete);
 
 	UFragmentsImporter();
 
@@ -40,6 +51,11 @@ public:
 	{
 		return FragmentModels;
 	}
+
+protected:
+	// Call when Async Loading Completes
+	UFUNCTION()
+	void OnAsyncLoadComplete(bool bSuccess, const FString& ErrorMessage, const FString& ModelGuid);
 
 private:
 
@@ -76,6 +92,23 @@ private:
 
 	void SavePackagesWithProgress(const TArray<UPackage*>& InPackagesToSave);
 
+	// Async Loader Instance
+	UPROPERTY()
+	UFragmentsAsyncLoader* AsyncLoader;
+
+	//Chunked spawning state
+	UPROPERTY()
+	bool bIsSpawning;
+
+	TQueue<FFragmentItem*>PendingSpawnQueue;
+	FTimerHandle SpawnChunkTimer;
+	FString CurrentSpawnGuid;
+
+	static constexpr int32 ITEMS_PER_TICK = 10; // Spawn 10 actors per tick
+
+	//Spawn chunk of actors
+	void SpawnActorsChunk();
+
 	// variables
 
 private:
@@ -102,6 +135,9 @@ private:
 	TArray<UPackage*> PackagesToSave;
 
 	FDeferredPackageSaveManager DeferredSaveManager;
+
+	// Pending Completion Callback
+	FOnFragmentLoadComplete PendingCallback;
 
 public:
 
