@@ -20,9 +20,17 @@ class UFragmentsAsyncLoader;
 // Use FlatBuffers Model type
 using Model = ::Model;
 
-/**
- * Core Fragments Importer
- */
+// Task for spawning a signle fragment
+struct FFragmentSpawnTask
+{
+	FFragmentItem FragmentItem;
+	AActor* ParentActor;
+
+	FFragmentSpawnTask() : ParentActor(nullptr) {}
+	FFragmentSpawnTask(const FFragmentItem& InItem, AActor* InParent)
+		: FragmentItem(InItem), ParentActor(InParent) {}
+};
+
 UCLASS()
 class FRAGMENTSUNREAL_API UFragmentsImporter :public UObject
 {
@@ -102,18 +110,18 @@ private:
 	UPROPERTY()
 	UFragmentsAsyncLoader* AsyncLoader;
 
-	//Chunked spawning state
-	UPROPERTY()
-	bool bIsSpawning;
+	// Chunked Spawning Functions
+	// Build flat queue of all fragments to spawn (recursive)
+	void BuildSpawnQueue(const FFragmentItem& Item, AActor* ParentActor, TArray<FFragmentSpawnTask>& OutQueue);
 
-	TQueue<FFragmentItem*>PendingSpawnQueue;
-	FTimerHandle SpawnChunkTimer;
-	FString CurrentSpawnGuid;
+	// Spawn a single fragment (non-recursive)
+	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes);
 
-	static constexpr int32 ITEMS_PER_TICK = 10; // Spawn 10 actors per tick
+	// Process one chunk of spawning
+	void ProcessSpawnChunk();
 
-
-	// variables
+	//Start Chunk Spawning
+	void StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes);
 
 private:
 
@@ -146,6 +154,34 @@ private:
 	// Owner actor for pending async spawn
 	UPROPERTY()
 	AActor* PendingOwner;
+
+	// CHUNKED SPAWNING MEMBERS
+	// Queue of fragments waiting to be spawned
+	TArray<FFragmentSpawnTask> PendingSpawnQueue;
+
+	// Meshes referencce for spawning
+	const Meshes* CurrentMeshesRef = nullptr;
+
+	// Save meshes flag
+	bool bCurrentSaveMeshes = false;
+
+	// Current model GUID being spawned 
+	FString CurrentSpawningModelGuid;
+
+	// Timer Handle for chunked spawning
+	FTimerHandle SpawnChunkTimerHandle;
+
+	// How many fragments to spawn per tick
+	int32 FragmentsPerChunk = 1;
+
+	// Current spawn progress (0.0 to 1.0)
+	float SpawnProgress = 0.0f;
+
+	// Total fragments to spawn
+	int32 TotalFragmentsToSpawn = 0;
+
+	// Fragments spawned thus far
+	int32 FragmentsSpawned = 0;
 
 public:
 

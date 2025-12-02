@@ -407,12 +407,13 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActor* InOwnerRef, bool bInSaveMesh)
 {
 	UE_LOG(LogFragments, Log, TEXT("ProcessLoadedFragment START - ModelGuid: %s, Owner: %p"), *InModelGuid, InOwnerRef);
+
 	// Check if model exists
 	if (!FragmentModels.Contains(InModelGuid))
 	{
-		UE_LOG(LogFragments, Log, TEXT("ProcessLoadedFragment: Model not in FragmentModels!"));
+		UE_LOG(LogFragments, Error, TEXT("ProcessLoadedFragment: Model not in FragmentModels!"));
+		return;
 	}
-
 
 	if (!InOwnerRef) return;
 
@@ -423,16 +424,12 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 
 	BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
 	BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
-	
-	FDateTime StartTime = FDateTime::Now();
-	SpawnFragmentModel(Wrapper->GetModelItem(), OwnerRef, ModelRef->meshes(), bInSaveMesh);
-	UE_LOG(LogFragments, Warning, TEXT("Loaded model in [%s]s -> %s"), *(FDateTime::Now() - StartTime).ToString(), *InModelGuid);
-	if (PackagesToSave.Num() > 0)
-	{
-		DeferredSaveManager.AddPackagesToSave(PackagesToSave);
-		PackagesToSave.Empty();
-	}
+
+	// Use chunked spawning instead of spawning all at once
+	UE_LOG(LogFragments, Log, TEXT("Starting chunked spawning for model: %s"), *InModelGuid);
+	StartChunkedSpawning(Wrapper->GetModelItem(), OwnerRef, ModelRef->meshes(), bInSaveMesh);
 }
+
 
 TArray<int32> UFragmentsImporter::GetElementsByCategory(const FString& InCategory, const FString& ModelGuid)
 {
@@ -886,6 +883,229 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 	{
 		SpawnFragmentModel(*Child, FragmentModel, MeshesRef, bSaveMeshes);
 	}
+}
+
+void UFragmentsImporter::BuildSpawnQueue(const FFragmentItem& Item, AActor* ParentActor, TArray<FFragmentSpawnTask>& OutQueue)
+{
+	// Add this fragmet to the queue
+	OutQueue.Add(FFragmentSpawnTask(Item, ParentActor));
+
+	// Note: We don't recursively add children here yet
+	// We'll handle parent-child relationships during spawning
+}
+
+AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes)
+{
+	if (!ParentActor) return nullptr;
+
+	// Create AFragment actor
+	AFragment* FragmentModel = OwnerRef->GetWorld()->SpawnActor<AFragment>(
+		AFragment::StaticClass(), Item.GlobalTransform);
+
+	if (!FragmentModel)
+	{
+		UE_LOG(LogFragments, Error, TEXT("Failed to spawn FragmentModel actor!"));
+		return nullptr;
+	}
+
+	// Root Component
+	USceneComponent* RootSceneComponent = NewObject<USceneComponent>(FragmentModel);
+	RootSceneComponent->RegisterComponent();
+	FragmentModel->SetRootComponent(RootSceneComponent);
+	RootSceneComponent->SetMobility(EComponentMobility::Movable);
+
+	// Set Transform and Info
+	FragmentModel->SetData(Item);
+	FragmentModel->AttachToActor(ParentActor, FAttachmentTransformRules::KeepWorldTransform);
+
+#if WITH_EDITOR
+	if (!FragmentModel->GetCategory().IsEmpty())
+		FragmentModel->SetActorLabel(FragmentModel->GetCategory());
+#endif
+
+	// Create Meshes If Sample Exists
+	const TArray<FFragmentSample>& Samples = FragmentModel->GetSamples();
+
+	if (Samples.Num() > 0)
+	{
+		for (int32 i = 0; i < Samples.Num(); i++)
+		{
+			const FFragmentSample& Sample = Samples[i];
+
+			FString MeshName = FString::Printf(TEXT("%d_%d"), FragmentModel->GetLocalId(), i);
+			FString PackagePath = TEXT("/Game/Buildings") / FragmentModel->GetModelGuid() / MeshName;
+			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
+
+			FString UniquePackageName = FPackageName::ObjectPathToPackageName(PackagePath);
+			FString PackageFileName = FPackageName::LongPackageNameToFilename(UniquePackageName, FPackageName::GetAssetPackageExtension());
+
+			const Material* material = MeshesRef->materials()->Get(Sample.MaterialIndex);
+			const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
+			const Transform* local_transform = MeshesRef->local_transforms()->Get(Sample.LocalTransformIndex);
+
+			FTransform LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
+
+			UStaticMesh* Mesh = nullptr;
+
+			// Check mesh cache first
+			if (MeshCache.Contains(SamplePath))
+			{
+				Mesh = MeshCache[SamplePath];
+			}
+			// Check if mesh exists on disk
+			else if (FPaths::FileExists(PackageFileName))
+			{
+				UPackage* ExistingPackage = LoadPackage(nullptr, *PackagePath, LOAD_None);
+				if (ExistingPackage)
+				{
+					Mesh = FindObject<UStaticMesh>(ExistingPackage, *MeshName);
+				}
+			}
+			// Create new mesh
+			else
+			{
+				UPackage* MeshPackage = CreatePackage(*PackagePath);
+				if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+				{
+					const auto* shell = MeshesRef->shells()->Get(representation->id());
+					Mesh = CreateStaticMeshFromShell(shell, material, *MeshName, MeshPackage);
+				}
+				else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
+				{
+					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
+					Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+				}
+
+				if (Mesh)
+				{
+					if (!FPaths::FileExists(PackageFileName) && bSaveMeshes)
+					{
+#if WITH_EDITOR
+						MeshPackage->FullyLoad();
+						Mesh->Rename(*MeshName, MeshPackage);
+						Mesh->SetFlags(RF_Public | RF_Standalone);
+						MeshPackage->MarkPackageDirty();
+						FAssetRegistryModule::AssetCreated(Mesh);
+						PackagesToSave.Add(MeshPackage);
+#endif
+					}
+				}
+
+				MeshCache.Add(SamplePath, Mesh);
+			}
+
+			if (Mesh)
+			{
+				// Add StaticMeshComponent to parent actor
+				UStaticMeshComponent* MeshComp = NewObject<UStaticMeshComponent>(FragmentModel);
+				MeshComp->SetStaticMesh(Mesh);
+				MeshComp->SetRelativeTransform(LocalTransform);
+				MeshComp->AttachToComponent(RootSceneComponent, FAttachmentTransformRules::KeepRelativeTransform);
+				MeshComp->RegisterComponent();
+				FragmentModel->AddInstanceComponent(MeshComp);
+			}
+		}
+	}
+
+	// Store in lookup map
+	if (ModelFragmentsMap.Contains(Item.ModelGuid))
+	{
+		ModelFragmentsMap[Item.ModelGuid].Fragments.Add(Item.LocalId, FragmentModel);
+	}
+
+	// NOTE: No recursive child spawning here - handled by chunking system
+
+	return FragmentModel;
+}
+
+void UFragmentsImporter::ProcessSpawnChunk()
+{
+	if (PendingSpawnQueue.Num() == 0)
+	{
+		// Spawning complete
+		UE_LOG(LogFragments, Log, TEXT("Chunked spawning complete! Total fragments: %d"), FragmentsSpawned);
+
+		// Clear timer
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(SpawnChunkTimerHandle);
+		}
+
+		// Save meshes if needed
+		if (PackagesToSave.Num() > 0)
+		{
+			DeferredSaveManager.AddPackagesToSave(PackagesToSave);
+			PackagesToSave.Empty();
+		}
+
+		//Notify Completion
+		PendingCallback.ExecuteIfBound(true, TEXT(""), CurrentSpawningModelGuid);
+		SpawnProgress = 1.0f;
+		return;
+	}
+
+	// Process a chunk
+	int32 ChunkSize = FMath::Min(FragmentsPerChunk, PendingSpawnQueue.Num());
+
+	for (int32 i = 0; i < ChunkSize; i++)
+	{
+		FFragmentSpawnTask Task = PendingSpawnQueue[0];
+		PendingSpawnQueue.RemoveAt(0);
+
+		// Spawn this fragment
+		AFragment* SpawnedActor = SpawnSingleFragment(Task.FragmentItem, Task.ParentActor, CurrentMeshesRef, bCurrentSaveMeshes);
+
+		if (SpawnedActor)
+		{
+			// Add children to queue with this actor as parent
+			for (FFragmentItem* Child : Task.FragmentItem.FragmentChildren)
+			{
+				PendingSpawnQueue.Add(FFragmentSpawnTask(*Child, SpawnedActor));
+				TotalFragmentsToSpawn++;
+			}
+		}
+
+		FragmentsSpawned++;
+
+	}
+
+	// Update Progress
+	SpawnProgress = (float)FragmentsSpawned / (float)FMath::Max(TotalFragmentsToSpawn, 1);
+
+	UE_LOG(LogFragments, Log, TEXT("Spawn progress: %d/%d (%.1f%%)"), FragmentsPerChunk, TotalFragmentsToSpawn, SpawnProgress * 100.0f);
+}
+
+void UFragmentsImporter::StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes)
+{
+	UE_LOG(LogFragments, Log, TEXT("Starting chunked spawning"));
+
+	// Reset State
+	PendingSpawnQueue.Empty();
+	FragmentsSpawned = 0;
+	TotalFragmentsToSpawn = 1; //Start with root
+	SpawnProgress = 0.0f;
+
+	// Store references
+	CurrentMeshesRef = MeshesRef;
+	bCurrentSaveMeshes = bSaveMeshes;
+	CurrentSpawningModelGuid = RootItem.ModelGuid;
+
+	// Add root to queue
+	PendingSpawnQueue.Add(FFragmentSpawnTask(RootItem, OwnerActor));
+
+	// Start timer to process chunks
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimer(
+			SpawnChunkTimerHandle,
+			this,
+			&UFragmentsImporter::ProcessSpawnChunk,
+			0.016f, // ~60 FPS 
+			true // Loop
+		);
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("Chunked Spawning Started. Processing %d fragments per frame."), FragmentsPerChunk);
 }
 
 UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef, const Material* RefMaterial, const FString& AssetName, UObject* OuterRef)
