@@ -4,6 +4,7 @@
 #include "HAL/PlatformFileManager.h"
 #include "Async/Async.h"
 #include "TimerManager.h"
+#include "Utils/FragmentsUtils.h"
 
 // for zlib decompression
 #include "zlib.h"
@@ -129,15 +130,17 @@ void FFragmentLoadTask::DoWork()
 }
 
 // LoadFragmentAsync -> Starts async task
-void UFragmentsAsyncLoader::LoadFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete)
+void UFragmentsAsyncLoader::LoadFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete, UFragmentsImporter* InImporter)
 {
 		// Don't start if already loading
 	if (bIsLoading)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("Already loading a fragment, ignoring new request"));
+
 		OnComplete.ExecuteIfBound(false, TEXT("Already loading"), TEXT(""));
 			return;
 		}
+
 	// Validate Path
 	if (!FPaths::FileExists(FragmentPath))
 	{
@@ -148,11 +151,14 @@ void UFragmentsAsyncLoader::LoadFragmentAsync(const FString& FragmentPath, FOnFr
 	// Store Callback
 	CompletionCallback = OnComplete;
 
-	// Get Importer Reference 
+	// Store the importer reference (passed from FragmentsImporter.cpp)
+	Importer = InImporter;
+
 	if (!Importer)
 	{
-		// Find or create importer
-		Importer = NewObject<UFragmentsImporter>(this);
+		UE_LOG(LogTemp, Error, TEXT("No importer provided to LoadFragmentAsync"));
+		OnComplete.ExecuteIfBound(false, TEXT("No Importer"), TEXT(""));
+		return;
 	}
 
 	// Create and start async task
@@ -202,8 +208,124 @@ void UFragmentsAsyncLoader::CheckTaskCompletion()
 
 		if (Task.bSuccess)
 		{
-			// For now, just log success - we'll implement model storage later
-			UE_LOG(LogTemp, Log, TEXT("Model loaded successfully: %s"), *Task.ModelGuid);
+			// Create Model Wrapper on Game Thread
+			UFragmentModelWrapper* Wrapper = NewObject<UFragmentModelWrapper>(Importer);
+
+			// Load the decompressed buffer into the wrapper
+			Wrapper->LoadModel(Task.DecompressedBuffer);
+
+			// Get the parsed models
+			const Model* ParsedModel = Wrapper->GetParsedModel();
+
+			if (ParsedModel && ParsedModel->spatial_structure())
+
+			{
+				// Create root FFragmentItem
+				FFragmentItem RootItem;
+				RootItem.ModelGuid = Task.ModelGuid;
+				RootItem.LocalId = -1; // Root should not have localID
+
+				// Build Hierarchy from spatial structure
+				UFragmentsUtils::MapModelStructureToData(
+					ParsedModel->spatial_structure(),
+					RootItem,
+					TEXT("") // No inherited category for root
+				);
+
+				// Store the hierarchy in the wrapper
+				Wrapper->SetModelItem(RootItem);
+
+				// Populate Samples
+				const Meshes* _meshes = ParsedModel->meshes();
+				const auto* local_ids = ParsedModel->local_ids();
+
+				if (_meshes && local_ids)
+				{
+					const auto* samples = _meshes->samples();
+					const auto* meshes_items = _meshes->meshes_items();
+					const auto* global_transforms = _meshes->global_transforms();
+
+					if (samples && meshes_items && global_transforms)
+					{
+						// Group samples by Item ID
+						TMap<int32, TArray<const Sample*>> SamplesByItem;
+						for (flatbuffers::uoffset_t i = 0; i < samples->size(); i++)
+						{
+							const auto* sample = samples->Get(i);
+							SamplesByItem.FindOrAdd(sample->item()).Add(sample);
+						}
+
+						UE_LOG(LogTemp, Log, TEXT("Found %d sample groups"), SamplesByItem.Num());
+
+						// Assign samples to corresponding fragment items
+						for (const auto& Item : SamplesByItem)
+						{
+							int32 ItemId = Item.Key;
+							const TArray<const Sample*> ItemSamples = Item.Value;
+
+							const auto mesh = meshes_items->Get(ItemId);
+							const auto local_id = local_ids->Get(ItemId);
+
+							// Find the fragment item with this local_id
+							FFragmentItem* FoundFragmentItem = nullptr;
+							if (Wrapper->GetModelItem().FindFragmentByLocalId(local_id, FoundFragmentItem))
+							{
+								// Populate item data (category, guid, attributes)
+								if (Importer)
+								{
+									Importer->GetItemData(FoundFragmentItem);
+								}
+
+								// Set global transform
+								const auto* global_transform = global_transforms->Get(mesh);
+								FTransform GlobalTransform = UFragmentsUtils::MakeTransform(global_transform);
+								FoundFragmentItem->GlobalTransform = GlobalTransform;
+
+								// Add all samples for this item
+								for (int32 i = 0; i < ItemSamples.Num(); i++)
+								{
+									const Sample* sample = ItemSamples[i];
+
+									FFragmentSample SampleInfo;
+									SampleInfo.SampleIndex = i;
+									SampleInfo.LocalTransformIndex = sample->local_transform();
+									SampleInfo.RepresentationIndex = sample->representation();
+									SampleInfo.MaterialIndex = sample->material();
+
+									FoundFragmentItem->Samples.Add(SampleInfo);
+								}
+
+								UE_LOG(LogTemp, Verbose, TEXT("Populated %d samples for LocalId %d"), ItemSamples.Num(), local_id);
+							}
+							else
+							{
+								UE_LOG(LogTemp, Warning, TEXT("Could not find FragmentItem for LocalId: %d"), local_id);
+							}
+						}
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("Model has no meshes or local_ids"));
+				}
+
+				// Store wrapper in importer's FragmentModels map
+				if (Importer)
+				{
+					Importer->GetFragmentModels_Mutable().Add(Task.ModelGuid, Wrapper);
+				}
+
+				UE_LOG(LogTemp, Log, TEXT("Model stored successfully: %s"), *Task.ModelGuid);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error, TEXT("Failed to parse spatial structure"));
+				CompletionCallback.ExecuteIfBound(false, TEXT("Invalid spatial structure"), TEXT(""));
+				delete CurrentTask;
+				CurrentTask = nullptr;
+				bIsLoading = false;
+				return;
+			}
 
 			// Notify completion
 			LoadProgress = 1.0f;

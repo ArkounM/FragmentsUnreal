@@ -31,7 +31,7 @@ class FRAGMENTSUNREAL_API UFragmentsImporter :public UObject
 public:
 	// Adding new async loading function
 	UFUNCTION(BlueprintCallable, Category = "Fragments")
-	void ProcessFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete);
+	void ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete);
 
 	UFragmentsImporter();
 
@@ -51,6 +51,12 @@ public:
 	{
 		return FragmentModels;
 	}
+	// Non-const version for async loader to add models
+	FORCEINLINE TMap<FString, class UFragmentModelWrapper*>& GetFragmentModels_Mutable()
+	{
+		return FragmentModels;
+	}
+
 
 protected:
 	// Call when Async Loading Completes
@@ -106,8 +112,6 @@ private:
 
 	static constexpr int32 ITEMS_PER_TICK = 10; // Spawn 10 actors per tick
 
-	//Spawn chunk of actors
-	void SpawnActorsChunk();
 
 	// variables
 
@@ -138,6 +142,10 @@ private:
 
 	// Pending Completion Callback
 	FOnFragmentLoadComplete PendingCallback;
+
+	// Owner actor for pending async spawn
+	UPROPERTY()
+	AActor* PendingOwner;
 
 public:
 

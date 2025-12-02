@@ -34,7 +34,7 @@ public:
 
 	// Update Subsystem to use async
 	UFUNCTION(BlueprintCallable, Category = "Fragments")
-	void ProcessFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete);
+	void ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete);
 
 	FFragmentItem* GetFragmentItemByLocalId(int32 InLocalId, const FString& InModelGuid);
 	void GetItemData(FFragmentItem* InFragmentItem);

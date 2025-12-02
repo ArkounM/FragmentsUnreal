@@ -23,7 +23,7 @@
 #include "Importer/FragmentsAsyncLoader.h"
 
 
-void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete)
+void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
 {
 	// Create async loader if needed
 	if (!AsyncLoader)
@@ -33,11 +33,12 @@ void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, FOnFr
 
 	// Store callback
 	PendingCallback = OnComplete;
+	PendingOwner = Owner;
 
 	// Start Async Load
 	FOnFragmentLoadComplete LoadCallback;
 	LoadCallback.BindUFunction(this, FName("OnAsyncLoadComplete"));
-	AsyncLoader->LoadFragmentAsync(FragmentPath, LoadCallback);
+	AsyncLoader->LoadFragmentAsync(FragmentPath, LoadCallback, this);
 }
 
 void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& ErrorMessage, const FString& ModelGuid)
@@ -50,6 +51,32 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 	}
 
 	UE_LOG(LogFragments, Log, TEXT("Async load complete: %s"), *ModelGuid);
+
+	// Verify model was stored
+	if (!FragmentModels.Contains(ModelGuid))
+	{
+		UE_LOG(LogFragments, Error, TEXT("Model not found in FragmentsModel after async load"));
+		PendingCallback.ExecuteIfBound(false, TEXT("Model not stored"), TEXT(""));
+		return;	
+	}
+
+	UE_LOG(LogFragments, Error, TEXT("About to call ProcessLoadedFragment for: %p"), PendingOwner);
+
+	// Set Owner reference before spawning
+	if (PendingOwner)
+	{
+		SetOwnerRef(PendingOwner);
+	}
+	else
+	{
+		UE_LOG(LogFragments, Warning, TEXT("No owner provided for async spawn"));
+	}
+
+	// Leverage existing ProcessLoadedFragment to spawn actors
+	// TEMP: Use nullptr owner and save meshes -> in the future this will be a passed obj and bool respectively
+	ProcessLoadedFragment(ModelGuid, PendingOwner, true);
+
+	UE_LOG(LogFragments, Error, TEXT("ProcessLoadedFragment returned for: %s"), *ModelGuid);
 
 	// Just notify success for now
 	PendingCallback.ExecuteIfBound(true, TEXT(""), ModelGuid);
@@ -379,6 +406,14 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 
 void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActor* InOwnerRef, bool bInSaveMesh)
 {
+	UE_LOG(LogFragments, Log, TEXT("ProcessLoadedFragment START - ModelGuid: %s, Owner: %p"), *InModelGuid, InOwnerRef);
+	// Check if model exists
+	if (!FragmentModels.Contains(InModelGuid))
+	{
+		UE_LOG(LogFragments, Log, TEXT("ProcessLoadedFragment: Model not in FragmentModels!"));
+	}
+
+
 	if (!InOwnerRef) return;
 
 	SetOwnerRef(InOwnerRef);
@@ -711,12 +746,26 @@ void UFragmentsImporter::SpawnFragmentModel(AFragment* InFragmentModel, AActor* 
 
 void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor* InParent, const Meshes* MeshesRef, bool bSaveMeshes)
 {
+	UE_LOG(LogFragments, Log, TEXT("SpawnFragmentModel Start - In Parent: %p, OwnerRef: %p"), InParent, OwnerRef);
+
 	if (!InParent) return;
+	{
+		UE_LOG(LogFragments, Error, TEXT("SpawnFragmentModel: InParent is NULL! Early return. "));
+	}
 
 	// Create AFragment
 
 	AFragment* FragmentModel = OwnerRef->GetWorld()->SpawnActor<AFragment>(
 		AFragment::StaticClass(), InFragmentItem.GlobalTransform);
+
+	if (!FragmentModel)
+	{
+		UE_LOG(LogFragments, Error, TEXT("Failed to spawn FragmentModel actor!"));
+		return;
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("Spawned FragmentModel: %s at %s"), *FragmentModel->GetName(),*InFragmentItem.GlobalTransform.ToString());
+	
 
 	// Root Component
 	USceneComponent* RootSceneComponent = NewObject<USceneComponent>(FragmentModel);
@@ -736,6 +785,8 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 
 	// Create Meshes If Sample Exists
 	const TArray<FFragmentSample>& Samples = FragmentModel->GetSamples();
+	UE_LOG(LogFragments, Log, TEXT("Processing %d samples for FragmentModel"), Samples.Num());
+
 	if (Samples.Num() > 0)
 	{
 		for (int32 i = 0; i < Samples.Num(); i++)

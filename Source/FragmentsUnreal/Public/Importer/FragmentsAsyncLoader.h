@@ -81,7 +81,7 @@ class FRAGMENTSUNREAL_API UFragmentsAsyncLoader : public UObject
 public:
 		// Start loading fragment file async
 		UFUNCTION(BlueprintCallable, Category = "Fragments")
-		void LoadFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete);
+		void LoadFragmentAsync(const FString& FragmentPath, FOnFragmentLoadComplete OnComplete, UFragmentsImporter* InImporter);
 
 		// Check if load is currently in progress
 		UFUNCTION(BlueprintPure, Category = "Fragments")
