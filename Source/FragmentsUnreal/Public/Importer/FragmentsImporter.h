@@ -8,7 +8,7 @@
 #include "Utils/FragmentsUtils.h"
 #include "Importer/DeferredPackageSaveManager.h"
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
-
+#include "Optimization/GeometryDeduplicationManager.h"
 #include "FragmentsImporter.generated.h"
 
 
@@ -65,6 +65,9 @@ public:
 		return FragmentModels;
 	}
 
+	UPROPERTY()
+	UGeometryDeduplicationManager* DeduplicationManager;
+
 
 protected:
 	// Call when Async Loading Completes
@@ -92,7 +95,8 @@ private:
 
 	FName AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial);
 
-	bool TriangulatePolygonWithHoles(const TArray<FVector>& Points,
+	bool TriangulatePolygonWithHoles(
+		const TArray<FVector>& Points,
 		const TArray<int32>& Profiles,
 		const TArray<TArray<int32>>& Holes,
 		TArray<FVector>& OutVertices,
@@ -122,6 +126,25 @@ private:
 
 	//Start Chunk Spawning
 	void StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes);
+
+	// Extract geometry from shell representation
+	void ExtractShellGeometry(
+		const Shell* ShellRef,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs
+	);
+
+	// Extract geometry from circle extrusion representation
+
+	void ExtractCircleExtrusionGeometry(
+		const CircleExtrusion* ExtrusionRef,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs
+	);
 
 private:
 
