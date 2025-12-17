@@ -8,6 +8,7 @@
 #include "Utils/FragmentsUtils.h"
 #include "Importer/DeferredPackageSaveManager.h"
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
+#include "Streaming/FragmentOctree.h"
 
 #include "FragmentsImporter.generated.h"
 
@@ -64,6 +65,26 @@ public:
 	{
 		return FragmentModels;
 	}
+
+	// ========== OCTREE STREAMING CONFIGURATION ==========
+
+	// Configuration for octree
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Streaming")
+	FFragmentOctreeConfig OctreeConfig;
+
+	// Maximum screen space error (pixels) for LOD
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Streaming|LOD", meta = (ClampMin = "1.0", ClampMax = "128.0"))
+	float MaximumScreenSpaceError = 16.0f;
+
+	// Whether to apply DPI scaling to LOD
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Streaming|LOD")
+	bool bApplyDpiScaling = true;
+
+	// Whether to enable octree streaming (if false, uses old spawning method)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Streaming")
+	bool bEnableOctreeStreaming = true;
+
+	// ========== END OCTREE STREAMING CONFIGURATION ==========
 
 
 protected:
@@ -147,6 +168,26 @@ private:
 	TArray<UPackage*> PackagesToSave;
 
 	FDeferredPackageSaveManager DeferredSaveManager;
+
+	// ========== OCTREE STREAMING SYSTEM ==========
+
+	// Octree for spatial subdivision
+	UPROPERTY()
+	TObjectPtr<UFragmentOctree> Octree;
+
+	// Tiles currently visible/loaded
+	TArray<TSharedPtr<FFragmentTile>> ActiveTiles;
+
+	// Build octree after model loaded
+	void BuildOctree();
+
+	// Update visible tiles based on camera
+	void UpdateVisibleTiles();
+
+	// Draw debug visualization of tiles
+	void DrawDebugTiles();
+
+	// ========== END OCTREE STREAMING SYSTEM ==========
 
 	// Pending Completion Callback
 	FOnFragmentLoadComplete PendingCallback;

@@ -302,6 +302,11 @@ void UFragmentsAsyncLoader::CheckTaskCompletion()
 								UE_LOG(LogTemp, Warning, TEXT("Could not find FragmentItem for LocalId: %d"), local_id);
 							}
 						}
+
+						// CRITICAL: Rebuild cache after populating transforms
+						// The cache was built before transforms were populated, so it has stale data
+						UE_LOG(LogTemp, Log, TEXT("Rebuilding fragment cache with updated transforms..."));
+						Wrapper->SetModelItem(Wrapper->GetModelItem());
 					}
 				}
 				else

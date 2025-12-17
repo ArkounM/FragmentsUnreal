@@ -22,6 +22,19 @@
 #include "Misc/ScopedSlowTask.h"
 #include "Importer/FragmentsAsyncLoader.h"
 
+// ========== CONSOLE COMMANDS ==========
+
+static TAutoConsoleVariable<bool> CVarFragmentsDebugTiles(
+	TEXT("fragments.DebugTiles"),
+	false,
+	TEXT("Draw debug visualization of fragment tiles (requires octree streaming enabled)\n")
+	TEXT("  0: Disabled (default)\n")
+	TEXT("  1: Show tile bounding boxes colored by state and level"),
+	ECVF_Default
+);
+
+// ========== END CONSOLE COMMANDS ==========
+
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
 {
@@ -57,7 +70,7 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 	{
 		UE_LOG(LogFragments, Error, TEXT("Model not found in FragmentsModel after async load"));
 		PendingCallback.ExecuteIfBound(false, TEXT("Model not stored"), TEXT(""));
-		return;	
+		return;
 	}
 
 	UE_LOG(LogFragments, Error, TEXT("About to call ProcessLoadedFragment for: %p"), PendingOwner);
@@ -72,6 +85,12 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 		UE_LOG(LogFragments, Warning, TEXT("No owner provided for async spawn"));
 	}
 
+	// Build octree if streaming is enabled
+	if (bEnableOctreeStreaming)
+	{
+		BuildOctree();
+	}
+
 	// Leverage existing ProcessLoadedFragment to spawn actors
 	// TEMP: Use nullptr owner and save meshes -> in the future this will be a passed obj and bool respectively
 	ProcessLoadedFragment(ModelGuid, PendingOwner, true);
@@ -81,6 +100,191 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 	// Just notify success for now
 	PendingCallback.ExecuteIfBound(true, TEXT(""), ModelGuid);
 }
+
+// ========== OCTREE STREAMING IMPLEMENTATION ==========
+
+void UFragmentsImporter::BuildOctree()
+{
+	// Get the current model wrapper
+	UFragmentModelWrapper* ModelWrapper = nullptr;
+	for (const auto& Pair : FragmentModels)
+	{
+		ModelWrapper = Pair.Value;
+		break; // Use the first (and typically only) model
+	}
+
+	if (!ModelWrapper)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("BuildOctree: No model wrapper found"));
+		return;
+	}
+
+	// Create octree
+	Octree = NewObject<UFragmentOctree>(this);
+
+	const double StartTime = FPlatformTime::Seconds();
+
+	bool bSuccess = Octree->BuildFromModel(ModelWrapper, OctreeConfig);
+
+	const double ElapsedTime = FPlatformTime::Seconds() - StartTime;
+
+	if (bSuccess)
+	{
+		TArray<int32> TileCounts = Octree->GetTileCountPerLevel();
+		FString CountsStr;
+		for (int32 i = 0; i < TileCounts.Num(); ++i)
+		{
+			CountsStr += FString::Printf(TEXT("L%d:%d "), i, TileCounts[i]);
+		}
+
+		UE_LOG(LogFragments, Log, TEXT("Octree built in %.2f seconds. Tiles per level: %s"),
+			ElapsedTime, *CountsStr);
+	}
+	else
+	{
+		UE_LOG(LogFragments, Error, TEXT("Failed to build octree"));
+	}
+}
+
+void UFragmentsImporter::UpdateVisibleTiles()
+{
+	if (!Octree || !bEnableOctreeStreaming)
+	{
+		return;
+	}
+
+	// Get the world
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// Get player camera
+	APlayerController* PC = World->GetFirstPlayerController();
+	if (!PC)
+	{
+		return;
+	}
+
+	FVector CameraLocation;
+	FRotator CameraRotation;
+	PC->GetPlayerViewPoint(CameraLocation, CameraRotation);
+
+	// Create frustum from camera
+	FConvexVolume Frustum;
+	FMatrix ViewMatrix = FRotationTranslationMatrix(CameraRotation, CameraLocation).Inverse();
+
+	// Get FOV from player camera
+	float VerticalFOV = 90.0f;
+	if (PC->PlayerCameraManager)
+	{
+		VerticalFOV = PC->PlayerCameraManager->GetFOVAngle();
+	}
+
+	// Get viewport size
+	FVector2D ViewportSize = FVector2D(1920.0f, 1080.0f);
+	if (GEngine && GEngine->GameViewport)
+	{
+		GEngine->GameViewport->GetViewportSize(ViewportSize);
+	}
+
+	// Calculate projection matrix
+	float AspectRatio = ViewportSize.X / ViewportSize.Y;
+	FMatrix ProjectionMatrix = FReversedZPerspectiveMatrix(
+		FMath::DegreesToRadians(VerticalFOV * 0.5f),
+		AspectRatio,
+		1.0f, // GNearClippingPlane
+		100000.0f // Far plane
+	);
+
+	// Create frustum from view-projection matrix
+	FMatrix ViewProjectionMatrix = ViewMatrix * ProjectionMatrix;
+	GetViewFrustumBounds(Frustum, ViewProjectionMatrix, false);
+
+	// Apply DPI scaling
+	float EffectiveSSE = MaximumScreenSpaceError;
+	float DpiScale = 1.0f;
+	if (bApplyDpiScaling && GEngine && GEngine->GameViewport)
+	{
+		// Get DPI scale from viewport if available
+		// For high-DPI displays, this will be > 1.0
+		DpiScale = GEngine->GameViewport->GetDPIScale();
+		EffectiveSSE *= DpiScale;
+	}
+
+	// Query visible tiles
+	TArray<TSharedPtr<FFragmentTile>> VisibleTiles = Octree->QueryVisibleTiles(
+		Frustum,
+		CameraLocation,
+		VerticalFOV,
+		ViewportSize.Y,
+		EffectiveSSE
+	);
+
+	UE_LOG(LogFragments, Verbose, TEXT("UpdateVisibleTiles: %d tiles visible (SSE: %.1f, DPI: %.2f)"),
+		VisibleTiles.Num(), EffectiveSSE, DpiScale);
+
+	// TODO: Load/unload tiles based on visibility
+	// For now, just store the active tiles
+	ActiveTiles = VisibleTiles;
+
+	// Draw debug visualization if enabled
+	if (CVarFragmentsDebugTiles.GetValueOnGameThread())
+	{
+		DrawDebugTiles();
+	}
+}
+
+void UFragmentsImporter::DrawDebugTiles()
+{
+#if !UE_BUILD_SHIPPING
+	if (!Octree || !bEnableOctreeStreaming)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// Get all tiles
+	TArray<FFragmentTile> AllTiles = Octree->GetAllTiles();
+
+	// Draw bounding boxes colored by state
+	for (const FFragmentTile& Tile : AllTiles)
+	{
+		FColor Color;
+		switch (Tile.State)
+		{
+			case EFragmentTileState::Visible:
+				// Color by level (green = low detail, red = high detail)
+				Color = FColor::MakeRedToGreenColorFromScalar(1.0f - (Tile.Level / 4.0f));
+				break;
+			case EFragmentTileState::Loading:
+				Color = FColor::Yellow;
+				break;
+			case EFragmentTileState::Loaded:
+				Color = FColor::Blue;
+				break;
+			default:
+				Color = FColor::White;
+				break;
+		}
+
+		DrawDebugBox(World, Tile.BoundingBox.GetCenter(), Tile.BoundingBox.GetExtent(),
+			Color, false, -1.0f, 0, 10.0f);
+
+		// Draw tile ID
+		DrawDebugString(World, Tile.BoundingBox.GetCenter(), Tile.TileID, nullptr,
+			Color, -1.0f, true, 1.0f);
+	}
+#endif
+}
+
+// ========== END OCTREE STREAMING IMPLEMENTATION ==========
 
 DEFINE_LOG_CATEGORY(LogFragments);
 
