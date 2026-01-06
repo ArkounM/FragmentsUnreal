@@ -116,4 +116,101 @@ AFragment* UFragmentsComponent::GetItemByLocalId(int32 LocalId, const FString& M
 	return nullptr;
 }
 
+void UFragmentsComponent::ProcessFragmentAsync(const FString& Path, FOnFragmentLoadComplete OnComplete)
+{
+	if (!FragmentsImporter)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ProcessFragmentAsync: No FragmentsImporter"));
+		OnComplete.ExecuteIfBound(false, TEXT("No importer"), TEXT(""));
+		return;
+	}
+
+	FragmentsImporter->ProcessFragmentAsync(Path, GetOwner(), OnComplete);
+}
+
+void UFragmentsComponent::StartTileStreaming()
+{
+	if (!FragmentsImporter)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("StartTileStreaming: No FragmentsImporter"));
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("StartTileStreaming: No World"));
+		return;
+	}
+
+	// Start camera update timer (5 times per second)
+	World->GetTimerManager().SetTimer(
+		CameraUpdateTimerHandle,
+		this,
+		&UFragmentsComponent::UpdateCameraStreaming,
+		0.2f, // Every 200ms
+		true  // Loop
+	);
+
+	UE_LOG(LogTemp, Log, TEXT("Tile streaming started"));
+}
+
+void UFragmentsComponent::StopTileStreaming()
+{
+	UWorld* World = GetWorld();
+	if (World && World->GetTimerManager().IsTimerActive(CameraUpdateTimerHandle))
+	{
+		World->GetTimerManager().ClearTimer(CameraUpdateTimerHandle);
+		UE_LOG(LogTemp, Log, TEXT("Tile streaming stopped"));
+	}
+}
+
+void UFragmentsComponent::UpdateCameraStreaming()
+{
+	if (!FragmentsImporter)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// Get first player controller
+	APlayerController* PC = World->GetFirstPlayerController();
+	if (!PC)
+	{
+		return;
+	}
+
+	// Get camera location and rotation
+	FVector CameraLocation;
+	FRotator CameraRotation;
+	PC->GetPlayerViewPoint(CameraLocation, CameraRotation);
+
+	// Get FOV (default to 90 if no camera manager)
+	float FOV = 90.0f;
+	if (PC->PlayerCameraManager)
+	{
+		FOV = PC->PlayerCameraManager->GetFOVAngle();
+	}
+
+	// Aspect ratio (default to 16:9)
+	float AspectRatio = 16.0f / 9.0f;
+	if (GEngine && GEngine->GameViewport)
+	{
+		FVector2D ViewportSize;
+		GEngine->GameViewport->GetViewportSize(ViewportSize);
+		if (ViewportSize.Y > 0)
+		{
+			AspectRatio = ViewportSize.X / ViewportSize.Y;
+		}
+	}
+
+	// Update tile streaming in importer
+	FragmentsImporter->UpdateTileStreaming(CameraLocation, CameraRotation, FOV, AspectRatio);
+}
+
 

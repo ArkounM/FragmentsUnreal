@@ -43,5 +43,32 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Importer")
 	AFragment* GetItemByLocalId(int32 LocalId, const FString& ModelGuid);
 
-	
+	/**
+	 * Load fragment asynchronously with automatic tile streaming
+	 * @param Path Path to .frag file
+	 * @param OnComplete Callback when loading finishes
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Importer")
+	void ProcessFragmentAsync(const FString& Path, FOnFragmentLoadComplete OnComplete);
+
+	/**
+	 * Start tile-based streaming (call after loading fragment)
+	 * Updates visible tiles based on camera frustum
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	void StartTileStreaming();
+
+	/**
+	 * Stop tile-based streaming
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	void StopTileStreaming();
+
+private:
+	// Timer handle for camera update
+	FTimerHandle CameraUpdateTimerHandle;
+
+	// Update camera streaming (called by timer)
+	void UpdateCameraStreaming();
 };
+

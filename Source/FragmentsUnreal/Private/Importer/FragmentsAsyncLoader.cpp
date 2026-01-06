@@ -315,6 +315,9 @@ void UFragmentsAsyncLoader::CheckTaskCompletion()
 					Importer->GetFragmentModels_Mutable().Add(Task.ModelGuid, Wrapper);
 				}
 
+				// Build spatial index for tile-based streaming
+				Wrapper->BuildSpatialIndex(Task.ModelGuid);
+
 				UE_LOG(LogTemp, Log, TEXT("Model stored successfully: %s"), *Task.ModelGuid);
 			}
 			else

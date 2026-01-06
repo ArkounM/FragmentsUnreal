@@ -16,6 +16,7 @@ FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
 
 // Forward Declarations
 class UFragmentsAsyncLoader;
+class UFragmentTileManager;
 
 // Use FlatBuffers Model type
 using Model = ::Model;
@@ -55,6 +56,13 @@ public:
 	TArray<int32> GetElementsByCategory(const FString& InCategory, const FString& ModelGuid);
 	void UnloadFragment(const FString& ModelGuid);
 
+	/**
+	 * Update tile streaming based on camera parameters
+	 * Called by FragmentsComponent to update visible tiles
+	 */
+	void UpdateTileStreaming(const FVector& CameraLocation, const FRotator& CameraRotation,
+	                         float FOV, float AspectRatio);
+
 	FORCEINLINE const TMap<FString, class UFragmentModelWrapper*>& GetFragmentModels() const
 	{
 		return FragmentModels;
@@ -65,6 +73,25 @@ public:
 		return FragmentModels;
 	}
 
+	// Get model wrapper by GUID
+	FORCEINLINE class UFragmentModelWrapper* GetFragmentModel(const FString& ModelGuid) const
+	{
+		UFragmentModelWrapper* const* Found = FragmentModels.Find(ModelGuid);
+		return Found ? *Found : nullptr;
+	}
+
+	// Get owner actor reference
+	FORCEINLINE AActor* GetOwnerRef() const { return OwnerRef; }
+
+	/**
+	 * Spawn a single fragment (used by TileManager for streaming)
+	 * @param Item Fragment item to spawn
+	 * @param ParentActor Parent actor to attach to
+	 * @param MeshesRef Meshes reference from FlatBuffers model
+	 * @param bSaveMeshes Whether to save meshes to disk
+	 * @return Spawned fragment actor or nullptr
+	 */
+	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes);
 
 protected:
 	// Call when Async Loading Completes
@@ -114,11 +141,11 @@ private:
 	// Build flat queue of all fragments to spawn (recursive)
 	void BuildSpawnQueue(const FFragmentItem& Item, AActor* ParentActor, TArray<FFragmentSpawnTask>& OutQueue);
 
-	// Spawn a single fragment (non-recursive)
-	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes);
-
 	// Process one chunk of spawning
 	void ProcessSpawnChunk();
+
+	// Process spawn chunks for all tile managers (called by timer)
+	void ProcessAllTileManagerChunks();
 
 	//Start Chunk Spawning
 	void StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes);
@@ -139,6 +166,10 @@ private:
 
 	UPROPERTY()
 	TMap<FString, FFragmentLookup> ModelFragmentsMap;
+
+	// Tile managers for streaming (one per loaded model)
+	UPROPERTY()
+	TMap<FString, UFragmentTileManager*> TileManagers;
 
 	UPROPERTY()
 	TMap<FString, UStaticMesh*> MeshCache;

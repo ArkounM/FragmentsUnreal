@@ -21,6 +21,7 @@
 #include "UObject/SavePackage.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Importer/FragmentsAsyncLoader.h"
+#include "Spatial/FragmentTileManager.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -425,9 +426,32 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 	BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
 	BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
 
-	// Use chunked spawning instead of spawning all at once
-	UE_LOG(LogFragments, Log, TEXT("Starting chunked spawning for model: %s"), *InModelGuid);
-	StartChunkedSpawning(Wrapper->GetModelItem(), OwnerRef, ModelRef->meshes(), bInSaveMesh);
+	// Create tile manager for streaming
+	UFragmentOctree* Octree = Wrapper->GetSpatialIndex();
+	if (!Octree)
+	{
+		UE_LOG(LogFragments, Error, TEXT("ProcessLoadedFragment: No spatial index for model %s"), *InModelGuid);
+		return;
+	}
+
+	UFragmentTileManager* TileManager = NewObject<UFragmentTileManager>(this);
+	TileManager->Initialize(InModelGuid, Octree, this);
+	TileManagers.Add(InModelGuid, TileManager);
+
+	// Start spawn processing timer if not already running
+	UWorld* World = GetWorld();
+	if (World && !World->GetTimerManager().IsTimerActive(SpawnChunkTimerHandle))
+	{
+		World->GetTimerManager().SetTimer(
+			SpawnChunkTimerHandle,
+			this,
+			&UFragmentsImporter::ProcessAllTileManagerChunks,
+			0.016f, // ~60 FPS
+			true // Repeat
+		);
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("Tile-based streaming started for model: %s"), *InModelGuid);
 }
 
 
@@ -1073,6 +1097,50 @@ void UFragmentsImporter::ProcessSpawnChunk()
 	SpawnProgress = (float)FragmentsSpawned / (float)FMath::Max(TotalFragmentsToSpawn, 1);
 
 	UE_LOG(LogFragments, Log, TEXT("Spawn progress: %d/%d (%.1f%%)"), FragmentsPerChunk, TotalFragmentsToSpawn, SpawnProgress * 100.0f);
+}
+
+void UFragmentsImporter::ProcessAllTileManagerChunks()
+{
+	// Process spawn chunks for all tile managers
+	for (auto& Pair : TileManagers)
+	{
+		UFragmentTileManager* TileManager = Pair.Value;
+		if (TileManager && TileManager->IsLoading())
+		{
+			TileManager->ProcessSpawnChunk();
+		}
+	}
+
+	// Check if all tile managers are idle
+	bool bAnyLoading = false;
+	for (auto& Pair : TileManagers)
+	{
+		if (Pair.Value && Pair.Value->IsLoading())
+		{
+			bAnyLoading = true;
+			break;
+		}
+	}
+
+	// If no tile managers are loading, we can stop the timer (it will restart when streaming updates)
+	if (!bAnyLoading && TileManagers.Num() > 0)
+	{
+		UE_LOG(LogFragments, Verbose, TEXT("All tile managers idle, timer continues for streaming updates"));
+	}
+}
+
+void UFragmentsImporter::UpdateTileStreaming(const FVector& CameraLocation, const FRotator& CameraRotation,
+                                              float FOV, float AspectRatio)
+{
+	// Update all tile managers with current camera
+	for (auto& Pair : TileManagers)
+	{
+		UFragmentTileManager* TileManager = Pair.Value;
+		if (TileManager)
+		{
+			TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio);
+		}
+	}
 }
 
 void UFragmentsImporter::StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes)

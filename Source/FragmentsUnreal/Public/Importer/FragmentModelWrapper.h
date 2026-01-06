@@ -6,6 +6,7 @@
 #include "UObject/NoExportTypes.h"
 #include "Index/index_generated.h"
 #include "Utils/FragmentsUtils.h"
+#include "Spatial/FragmentOctree.h"
 #include "FragmentModelWrapper.generated.h"
 
 /**
@@ -16,7 +17,7 @@ class FRAGMENTSUNREAL_API UFragmentModelWrapper : public UObject
 {
 	GENERATED_BODY()
 
-	
+
 private:
 
 	UPROPERTY()
@@ -25,6 +26,9 @@ private:
 	const Model* ParsedModel = nullptr;
 
 	FFragmentItem ModelItem;
+
+	UPROPERTY()
+	UFragmentOctree* SpatialIndex = nullptr;
 
 
 public:
@@ -38,5 +42,17 @@ public:
 
 	void SetModelItem(FFragmentItem InModelItem) { ModelItem = InModelItem; }
 	FFragmentItem GetModelItem() { return ModelItem; }
+	const FFragmentItem& GetModelItemRef() const { return ModelItem; }
+
+	/**
+	 * Build spatial index for this model
+	 * @param ModelGuid Model identifier
+	 */
+	void BuildSpatialIndex(const FString& ModelGuid);
+
+	/**
+	 * Get the spatial index
+	 */
+	UFragmentOctree* GetSpatialIndex() const { return SpatialIndex; }
 
 };

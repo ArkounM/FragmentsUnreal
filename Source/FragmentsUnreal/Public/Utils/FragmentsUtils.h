@@ -185,6 +185,29 @@ struct FFragmentItem
 		// If no match is found, return nullptr
 		return false;
 	}
+
+	// Const version
+	bool FindFragmentByLocalId(int32 InLocalId, FFragmentItem*& OutItem) const
+	{
+		// Check if the current item matches the LocalId
+		if (LocalId == InLocalId)
+		{
+			OutItem = const_cast<FFragmentItem*>(this);
+			return true;
+		}
+
+		// If not, search through all children recursively
+		for (FFragmentItem* Child : FragmentChildren)
+		{
+			if (Child->FindFragmentByLocalId(InLocalId, OutItem))
+			{
+				return true;
+			}
+		}
+
+		// If no match is found, return nullptr
+		return false;
+	}
 };
 
 /**
