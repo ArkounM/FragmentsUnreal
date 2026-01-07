@@ -1130,15 +1130,15 @@ void UFragmentsImporter::ProcessAllTileManagerChunks()
 }
 
 void UFragmentsImporter::UpdateTileStreaming(const FVector& CameraLocation, const FRotator& CameraRotation,
-                                              float FOV, float AspectRatio)
+                                              float FOV, float AspectRatio, float ViewportHeight)
 {
-	// Update all tile managers with current camera
+	// Update all tile managers with current camera (pass viewport height for SSE calculation)
 	for (auto& Pair : TileManagers)
 	{
 		UFragmentTileManager* TileManager = Pair.Value;
 		if (TileManager)
 		{
-			TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio);
+			TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
 		}
 	}
 }

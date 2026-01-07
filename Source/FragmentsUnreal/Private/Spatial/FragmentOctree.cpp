@@ -22,6 +22,24 @@ UFragmentOctree::~UFragmentOctree()
 	Tiles.Empty();
 }
 
+float UFragmentOctree::CalculateGeometricError(const FBox& Box)
+{
+	// Entwine 2.1 formula: max_half_extent / 8
+	// This ratio (0.125) balances performance (not loading too many tiles) with quality (no holes)
+	const FVector Extent = Box.GetExtent();
+
+	// Get magnitude of each half-extent (Extent is already the half-size)
+	const float hx = Extent.X;
+	const float hy = Extent.Y;
+	const float hz = Extent.Z;
+
+	// Take maximum half-extent
+	const float MaxHalfExtent = FMath::Max3(hx, hy, hz);
+
+	// Apply Entwine ratio (0.125 = 1/8)
+	return MaxHalfExtent / 8.0f;
+}
+
 void UFragmentOctree::BuildFromModel(const UFragmentModelWrapper* ModelWrapper, const FString& ModelGuid)
 {
 	if (!ModelWrapper)
@@ -224,13 +242,25 @@ void UFragmentOctree::BuildNode(FFragmentOctreeNode* Node, const TArray<int32>& 
 	{
 		// Create leaf tile
 		UFragmentTile* Tile = NewObject<UFragmentTile>(this);
-		Tile->Initialize(Node->Bounds);
+
+		// Calculate geometric error using Entwine 2.1 formula
+		float GeometricError = CalculateGeometricError(Node->Bounds);
+
+		// Apply root multiplier if this is root level (depth 0)
+		if (CurrentDepth == 0)
+		{
+			GeometricError *= GetRootErrorMultiplier();
+			UE_LOG(LogFragmentOctree, Log, TEXT("Root tile geometric error: %.2f (with %dx multiplier)"),
+			       GeometricError, static_cast<int32>(GetRootErrorMultiplier()));
+		}
+
+		Tile->Initialize(Node->Bounds, GeometricError);
 		Tile->FragmentLocalIDs = FragmentIDs;
 		Node->Tile = Tile;
 		Tiles.Add(Tile); // For memory management
 
-		UE_LOG(LogFragmentOctree, Verbose, TEXT("Created tile %d: %d fragments, bounds=%s"),
-		       Tiles.Num() - 1, FragmentIDs.Num(), *Node->Bounds.ToString());
+		UE_LOG(LogFragmentOctree, Verbose, TEXT("Created tile %d: %d fragments, bounds=%s, geomError=%.2f"),
+		       Tiles.Num() - 1, FragmentIDs.Num(), *Node->Bounds.ToString(), GeometricError);
 		return;
 	}
 

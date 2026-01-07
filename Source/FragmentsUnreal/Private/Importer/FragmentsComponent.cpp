@@ -197,20 +197,22 @@ void UFragmentsComponent::UpdateCameraStreaming()
 		FOV = PC->PlayerCameraManager->GetFOVAngle();
 	}
 
-	// Aspect ratio (default to 16:9)
+	// Get viewport dimensions (needed for SSE calculation)
+	float ViewportHeight = 1080.0f; // Default
 	float AspectRatio = 16.0f / 9.0f;
 	if (GEngine && GEngine->GameViewport)
 	{
 		FVector2D ViewportSize;
 		GEngine->GameViewport->GetViewportSize(ViewportSize);
+		ViewportHeight = ViewportSize.Y;
 		if (ViewportSize.Y > 0)
 		{
 			AspectRatio = ViewportSize.X / ViewportSize.Y;
 		}
 	}
 
-	// Update tile streaming in importer
-	FragmentsImporter->UpdateTileStreaming(CameraLocation, CameraRotation, FOV, AspectRatio);
+	// Update tile streaming in importer (pass viewport height for SSE calculation)
+	FragmentsImporter->UpdateTileStreaming(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
 }
 
 void UFragmentsComponent::SetShowDebugTileBounds(bool bShow)

@@ -87,6 +87,19 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Octree")
 	float MinTileSize = 1000.0f; // cm
 
+	/**
+	 * Calculate geometric error from bounding box (Entwine 2.1 formula)
+	 * @param Box Tile bounding box
+	 * @return Geometric error (max_half_extent / 8)
+	 */
+	static float CalculateGeometricError(const FBox& Box);
+
+	/**
+	 * Get root error multiplier for distant visibility
+	 * Higher values = visible from farther away (default: 16.0 for buildings)
+	 */
+	static float GetRootErrorMultiplier() { return 16.0f; }
+
 private:
 	FFragmentOctreeNode* Root = nullptr;
 

@@ -87,7 +87,7 @@ namespace
 }
 
 void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, const FRotator& CameraRotation,
-                                                float FOV, float AspectRatio)
+                                                float FOV, float AspectRatio, float ViewportHeight)
 {
 	if (!Octree || !Importer)
 	{
@@ -163,7 +163,7 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 	TArray<UFragmentTile*> FrustumTiles;
 	Octree->QueryVisibleTiles(Frustum, FrustumTiles);
 
-	// Filter by screen-space size
+	// Filter by screen-space error (SSE) using industry-standard Cesium formula
 	TArray<UFragmentTile*> NewVisibleTiles;
 	for (UFragmentTile* Tile : FrustumTiles)
 	{
@@ -172,23 +172,27 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 			continue;
 		}
 
-		// Calculate screen-space coverage
-		const float ScreenSize = CalculateTileScreenSize(Tile, CameraLocation, FOV);
+		// Calculate screen space error (Cesium/3D Tiles standard)
+		const float SSE = CalculateScreenSpaceError(Tile, CameraLocation, FOV, ViewportHeight);
 
-		// Only load tiles with sufficient screen coverage
-		if (ScreenSize >= MinScreenCoverage)
+		// CRITICAL: Load tile if SSE >= threshold (more error = needs refinement)
+		// This is INVERTED from old logic (screen coverage)
+		if (SSE >= MaximumScreenSpaceError)
 		{
 			NewVisibleTiles.Add(Tile);
+
+			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile LOAD: SSE=%.2f >= threshold=%.2f (geomErr=%.2f)"),
+			       SSE, MaximumScreenSpaceError, Tile->GeometricError);
 		}
 		else
 		{
-			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile %p culled: screen size %.4f < min %.4f"),
-			       Tile, ScreenSize, MinScreenCoverage);
+			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile SKIP: SSE=%.2f < threshold=%.2f (sufficient quality)"),
+			       SSE, MaximumScreenSpaceError);
 		}
 	}
 
-	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Camera update: %d frustum tiles, %d after screen filter"),
-	       FrustumTiles.Num(), NewVisibleTiles.Num());
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Camera update: %d frustum tiles, %d after SSE filter (threshold=%.1fpx)"),
+	       FrustumTiles.Num(), NewVisibleTiles.Num(), MaximumScreenSpaceError);
 
 	// Store camera state for priority sorting
 	LastPriorityCameraLocation = CameraLocation;
@@ -789,35 +793,42 @@ FConvexVolume UFragmentTileManager::BuildCameraFrustum(const FVector& CameraLoca
 	return Frustum;
 }
 
-float UFragmentTileManager::CalculateTileScreenSize(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const
+float UFragmentTileManager::CalculateScreenSpaceError(const UFragmentTile* Tile,
+                                                       const FVector& CameraLocation,
+                                                       float FOV,
+                                                       float ViewportHeight) const
 {
 	if (!Tile)
 	{
 		return 0.0f;
 	}
 
-	// Use closest point on bounds instead of center (better for zoom scenarios)
-	const float DistanceToTile = FMath::Max(1.0f, Tile->Bounds.ComputeSquaredDistanceToPoint(CameraLocation));
-	const float Distance = FMath::Sqrt(DistanceToTile);
-
-	// Get tile size (largest dimension)
-	const float TileSize = Tile->Bounds.GetSize().GetMax();
+	// Use closest point on bounds (not center) for accurate distance calculation
+	const float DistanceSquared = Tile->Bounds.ComputeSquaredDistanceToPoint(CameraLocation);
+	const float Distance = FMath::Sqrt(FMath::Max(1.0f, DistanceSquared));
 
 	// Avoid division by zero for very close distances
 	if (Distance < 1.0f)
 	{
-		return 1.0f; // Treat as full screen if inside tile
+		return 100000.0f; // Extremely high SSE forces immediate refinement
 	}
 
-	// Calculate vertical view dimension at tile distance
+	// Cesium/3D Tiles standard formula:
+	// SSE = (geometricError × viewportHeight) / (2 × distance × tan(fov/2))
+
 	const float HalfFOVRadians = FMath::DegreesToRadians(FOV * 0.5f);
-	const float VerticalViewDimension = 2.0f * Distance * FMath::Tan(HalfFOVRadians);
+	const float TanHalfFOV = FMath::Tan(HalfFOVRadians);
 
-	// Calculate screen coverage as ratio (0.0 to 1.0+)
-	// Returns fraction of screen height occupied by tile
-	const float ScreenCoverage = TileSize / VerticalViewDimension;
+	// Avoid division by zero
+	if (TanHalfFOV < KINDA_SMALL_NUMBER)
+	{
+		return 0.0f;
+	}
 
-	return ScreenCoverage;
+	const float SSEDenominator = 2.0f * Distance * TanHalfFOV;
+	const float ScreenSpaceError = (Tile->GeometricError * ViewportHeight) / SSEDenominator;
+
+	return ScreenSpaceError;
 }
 
 float UFragmentTileManager::CalculateTilePriority(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const
@@ -827,24 +838,26 @@ float UFragmentTileManager::CalculateTilePriority(const UFragmentTile* Tile, con
 		return 0.0f;
 	}
 
-	// Priority factors:
-	// 1. Screen-space size (larger on screen = higher priority)
+	// Priority factors (using SSE-based approach):
+	// 1. Geometric error / distance ratio (higher = more important visually)
 	// 2. Distance (closer = higher priority)
 	// 3. Fragment count (more fragments = higher priority for visual completeness)
 
-	const float ScreenSize = CalculateTileScreenSize(Tile, CameraLocation, FOV);
 	const FVector TileCenter = Tile->Bounds.GetCenter();
-	const float Distance = FVector::Dist(CameraLocation, TileCenter);
+	const float Distance = FMath::Max(100.0f, FVector::Dist(CameraLocation, TileCenter));
 	const float FragmentCount = static_cast<float>(Tile->FragmentLocalIDs.Num());
 
-	// Screen size weight: 100.0 (most important)
-	// Distance weight: inverse, normalized to 0-10 range (10000cm = priority 1.0)
-	// Fragment count weight: 0.01 (minor influence, breaks ties)
+	// Geometric error / distance = relative visual importance (higher = more important)
+	const float ErrorRatio = Tile->GeometricError / Distance;
 
-	const float DistancePriority = FMath::Clamp(10000.0f / FMath::Max(Distance, 100.0f), 0.0f, 10.0f);
+	// Distance priority: inverse, normalized (closer = higher)
+	const float DistancePriority = FMath::Clamp(10000.0f / Distance, 0.0f, 10.0f);
+
+	// Fragment count weight: minor influence, breaks ties
 	const float FragmentPriority = FragmentCount * 0.01f;
 
-	const float Priority = (ScreenSize * 100.0f) + DistancePriority + FragmentPriority;
+	// Combined priority (error ratio is most important)
+	const float Priority = (ErrorRatio * 100000.0f) + DistancePriority + FragmentPriority;
 
 	return Priority;
 }

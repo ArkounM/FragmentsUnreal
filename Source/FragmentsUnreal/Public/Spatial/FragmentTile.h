@@ -31,6 +31,10 @@ public:
 	UPROPERTY()
 	FBox Bounds;
 
+	/** Geometric error in world units (Entwine 2.1: max_half_extent / 8) */
+	UPROPERTY()
+	float GeometricError;
+
 	// Fragment LocalIDs in this tile
 	UPROPERTY()
 	TArray<int32> FragmentLocalIDs;
@@ -59,6 +63,7 @@ public:
 
 	UFragmentTile()
 		: Bounds(ForceInit)
+		, GeometricError(0.0f)
 		, State(ETileState::Unloaded)
 		, TimeLeftFrustum(0.0f)
 		, CurrentSpawnIndex(0)
@@ -66,9 +71,10 @@ public:
 	{
 	}
 
-	void Initialize(const FBox& InBounds)
+	void Initialize(const FBox& InBounds, float InGeometricError)
 	{
 		Bounds = InBounds;
+		GeometricError = InGeometricError;
 		State = ETileState::Unloaded;
 		TimeLeftFrustum = 0.0f;
 		CurrentSpawnIndex = 0;

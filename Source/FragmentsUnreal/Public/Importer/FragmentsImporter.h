@@ -61,7 +61,7 @@ public:
 	 * Called by FragmentsComponent to update visible tiles
 	 */
 	void UpdateTileStreaming(const FVector& CameraLocation, const FRotator& CameraRotation,
-	                         float FOV, float AspectRatio);
+	                         float FOV, float AspectRatio, float ViewportHeight);
 
 	FORCEINLINE const TMap<FString, class UFragmentModelWrapper*>& GetFragmentModels() const
 	{

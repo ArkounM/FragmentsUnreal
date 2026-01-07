@@ -35,9 +35,10 @@ public:
 	 * @param CameraRotation Camera rotation
 	 * @param FOV Field of view in degrees
 	 * @param AspectRatio Screen aspect ratio (width/height)
+	 * @param ViewportHeight Viewport height in pixels (for SSE calculation)
 	 */
 	void UpdateVisibleTiles(const FVector& CameraLocation, const FRotator& CameraRotation,
-	                        float FOV, float AspectRatio);
+	                        float FOV, float AspectRatio, float ViewportHeight);
 
 	/**
 	 * Process one spawn chunk (called per frame by timer)
@@ -85,9 +86,9 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.0", ClampMax = "90.0"))
 	float MinCameraRotation = 10.0f;
 
-	/** Minimum screen coverage to load tile (0.0001 = 0.01% of screen, very permissive) */
-	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.00001", ClampMax = "1.0"))
-	float MinScreenCoverage = 0.0001f;
+	/** Maximum screen space error in pixels (Cesium default: 16, lower = higher quality) */
+	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "1.0", ClampMax = "128.0"))
+	float MaximumScreenSpaceError = 16.0f;
 
 	// --- Cache Configuration ---
 
@@ -251,13 +252,16 @@ private:
 	                                  float FOV, float AspectRatio) const;
 
 	/**
-	 * Calculate screen-space size of a tile
-	 * @param Tile Tile to measure
-	 * @param CameraLocation Camera position
+	 * Calculate screen space error for tile (Cesium/3D Tiles standard)
+	 * SSE = (geometricError × viewportHeight) / (2 × distance × tan(fov/2))
+	 * @param Tile Tile to evaluate
+	 * @param CameraLocation Camera world position
 	 * @param FOV Field of view in degrees
-	 * @return Screen ratio (0.0 to 1.0+) where 1.0 = full screen
+	 * @param ViewportHeight Viewport height in pixels
+	 * @return Screen space error in pixels
 	 */
-	float CalculateTileScreenSize(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const;
+	float CalculateScreenSpaceError(const UFragmentTile* Tile, const FVector& CameraLocation,
+	                                 float FOV, float ViewportHeight) const;
 
 	/**
 	 * Calculate loading priority for a tile
