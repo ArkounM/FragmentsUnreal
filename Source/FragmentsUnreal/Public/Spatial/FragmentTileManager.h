@@ -67,19 +67,71 @@ public:
 
 	/** How often to update visible tiles (seconds) */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
-	float CameraUpdateInterval = 0.2f;
+	float CameraUpdateInterval = 0.5f; // CHANGED from 0.2f (5 FPS → 2 FPS)
 
 	/** How long after leaving frustum before unloading (seconds) */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
-	float UnloadHysteresis = 5.0f;
+	float UnloadHysteresis = 10.0f; // CHANGED from 5.0f
 
-	/** Number of fragments to spawn per chunk (1 = one per frame) */
-	UPROPERTY(EditAnywhere, Category = "Streaming")
-	int32 FragmentsPerChunk = 1;
+	/** Maximum time to spend spawning per frame (milliseconds) */
+	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "1.0", ClampMax = "16.0"))
+	float MaxSpawnTimeMs = 4.0f; // 4ms like engine_fragment
 
 	/** Minimum camera movement to trigger update (cm) */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
-	float MinCameraMovement = 500.0f;
+	float MinCameraMovement = 2500.0f; // CHANGED from 500.0f (5m → 25m)
+
+	/** Minimum camera rotation to trigger update (degrees) */
+	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+	float MinCameraRotation = 10.0f;
+
+	/** Minimum screen coverage to load tile (0.01 = 1% of screen) */
+	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.001", ClampMax = "1.0"))
+	float MinScreenCoverage = 0.01f;
+
+	// --- Cache Configuration ---
+
+	/** Maximum memory budget for tile cache in bytes (default: 512 MB) */
+	UPROPERTY(EditAnywhere, Category = "Streaming|Cache")
+	int64 MaxCachedBytes = 512 * 1024 * 1024;
+
+	/** Enable tile caching (hide tiles instead of destroying them) */
+	UPROPERTY(EditAnywhere, Category = "Streaming|Cache")
+	bool bEnableTileCache = true;
+
+	/** Use device RAM to auto-calculate cache budget (100 MB per GB) */
+	UPROPERTY(EditAnywhere, Category = "Streaming|Cache")
+	bool bAutoDetectCacheBudget = true;
+
+	/** Minimum time a tile must be out of frustum before being eligible for eviction (seconds) */
+	UPROPERTY(EditAnywhere, Category = "Streaming|Cache")
+	float MinTimeBeforeUnload = 10.0f;
+
+	// --- Cache Statistics ---
+
+	/** Get current cache usage in megabytes */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	float GetCacheUsageMB() const { return CurrentCacheBytes / (1024.0f * 1024.0f); }
+
+	/** Get cache limit in megabytes */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	float GetCacheLimitMB() const { return MaxCachedBytes / (1024.0f * 1024.0f); }
+
+	/** Get cache usage as percentage (0-100) */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	float GetCacheUsagePercent() const
+	{
+		if (MaxCachedBytes == 0) return 0.0f;
+		return (CurrentCacheBytes * 100.0f) / MaxCachedBytes;
+	}
+
+	/** Get number of loaded tiles (in cache) */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	int32 GetLoadedTileCount() const { return LoadedTiles.Num(); }
+
+	/** Get number of visible tiles */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	int32 GetVisibleTileCount() const { return VisibleTiles.Num(); }
 
 private:
 	// --- State ---
@@ -106,8 +158,17 @@ private:
 	/** Last camera position used for update */
 	FVector LastCameraPosition = FVector::ZeroVector;
 
+	/** Last camera rotation used for update */
+	FRotator LastCameraRotation = FRotator::ZeroRotator;
+
 	/** Last update time */
 	double LastUpdateTime = 0.0;
+
+	/** Last camera location for priority sorting */
+	FVector LastPriorityCameraLocation = FVector::ZeroVector;
+
+	/** Last FOV for priority sorting */
+	float LastPriorityFOV = 90.0f;
 
 	/** Total fragments to spawn across all loading tiles */
 	int32 TotalFragmentsToSpawn = 0;
@@ -120,6 +181,15 @@ private:
 
 	/** Current loading stage description */
 	FString LoadingStage = TEXT("Idle");
+
+	// --- Cache State ---
+
+	/** Current memory used by cached tiles (bytes) */
+	int64 CurrentCacheBytes = 0;
+
+	/** Last used time for each tile (for LRU eviction) */
+	UPROPERTY()
+	TMap<UFragmentTile*, double> TileLastUsedTime;
 
 	// --- Helper Methods ---
 
@@ -172,6 +242,25 @@ private:
 	                                  float FOV, float AspectRatio) const;
 
 	/**
+	 * Calculate screen-space size of a tile
+	 * @param Tile Tile to measure
+	 * @param CameraLocation Camera position
+	 * @param FOV Field of view in degrees
+	 * @return Screen ratio (0.0 to 1.0+) where 1.0 = full screen
+	 */
+	float CalculateTileScreenSize(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const;
+
+	/**
+	 * Calculate loading priority for a tile
+	 * Higher priority = load first
+	 * @param Tile Tile to prioritize
+	 * @param CameraLocation Camera position
+	 * @param FOV Field of view
+	 * @return Priority score (higher = more important)
+	 */
+	float CalculateTilePriority(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const;
+
+	/**
 	 * Update spawn progress tracking
 	 */
 	void UpdateSpawnProgress();
@@ -207,4 +296,24 @@ private:
 	 * @return Parent FFragmentItem or nullptr if not found/is root
 	 */
 	FFragmentItem* FindParentFragmentItem(const FFragmentItem* Root, const FFragmentItem* Target);
+
+	// --- Cache Management Methods ---
+
+	/**
+	 * Calculate approximate memory usage of a tile
+	 * @param Tile Tile to measure
+	 * @return Memory usage in bytes
+	 */
+	int64 CalculateTileMemoryUsage(UFragmentTile* Tile) const;
+
+	/**
+	 * Evict least recently used tiles to fit under memory budget
+	 */
+	void EvictTilesToFitBudget();
+
+	/**
+	 * Mark tile as recently used (updates LRU tracking)
+	 * @param Tile Tile that was accessed
+	 */
+	void TouchTile(UFragmentTile* Tile);
 };

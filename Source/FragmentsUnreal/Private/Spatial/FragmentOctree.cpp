@@ -335,10 +335,16 @@ void UFragmentOctree::QueryNodeFrustum(FFragmentOctreeNode* Node, const FConvexV
 		return;
 	}
 
-	// Test bounds against frustum
-	if (!Frustum.IntersectBox(Node->Bounds.GetCenter(), Node->Bounds.GetExtent()))
+	// Test node bounds against frustum with margin
+	FVector Center = Node->Bounds.GetCenter();
+	FVector Extent = Node->Bounds.GetExtent();
+
+	// Add 20% margin to prevent premature culling when zooming
+	const FVector ExpandedExtent = Extent * 1.2f;
+
+	if (!Frustum.IntersectBox(Center, ExpandedExtent))
 	{
-		return; // Early out - entire node outside frustum
+		return; // Node completely outside frustum (with margin)
 	}
 
 	// Leaf node - add tile

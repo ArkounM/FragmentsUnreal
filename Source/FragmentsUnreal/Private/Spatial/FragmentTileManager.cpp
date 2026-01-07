@@ -8,6 +8,26 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogFragmentTileManager, Log, All);
 
+namespace
+{
+	/** Calculate memory budget based on device RAM (100 MB per GB like engine_fragment) */
+	int64 CalculateDeviceMemoryBudget()
+	{
+		const int32 PhysicalGB = FPlatformMemory::GetPhysicalGBRam();
+
+		// Clamp to reasonable range
+		const int32 ClampedGB = FMath::Clamp(PhysicalGB, 2, 64);
+
+		// 100 MB per GB of system RAM
+		const int64 Budget = static_cast<int64>(ClampedGB) * 100 * 1024 * 1024;
+
+		UE_LOG(LogFragmentTileManager, Log, TEXT("Device RAM: %d GB, Cache budget: %lld MB"),
+		       PhysicalGB, Budget / (1024 * 1024));
+
+		return Budget;
+	}
+}
+
 UFragmentTileManager::UFragmentTileManager()
 {
 }
@@ -32,9 +52,17 @@ void UFragmentTileManager::Initialize(const FString& InModelGuid, UFragmentOctre
 	SpawnProgress = 0.0f;
 	LoadingStage = TEXT("Idle");
 	LastCameraPosition = FVector::ZeroVector;
+	LastCameraRotation = FRotator::ZeroRotator;
 	LastUpdateTime = 0.0;
 
-	UE_LOG(LogFragmentTileManager, Log, TEXT("TileManager initialized for model: %s"), *ModelGuid);
+	// Set device-aware memory budget (if auto-detect enabled)
+	if (bAutoDetectCacheBudget)
+	{
+		MaxCachedBytes = CalculateDeviceMemoryBudget();
+	}
+
+	UE_LOG(LogFragmentTileManager, Log, TEXT("TileManager initialized for model: %s, Cache budget: %lld MB"),
+	       *ModelGuid, MaxCachedBytes / (1024 * 1024));
 }
 
 void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, const FRotator& CameraRotation,
@@ -48,32 +76,75 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 	const double CurrentTime = FPlatformTime::Seconds();
 	const float TimeSinceUpdate = CurrentTime - LastUpdateTime;
 
-	// Check if update needed (time threshold OR significant movement)
+	// Check if update needed (time threshold OR significant movement OR significant rotation)
 	const bool bTimeThresholdMet = TimeSinceUpdate >= CameraUpdateInterval;
+
 	const float DistanceMoved = FVector::Dist(LastCameraPosition, CameraLocation);
 	const bool bMovedSignificantly = DistanceMoved >= MinCameraMovement;
 
-	if (!bTimeThresholdMet && !bMovedSignificantly)
+	// Check rotation change
+	const FRotator RotationDelta = CameraRotation - LastCameraRotation;
+	const float RotationChange = FMath::Max3(
+		FMath::Abs(RotationDelta.Pitch),
+		FMath::Abs(RotationDelta.Yaw),
+		FMath::Abs(RotationDelta.Roll)
+	);
+	const bool bRotatedSignificantly = RotationChange >= MinCameraRotation;
+
+	if (!bTimeThresholdMet && !bMovedSignificantly && !bRotatedSignificantly)
 	{
 		// Process unload timers even if not updating visible set
 		ProcessUnloadTimers(TimeSinceUpdate);
 		return;
 	}
 
+	UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Update triggered: time=%d move=%d (%.0fcm) rotate=%d (%.1fdeg)"),
+	       bTimeThresholdMet, bMovedSignificantly, DistanceMoved, bRotatedSignificantly, RotationChange);
+
 	// Build camera frustum
 	FConvexVolume Frustum = BuildCameraFrustum(CameraLocation, CameraRotation, FOV, AspectRatio);
 
-	// Query octree for visible tiles
-	TArray<UFragmentTile*> NewVisibleTiles;
-	Octree->QueryVisibleTiles(Frustum, NewVisibleTiles);
+	// Query octree for tiles intersecting frustum
+	TArray<UFragmentTile*> FrustumTiles;
+	Octree->QueryVisibleTiles(Frustum, FrustumTiles);
 
-	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Camera update: %d visible tiles found"), NewVisibleTiles.Num());
+	// Filter by screen-space size
+	TArray<UFragmentTile*> NewVisibleTiles;
+	for (UFragmentTile* Tile : FrustumTiles)
+	{
+		if (!Tile)
+		{
+			continue;
+		}
+
+		// Calculate screen-space coverage
+		const float ScreenSize = CalculateTileScreenSize(Tile, CameraLocation, FOV);
+
+		// Only load tiles with sufficient screen coverage
+		if (ScreenSize >= MinScreenCoverage)
+		{
+			NewVisibleTiles.Add(Tile);
+		}
+		else
+		{
+			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile %p culled: screen size %.4f < min %.4f"),
+			       Tile, ScreenSize, MinScreenCoverage);
+		}
+	}
+
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Camera update: %d frustum tiles, %d after screen filter"),
+	       FrustumTiles.Num(), NewVisibleTiles.Num());
+
+	// Store camera state for priority sorting
+	LastPriorityCameraLocation = CameraLocation;
+	LastPriorityFOV = FOV;
 
 	// Update tile states based on new visible set
 	UpdateTileStates(NewVisibleTiles);
 
 	// Update last update tracking
 	LastCameraPosition = CameraLocation;
+	LastCameraRotation = CameraRotation;
 	LastUpdateTime = CurrentTime;
 
 	// Process unload timers
@@ -93,6 +164,9 @@ void UFragmentTileManager::UpdateTileStates(const TArray<UFragmentTile*>& NewVis
 			continue;
 		}
 
+		// Mark tile as recently used (for LRU tracking)
+		TouchTile(Tile);
+
 		if (Tile->State == ETileState::Unloaded)
 		{
 			// Start loading this tile
@@ -100,8 +174,9 @@ void UFragmentTileManager::UpdateTileStates(const TArray<UFragmentTile*>& NewVis
 		}
 		else if (Tile->State == ETileState::Loaded)
 		{
-			// Already loaded, just show it
+			// Already loaded, just show it (cache hit!)
 			ShowTile(Tile);
+			UE_LOG(LogFragmentTileManager, Verbose, TEXT("Tile %p made visible from cache"), Tile);
 		}
 		else if (Tile->State == ETileState::Unloading)
 		{
@@ -123,11 +198,19 @@ void UFragmentTileManager::UpdateTileStates(const TArray<UFragmentTile*>& NewVis
 
 	for (UFragmentTile* Tile : TilesToHide)
 	{
+		// Hide tile but DON'T destroy actors (kept in cache)
 		HideTile(Tile);
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Tile %p hidden (kept in cache)"), Tile);
 	}
 
 	// Update visible tiles list
 	VisibleTiles = NewVisibleTiles;
+
+	// Check if we need to evict tiles due to memory budget
+	if (bEnableTileCache)
+	{
+		EvictTilesToFitBudget();
+	}
 
 	UpdateSpawnProgress();
 }
@@ -274,7 +357,11 @@ void UFragmentTileManager::UnloadTile(UFragmentTile* Tile)
 		return;
 	}
 
-	UE_LOG(LogFragmentTileManager, Log, TEXT("Unloading tile with %d actors"), Tile->SpawnedActors.Num());
+	// Calculate memory before destroying actors
+	int64 TileMemory = CalculateTileMemoryUsage(Tile);
+
+	UE_LOG(LogFragmentTileManager, Log, TEXT("Unloading tile with %d actors (%lld KB)"),
+	       Tile->SpawnedActors.Num(), TileMemory / 1024);
 
 	// Destroy all actors
 	for (AFragment* Actor : Tile->SpawnedActors)
@@ -294,6 +381,9 @@ void UFragmentTileManager::UnloadTile(UFragmentTile* Tile)
 	// Remove from loaded tiles
 	LoadedTiles.Remove(Tile);
 
+	// Update cache tracking
+	CurrentCacheBytes = FMath::Max((int64)0, CurrentCacheBytes - TileMemory);
+
 	// Update spawn tracking
 	TotalFragmentsToSpawn = FMath::Max(0, TotalFragmentsToSpawn - Tile->FragmentLocalIDs.Num());
 	FragmentsSpawned = FMath::Max(0, FragmentsSpawned - Tile->FragmentLocalIDs.Num());
@@ -308,18 +398,17 @@ void UFragmentTileManager::ProcessSpawnChunk()
 		return;
 	}
 
-	// Find first tile in Loading state
-	UFragmentTile* CurrentTile = nullptr;
+	// Find all tiles in Loading state
+	TArray<UFragmentTile*> LoadingTiles;
 	for (UFragmentTile* Tile : LoadedTiles)
 	{
 		if (Tile && Tile->State == ETileState::Loading)
 		{
-			CurrentTile = Tile;
-			break;
+			LoadingTiles.Add(Tile);
 		}
 	}
 
-	if (!CurrentTile)
+	if (LoadingTiles.Num() == 0)
 	{
 		// No tiles currently loading
 		if (TotalFragmentsToSpawn > 0 && FragmentsSpawned >= TotalFragmentsToSpawn)
@@ -334,36 +423,64 @@ void UFragmentTileManager::ProcessSpawnChunk()
 		return;
 	}
 
-	// Spawn fragments from this tile (up to FragmentsPerChunk)
-	int32 SpawnedThisFrame = 0;
-	while (SpawnedThisFrame < FragmentsPerChunk && CurrentTile->CurrentSpawnIndex < CurrentTile->FragmentLocalIDs.Num())
+	// Sort loading tiles by priority (highest first)
+	LoadingTiles.Sort([this](const UFragmentTile& A, const UFragmentTile& B)
 	{
-		if (SpawnFragmentFromTile(CurrentTile))
-		{
-			SpawnedThisFrame++;
-			FragmentsSpawned++;
-		}
-		else
-		{
-			// Spawn failed, skip this fragment
-			UE_LOG(LogFragmentTileManager, Warning, TEXT("Failed to spawn fragment"));
-		}
+		const float PriorityA = CalculateTilePriority(&A, LastPriorityCameraLocation, LastPriorityFOV);
+		const float PriorityB = CalculateTilePriority(&B, LastPriorityCameraLocation, LastPriorityFOV);
+		return PriorityB < PriorityA; // Descending order (highest priority first)
+	});
 
-		CurrentTile->CurrentSpawnIndex++;
-	}
+	// Time-based spawning - spawn from multiple tiles within budget
+	const double StartTime = FPlatformTime::Seconds();
+	const double MaxSpawnTimeSec = MaxSpawnTimeMs / 1000.0;
+	int32 TilesProcessedThisFrame = 0;
 
-	// Check if tile finished loading
-	if (CurrentTile->CurrentSpawnIndex >= CurrentTile->FragmentLocalIDs.Num())
+	// Spawn from multiple tiles in parallel within time budget
+	for (UFragmentTile* Tile : LoadingTiles)
 	{
-		CurrentTile->State = ETileState::Loaded;
-
-		// If this tile is in the visible set, show it
-		if (VisibleTiles.Contains(CurrentTile))
+		// Check time budget
+		const double ElapsedTime = FPlatformTime::Seconds() - StartTime;
+		if (ElapsedTime >= MaxSpawnTimeSec && TilesProcessedThisFrame > 0)
 		{
-			ShowTile(CurrentTile);
+			// Budget exhausted, stop for this frame
+			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Frame budget exhausted: %.2fms, %d tiles processed"),
+			       ElapsedTime * 1000.0, TilesProcessedThisFrame);
+			break;
 		}
 
-		UE_LOG(LogFragmentTileManager, Log, TEXT("Tile finished loading: %d fragments"), CurrentTile->FragmentLocalIDs.Num());
+		// Spawn one fragment from this tile
+		if (Tile->CurrentSpawnIndex < Tile->FragmentLocalIDs.Num())
+		{
+			if (SpawnFragmentFromTile(Tile))
+			{
+				FragmentsSpawned++;
+				TilesProcessedThisFrame++;
+			}
+			Tile->CurrentSpawnIndex++;
+		}
+
+		// Check if tile finished loading
+		if (Tile->CurrentSpawnIndex >= Tile->FragmentLocalIDs.Num())
+		{
+			Tile->State = ETileState::Loaded;
+
+			// Add to cache tracking
+			int64 TileMemory = CalculateTileMemoryUsage(Tile);
+			CurrentCacheBytes += TileMemory;
+
+			UE_LOG(LogFragmentTileManager, Log, TEXT("Tile finished loading: %d fragments, %lld KB - Cache: %lld MB / %lld MB"),
+			       Tile->FragmentLocalIDs.Num(),
+			       TileMemory / 1024,
+			       CurrentCacheBytes / (1024 * 1024),
+			       MaxCachedBytes / (1024 * 1024));
+
+			// If this tile is in the visible set, show it
+			if (VisibleTiles.Contains(Tile))
+			{
+				ShowTile(Tile);
+			}
+		}
 	}
 
 	UpdateSpawnProgress();
@@ -515,6 +632,63 @@ FConvexVolume UFragmentTileManager::BuildCameraFrustum(const FVector& CameraLoca
 	return Frustum;
 }
 
+float UFragmentTileManager::CalculateTileScreenSize(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const
+{
+	if (!Tile)
+	{
+		return 0.0f;
+	}
+
+	// Get tile dimensions and distance
+	const FVector TileCenter = Tile->Bounds.GetCenter();
+	const float Distance = FVector::Dist(CameraLocation, TileCenter);
+	const float TileSize = Tile->Bounds.GetSize().GetMax();
+
+	// Avoid division by zero for very close distances
+	if (Distance < 1.0f)
+	{
+		return 1.0f; // Treat as full screen if inside tile
+	}
+
+	// Calculate view dimension at tile distance
+	const float HalfFOVRadians = FMath::DegreesToRadians(FOV * 0.5f);
+	const float ViewDimension = Distance * FMath::Tan(HalfFOVRadians);
+
+	// Screen ratio: tile size / view size
+	const float ScreenRatio = TileSize / ViewDimension;
+
+	return ScreenRatio;
+}
+
+float UFragmentTileManager::CalculateTilePriority(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const
+{
+	if (!Tile)
+	{
+		return 0.0f;
+	}
+
+	// Priority factors:
+	// 1. Screen-space size (larger on screen = higher priority)
+	// 2. Distance (closer = higher priority)
+	// 3. Fragment count (more fragments = higher priority for visual completeness)
+
+	const float ScreenSize = CalculateTileScreenSize(Tile, CameraLocation, FOV);
+	const FVector TileCenter = Tile->Bounds.GetCenter();
+	const float Distance = FVector::Dist(CameraLocation, TileCenter);
+	const float FragmentCount = static_cast<float>(Tile->FragmentLocalIDs.Num());
+
+	// Screen size weight: 100.0 (most important)
+	// Distance weight: inverse, normalized to 0-10 range (10000cm = priority 1.0)
+	// Fragment count weight: 0.01 (minor influence, breaks ties)
+
+	const float DistancePriority = FMath::Clamp(10000.0f / FMath::Max(Distance, 100.0f), 0.0f, 10.0f);
+	const float FragmentPriority = FragmentCount * 0.01f;
+
+	const float Priority = (ScreenSize * 100.0f) + DistancePriority + FragmentPriority;
+
+	return Priority;
+}
+
 void UFragmentTileManager::UpdateSpawnProgress()
 {
 	if (TotalFragmentsToSpawn > 0)
@@ -571,4 +745,162 @@ bool UFragmentTileManager::IsLoading() const
 		}
 	}
 	return false;
+}
+
+void UFragmentTileManager::TouchTile(UFragmentTile* Tile)
+{
+	if (!Tile || !Importer)
+	{
+		return;
+	}
+
+	UWorld* World = Importer->GetWorld();
+	if (World)
+	{
+		TileLastUsedTime.Add(Tile, World->GetTimeSeconds());
+	}
+}
+
+int64 UFragmentTileManager::CalculateTileMemoryUsage(UFragmentTile* Tile) const
+{
+	if (!Tile)
+	{
+		return 0;
+	}
+
+	int64 TotalBytes = 0;
+
+	// Calculate memory from spawned actors
+	for (AFragment* Actor : Tile->SpawnedActors)
+	{
+		if (!Actor)
+		{
+			continue;
+		}
+
+		// Get all static mesh components
+		TArray<UStaticMeshComponent*> MeshComponents;
+		Actor->GetComponents<UStaticMeshComponent>(MeshComponents);
+
+		for (UStaticMeshComponent* MeshComp : MeshComponents)
+		{
+			if (!MeshComp || !MeshComp->GetStaticMesh())
+			{
+				continue;
+			}
+
+			UStaticMesh* Mesh = MeshComp->GetStaticMesh();
+
+			// Get mesh resource size
+			// Note: This is approximate - includes vertex buffer, index buffer, etc.
+			if (Mesh->GetRenderData())
+			{
+				for (const FStaticMeshLODResources& LOD : Mesh->GetRenderData()->LODResources)
+				{
+					// Vertex buffer
+					TotalBytes += LOD.VertexBuffers.PositionVertexBuffer.GetNumVertices() * sizeof(FVector);
+					TotalBytes += LOD.VertexBuffers.StaticMeshVertexBuffer.GetResourceSize();
+					TotalBytes += LOD.VertexBuffers.ColorVertexBuffer.GetNumVertices() * sizeof(FColor);
+
+					// Index buffer (UE5 API)
+					TotalBytes += LOD.IndexBuffer.GetAllocatedSize();
+				}
+			}
+
+			// Material instances (rough estimate)
+			TArray<UMaterialInterface*> Materials = MeshComp->GetMaterials();
+			TotalBytes += Materials.Num() * 1024;  // ~1 KB per material instance
+		}
+
+		// Actor overhead (rough estimate)
+		TotalBytes += 4096;  // ~4 KB per actor
+	}
+
+	return TotalBytes;
+}
+
+void UFragmentTileManager::EvictTilesToFitBudget()
+{
+	if (!Importer)
+	{
+		return;
+	}
+
+	UWorld* World = Importer->GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	double CurrentTime = World->GetTimeSeconds();
+
+	// Recalculate current cache usage
+	CurrentCacheBytes = 0;
+
+	for (UFragmentTile* Tile : LoadedTiles)
+	{
+		if (Tile && Tile->State == ETileState::Loaded)
+		{
+			CurrentCacheBytes += CalculateTileMemoryUsage(Tile);
+		}
+	}
+
+	// Check if we're over budget
+	if (CurrentCacheBytes <= MaxCachedBytes)
+	{
+		return;  // Within budget, no eviction needed
+	}
+
+	UE_LOG(LogFragmentTileManager, Warning, TEXT("Cache over budget: %lld MB / %lld MB - evicting tiles"),
+	       CurrentCacheBytes / (1024 * 1024),
+	       MaxCachedBytes / (1024 * 1024));
+
+	// Build list of eviction candidates (Loaded tiles only, not Visible)
+	TArray<UFragmentTile*> EvictionCandidates;
+
+	for (UFragmentTile* Tile : LoadedTiles)
+	{
+		if (!Tile || Tile->State != ETileState::Loaded)
+		{
+			continue;  // Skip unloaded or currently visible tiles
+		}
+
+		// Must have been out of frustum for minimum time
+		double TimeSinceUsed = CurrentTime - Tile->TimeLeftFrustum;
+		if (TimeSinceUsed < MinTimeBeforeUnload)
+		{
+			continue;  // Too recent, keep in cache
+		}
+
+		EvictionCandidates.Add(Tile);
+	}
+
+	// Sort by last used time (LRU first)
+	EvictionCandidates.Sort([this](const UFragmentTile& A, const UFragmentTile& B)
+	{
+		double TimeA = TileLastUsedTime.FindRef(&A);
+		double TimeB = TileLastUsedTime.FindRef(&B);
+		return TimeA < TimeB;  // Oldest first
+	});
+
+	// Evict tiles until we're under budget
+	for (UFragmentTile* Tile : EvictionCandidates)
+	{
+		if (CurrentCacheBytes <= MaxCachedBytes)
+		{
+			break;  // Under budget now
+		}
+
+		int64 TileMemory = CalculateTileMemoryUsage(Tile);
+
+		// Unload this tile
+		UnloadTile(Tile);
+
+		CurrentCacheBytes -= TileMemory;
+
+		UE_LOG(LogFragmentTileManager, Log, TEXT("Evicted tile %p (%lld KB) - Cache now: %lld MB"),
+		       Tile,
+		       TileMemory / 1024,
+		       CurrentCacheBytes / (1024 * 1024));
+	}
 }
