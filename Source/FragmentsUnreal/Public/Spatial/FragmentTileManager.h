@@ -67,7 +67,7 @@ public:
 
 	/** How often to update visible tiles (seconds) */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
-	float CameraUpdateInterval = 0.5f; // CHANGED from 0.2f (5 FPS → 2 FPS)
+	float CameraUpdateInterval = 0.1f; // 10 FPS for smoother rotation tracking
 
 	/** How long after leaving frustum before unloading (seconds) */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
@@ -85,9 +85,9 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.0", ClampMax = "90.0"))
 	float MinCameraRotation = 10.0f;
 
-	/** Minimum screen coverage to load tile (0.01 = 1% of screen) */
-	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.001", ClampMax = "1.0"))
-	float MinScreenCoverage = 0.01f;
+	/** Minimum screen coverage to load tile (0.0001 = 0.01% of screen, very permissive) */
+	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.00001", ClampMax = "1.0"))
+	float MinScreenCoverage = 0.0001f;
 
 	// --- Cache Configuration ---
 

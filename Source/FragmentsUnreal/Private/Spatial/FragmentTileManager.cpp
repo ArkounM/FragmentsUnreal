@@ -773,7 +773,7 @@ FConvexVolume UFragmentTileManager::BuildCameraFrustum(const FVector& CameraLoca
 
 	// Build projection matrix
 	const float HalfFOVRadians = FMath::DegreesToRadians(FOV * 0.5f);
-	const float NearPlane = 10.0f; // 10cm
+	const float NearPlane = 50.0f; // 50cm (increased from 10cm to prevent zoom culling)
 	const float FarPlane = 10000000.0f; // 100km
 
 	FMatrix ProjectionMatrix;
@@ -796,9 +796,11 @@ float UFragmentTileManager::CalculateTileScreenSize(const UFragmentTile* Tile, c
 		return 0.0f;
 	}
 
-	// Get tile dimensions and distance
-	const FVector TileCenter = Tile->Bounds.GetCenter();
-	const float Distance = FVector::Dist(CameraLocation, TileCenter);
+	// Use closest point on bounds instead of center (better for zoom scenarios)
+	const float DistanceToTile = FMath::Max(1.0f, Tile->Bounds.ComputeSquaredDistanceToPoint(CameraLocation));
+	const float Distance = FMath::Sqrt(DistanceToTile);
+
+	// Get tile size (largest dimension)
 	const float TileSize = Tile->Bounds.GetSize().GetMax();
 
 	// Avoid division by zero for very close distances
@@ -807,14 +809,15 @@ float UFragmentTileManager::CalculateTileScreenSize(const UFragmentTile* Tile, c
 		return 1.0f; // Treat as full screen if inside tile
 	}
 
-	// Calculate view dimension at tile distance
+	// Calculate vertical view dimension at tile distance
 	const float HalfFOVRadians = FMath::DegreesToRadians(FOV * 0.5f);
-	const float ViewDimension = Distance * FMath::Tan(HalfFOVRadians);
+	const float VerticalViewDimension = 2.0f * Distance * FMath::Tan(HalfFOVRadians);
 
-	// Screen ratio: tile size / view size
-	const float ScreenRatio = TileSize / ViewDimension;
+	// Calculate screen coverage as ratio (0.0 to 1.0+)
+	// Returns fraction of screen height occupied by tile
+	const float ScreenCoverage = TileSize / VerticalViewDimension;
 
-	return ScreenRatio;
+	return ScreenCoverage;
 }
 
 float UFragmentTileManager::CalculateTilePriority(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const

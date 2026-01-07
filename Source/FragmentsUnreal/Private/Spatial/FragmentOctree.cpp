@@ -339,8 +339,8 @@ void UFragmentOctree::QueryNodeFrustum(FFragmentOctreeNode* Node, const FConvexV
 	FVector Center = Node->Bounds.GetCenter();
 	FVector Extent = Node->Bounds.GetExtent();
 
-	// Add 20% margin to prevent premature culling when zooming
-	const FVector ExpandedExtent = Extent * 1.2f;
+	// Add 50% margin to prevent premature culling during rotation/zoom
+	const FVector ExpandedExtent = Extent * 1.5f;
 
 	if (!Frustum.IntersectBox(Center, ExpandedExtent))
 	{

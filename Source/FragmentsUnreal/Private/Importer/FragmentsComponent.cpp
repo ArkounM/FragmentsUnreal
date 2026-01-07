@@ -213,4 +213,22 @@ void UFragmentsComponent::UpdateCameraStreaming()
 	FragmentsImporter->UpdateTileStreaming(CameraLocation, CameraRotation, FOV, AspectRatio);
 }
 
+void UFragmentsComponent::SetShowDebugTileBounds(bool bShow)
+{
+	if (FragmentsImporter)
+	{
+		FragmentsImporter->bShowDebugTileBounds = bShow;
+		UE_LOG(LogTemp, Log, TEXT("Debug tile bounds: %s"), bShow ? TEXT("Enabled") : TEXT("Disabled"));
+	}
+}
+
+bool UFragmentsComponent::GetShowDebugTileBounds() const
+{
+	if (FragmentsImporter)
+	{
+		return FragmentsImporter->bShowDebugTileBounds;
+	}
+	return false;
+}
+
 

@@ -64,6 +64,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
 	void StopTileStreaming();
 
+	/**
+	 * Toggle debug visualization of tile bounds
+	 * @param bShow True to show wireframe boxes, false to hide
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Debug")
+	void SetShowDebugTileBounds(bool bShow);
+
+	/**
+	 * Get current debug visualization state
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Debug")
+	bool GetShowDebugTileBounds() const;
+
 private:
 	// Timer handle for camera update
 	FTimerHandle CameraUpdateTimerHandle;
