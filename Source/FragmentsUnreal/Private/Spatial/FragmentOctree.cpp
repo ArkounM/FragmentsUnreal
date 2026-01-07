@@ -30,14 +30,21 @@ void UFragmentOctree::BuildFromModel(const UFragmentModelWrapper* ModelWrapper, 
 		return;
 	}
 
+	const Model* ParsedModel = ModelWrapper->GetParsedModel();
+	if (!ParsedModel)
+	{
+		UE_LOG(LogFragmentOctree, Error, TEXT("BuildFromModel: No parsed model"));
+		return;
+	}
+
 	ModelGuidRef = ModelGuid;
 
-	// Extract fragment positions from model hierarchy
-	TMap<int32, FVector> FragmentPositions;
+	// Extract fragment bounding boxes from model hierarchy (not just positions!)
+	TMap<int32, FBox> FragmentBounds;
 	TArray<int32> AllFragmentIDs;
 
 	const FFragmentItem& RootItem = ModelWrapper->GetModelItemRef();
-	CollectFragmentPositions(RootItem, FragmentPositions, AllFragmentIDs);
+	CollectFragmentBounds(RootItem, ParsedModel, FragmentBounds, AllFragmentIDs);
 
 	if (AllFragmentIDs.Num() == 0)
 	{
@@ -45,14 +52,19 @@ void UFragmentOctree::BuildFromModel(const UFragmentModelWrapper* ModelWrapper, 
 		return;
 	}
 
-	// Calculate world bounds
-	FBox WorldBounds = CalculateBounds(AllFragmentIDs, FragmentPositions);
+	// Calculate world bounds from actual mesh extents
+	FBox WorldBounds = CalculateBounds(AllFragmentIDs, FragmentBounds);
 
 	if (!WorldBounds.IsValid)
 	{
 		UE_LOG(LogFragmentOctree, Error, TEXT("BuildFromModel: Invalid world bounds"));
 		return;
 	}
+
+	UE_LOG(LogFragmentOctree, Log, TEXT("Octree WorldBounds: Min=%s Max=%s Size=%s"),
+	       *WorldBounds.Min.ToString(),
+	       *WorldBounds.Max.ToString(),
+	       *WorldBounds.GetSize().ToString());
 
 	// Create root node
 	Root = new FFragmentOctreeNode();
@@ -62,7 +74,7 @@ void UFragmentOctree::BuildFromModel(const UFragmentModelWrapper* ModelWrapper, 
 	const double StartTime = FPlatformTime::Seconds();
 
 	// Build tree recursively
-	BuildNode(Root, AllFragmentIDs, FragmentPositions, 0);
+	BuildNode(Root, AllFragmentIDs, FragmentBounds, 0);
 
 	const double ElapsedTime = FPlatformTime::Seconds() - StartTime;
 
@@ -70,15 +82,99 @@ void UFragmentOctree::BuildFromModel(const UFragmentModelWrapper* ModelWrapper, 
 	       ElapsedTime * 1000.0, AllFragmentIDs.Num(), Tiles.Num());
 }
 
-void UFragmentOctree::CollectFragmentPositions(const FFragmentItem& Item,
-                                                TMap<int32, FVector>& OutPositions,
-                                                TArray<int32>& OutFragmentIDs)
+void UFragmentOctree::CollectFragmentBounds(const FFragmentItem& Item,
+                                             const Model* ParsedModel,
+                                             TMap<int32, FBox>& OutBounds,
+                                             TArray<int32>& OutFragmentIDs)
 {
-	// Only store fragments with valid LocalId (not structural nodes)
-	if (Item.LocalId >= 0)
+	// Only process fragments with valid LocalId and at least one sample (representation)
+	if (Item.LocalId >= 0 && Item.Samples.Num() > 0)
 	{
-		OutPositions.Add(Item.LocalId, Item.GlobalTransform.GetLocation());
-		OutFragmentIDs.Add(Item.LocalId);
+		FBox CombinedBounds(ForceInit);
+		bool bHasValidBounds = false;
+
+		// Iterate through all samples (representations) for this fragment
+		for (const FFragmentSample& Sample : Item.Samples)
+		{
+			if (Sample.RepresentationIndex < 0 || !ParsedModel)
+			{
+				continue;
+			}
+
+			// Get meshes from model
+			const Meshes* MeshesRef = ParsedModel->meshes();
+			if (!MeshesRef)
+			{
+				continue;
+			}
+
+			// Get representations from meshes
+			const auto* Representations = MeshesRef->representations();
+			if (!Representations || Sample.RepresentationIndex >= static_cast<int32>(Representations->size()))
+			{
+				continue;
+			}
+
+			const Representation* Rep = Representations->Get(Sample.RepresentationIndex);
+			if (!Rep)
+			{
+				continue;
+			}
+
+			// Get bounding box from representation (returns reference, not pointer)
+			const BoundingBox& bbox = Rep->bbox();
+
+			// Get min/max vectors (returns references, not pointers)
+			const FloatVector& min = bbox.min();
+			const FloatVector& max = bbox.max();
+
+			// Convert FlatBuffers bbox to Unreal FBox
+			// Note: Coordinate transform (x,y,z) → (x*100, z*100, y*100)
+			FVector Min(
+				min.x() * 100.0f,
+				min.z() * 100.0f,
+				min.y() * 100.0f
+			);
+			FVector Max(
+				max.x() * 100.0f,
+				max.z() * 100.0f,
+				max.y() * 100.0f
+			);
+
+			FBox RepBounds(Min, Max);
+
+			// Apply fragment's global transform to bounding box
+			FTransform GlobalTransform = Item.GlobalTransform;
+			FBox TransformedBounds = RepBounds.TransformBy(GlobalTransform);
+
+			// Combine with other representations
+			if (bHasValidBounds)
+			{
+				CombinedBounds += TransformedBounds;
+			}
+			else
+			{
+				CombinedBounds = TransformedBounds;
+				bHasValidBounds = true;
+			}
+		}
+
+		// Store combined bounds for this fragment
+		if (bHasValidBounds)
+		{
+			OutBounds.Add(Item.LocalId, CombinedBounds);
+			OutFragmentIDs.Add(Item.LocalId);
+		}
+		else
+		{
+			// Fallback to position-based point if no bbox available
+			FVector Position = Item.GlobalTransform.GetLocation();
+			FBox PointBounds(Position, Position);
+			OutBounds.Add(Item.LocalId, PointBounds.ExpandBy(50.0f)); // 50cm safety margin
+			OutFragmentIDs.Add(Item.LocalId);
+
+			UE_LOG(LogFragmentOctree, Warning, TEXT("Fragment %d has no valid bbox, using position fallback"), Item.LocalId);
+		}
 	}
 
 	// Recurse to children
@@ -86,37 +182,32 @@ void UFragmentOctree::CollectFragmentPositions(const FFragmentItem& Item,
 	{
 		if (Child)
 		{
-			CollectFragmentPositions(*Child, OutPositions, OutFragmentIDs);
+			CollectFragmentBounds(*Child, ParsedModel, OutBounds, OutFragmentIDs);
 		}
 	}
 }
 
 FBox UFragmentOctree::CalculateBounds(const TArray<int32>& FragmentIDs,
-                                       const TMap<int32, FVector>& FragmentPositions)
+                                       const TMap<int32, FBox>& FragmentBounds)
 {
 	FBox Bounds(ForceInit);
 
 	for (int32 ID : FragmentIDs)
 	{
-		const FVector* Pos = FragmentPositions.Find(ID);
-		if (Pos)
+		const FBox* FragBounds = FragmentBounds.Find(ID);
+		if (FragBounds && FragBounds->IsValid)
 		{
-			Bounds += *Pos;
+			// Combine actual mesh bounds (not point cloud!)
+			Bounds += *FragBounds;
 		}
 	}
 
-	// Add 10% padding
-	if (Bounds.IsValid)
-	{
-		const FVector Padding = Bounds.GetSize() * 0.1f;
-		Bounds = Bounds.ExpandBy(Padding);
-	}
-
+	// No artificial padding needed - bounds are already accurate
 	return Bounds;
 }
 
 void UFragmentOctree::BuildNode(FFragmentOctreeNode* Node, const TArray<int32>& FragmentIDs,
-                                 const TMap<int32, FVector>& FragmentPositions, int32 CurrentDepth)
+                                 const TMap<int32, FBox>& FragmentBounds, int32 CurrentDepth)
 {
 	if (!Node)
 	{
@@ -138,8 +229,8 @@ void UFragmentOctree::BuildNode(FFragmentOctreeNode* Node, const TArray<int32>& 
 		Node->Tile = Tile;
 		Tiles.Add(Tile); // For memory management
 
-		UE_LOG(LogFragmentOctree, Verbose, TEXT("Leaf tile at depth %d with %d fragments"),
-		       CurrentDepth, FragmentIDs.Num());
+		UE_LOG(LogFragmentOctree, Verbose, TEXT("Created tile %d: %d fragments, bounds=%s"),
+		       Tiles.Num() - 1, FragmentIDs.Num(), *Node->Bounds.ToString());
 		return;
 	}
 
@@ -188,12 +279,20 @@ void UFragmentOctree::BuildNode(FFragmentOctreeNode* Node, const TArray<int32>& 
 
 		const FBox ChildBounds(ChildMin, ChildMax);
 
-		// Assign fragments to this octant
+		// Assign fragments to this octant based on bounding box CENTER
 		TArray<int32> ChildFragments;
 		for (int32 ID : FragmentIDs)
 		{
-			const FVector* Pos = FragmentPositions.Find(ID);
-			if (Pos && ChildBounds.IsInsideOrOn(*Pos))
+			const FBox* FragBounds = FragmentBounds.Find(ID);
+			if (!FragBounds)
+			{
+				continue;
+			}
+
+			// Use fragment bounds CENTER to determine octant
+			FVector FragCenter = FragBounds->GetCenter();
+
+			if (ChildBounds.IsInsideOrOn(FragCenter))
 			{
 				ChildFragments.Add(ID);
 			}
@@ -212,7 +311,7 @@ void UFragmentOctree::BuildNode(FFragmentOctreeNode* Node, const TArray<int32>& 
 		Node->Children.Add(Child);
 
 		// Recurse
-		BuildNode(Child, ChildFragments, FragmentPositions, CurrentDepth + 1);
+		BuildNode(Child, ChildFragments, FragmentBounds, CurrentDepth + 1);
 	}
 }
 

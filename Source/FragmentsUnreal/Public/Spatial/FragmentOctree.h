@@ -101,7 +101,7 @@ private:
 	 * Recursive node building
 	 */
 	void BuildNode(FFragmentOctreeNode* Node, const TArray<int32>& FragmentIDs,
-	               const TMap<int32, FVector>& FragmentPositions, int32 CurrentDepth);
+	               const TMap<int32, FBox>& FragmentBounds, int32 CurrentDepth);
 
 	/**
 	 * Recursive frustum query
@@ -124,12 +124,13 @@ private:
 	 * Calculate bounds for fragment list
 	 */
 	FBox CalculateBounds(const TArray<int32>& FragmentIDs,
-	                     const TMap<int32, FVector>& FragmentPositions);
+	                     const TMap<int32, FBox>& FragmentBounds);
 
 	/**
-	 * Recursively collect fragment positions from hierarchy
+	 * Recursively collect fragment bounding boxes from hierarchy
 	 */
-	void CollectFragmentPositions(const FFragmentItem& Item,
-	                               TMap<int32, FVector>& OutPositions,
-	                               TArray<int32>& OutFragmentIDs);
+	void CollectFragmentBounds(const FFragmentItem& Item,
+	                            const Model* ParsedModel,
+	                            TMap<int32, FBox>& OutBounds,
+	                            TArray<int32>& OutFragmentIDs);
 };

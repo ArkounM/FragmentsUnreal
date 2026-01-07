@@ -38,7 +38,7 @@ public:
 		ParsedModel = GetModel(RawBuffer.GetData());
 	}
 
-	const Model* GetParsedModel() { return ParsedModel; }
+	const Model* GetParsedModel() const { return ParsedModel; }
 
 	void SetModelItem(FFragmentItem InModelItem) { ModelItem = InModelItem; }
 	FFragmentItem GetModelItem() { return ModelItem; }
