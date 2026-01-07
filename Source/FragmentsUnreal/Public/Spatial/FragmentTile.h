@@ -54,11 +54,15 @@ public:
 	// Spawn queue index (for chunked spawning)
 	int32 CurrentSpawnIndex;
 
+	// Has hierarchy subtree been expanded? (cached to avoid recalculation)
+	bool bHierarchyExpanded;
+
 	UFragmentTile()
 		: Bounds(ForceInit)
 		, State(ETileState::Unloaded)
 		, TimeLeftFrustum(0.0f)
 		, CurrentSpawnIndex(0)
+		, bHierarchyExpanded(false)
 	{
 	}
 
@@ -68,5 +72,6 @@ public:
 		State = ETileState::Unloaded;
 		TimeLeftFrustum = 0.0f;
 		CurrentSpawnIndex = 0;
+		bHierarchyExpanded = false;
 	}
 };

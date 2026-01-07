@@ -218,4 +218,8 @@ public:
 
 	TArray<class AFragment*> FragmentActors;
 
+	/** Show debug wireframe bounds for streaming tiles (green=loading, red=culled) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
+	bool bShowDebugTileBounds = false;
+
 };

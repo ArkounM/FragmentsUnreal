@@ -54,6 +54,7 @@ void UFragmentTileManager::Initialize(const FString& InModelGuid, UFragmentOctre
 	LastCameraPosition = FVector::ZeroVector;
 	LastCameraRotation = FRotator::ZeroRotator;
 	LastUpdateTime = 0.0;
+	LastCameraMovementTime = 0.0;
 
 	// Set device-aware memory budget (if auto-detect enabled)
 	if (bAutoDetectCacheBudget)
@@ -63,6 +64,26 @@ void UFragmentTileManager::Initialize(const FString& InModelGuid, UFragmentOctre
 
 	UE_LOG(LogFragmentTileManager, Log, TEXT("TileManager initialized for model: %s, Cache budget: %lld MB"),
 	       *ModelGuid, MaxCachedBytes / (1024 * 1024));
+}
+
+namespace
+{
+	/** Calculate hash of frustum state for change detection */
+	uint32 CalculateFrustumHash(const FVector& Position, const FRotator& Rotation, float FOV, float AspectRatio)
+	{
+		// Simple hash: combine position, rotation, and FOV
+		// Use 10cm precision for position, 1 degree for rotation
+		uint32 Hash = 0;
+		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt(Position.X / 10.0f)));
+		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt(Position.Y / 10.0f)));
+		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt(Position.Z / 10.0f)));
+		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt(Rotation.Yaw)));
+		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt(Rotation.Pitch)));
+		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt(Rotation.Roll)));
+		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt(FOV)));
+		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt(AspectRatio * 100.0f)));
+		return Hash;
+	}
 }
 
 void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, const FRotator& CameraRotation,
@@ -93,13 +114,47 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 
 	if (!bTimeThresholdMet && !bMovedSignificantly && !bRotatedSignificantly)
 	{
-		// Process unload timers even if not updating visible set
-		ProcessUnloadTimers(TimeSinceUpdate);
+		// OPTIMIZATION: Only process unload timers if camera moved recently (prevents delayed pops)
+		const double TimeSinceMovement = CurrentTime - LastCameraMovementTime;
+		if (TimeSinceMovement < 5.0)
+		{
+			ProcessUnloadTimers(TimeSinceUpdate);
+		}
+		else
+		{
+			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Deferring unload timers: camera stationary for %.1fs"), TimeSinceMovement);
+		}
 		return;
 	}
 
 	UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Update triggered: time=%d move=%d (%.0fcm) rotate=%d (%.1fdeg)"),
 	       bTimeThresholdMet, bMovedSignificantly, DistanceMoved, bRotatedSignificantly, RotationChange);
+
+	// Track camera movement for deferred eviction/unload
+	if (bMovedSignificantly || bRotatedSignificantly)
+	{
+		LastCameraMovementTime = CurrentTime;
+	}
+
+	// OPTIMIZATION: Check if frustum has actually changed (skip expensive octree query if identical)
+	const uint32 CurrentFrustumHash = CalculateFrustumHash(CameraLocation, CameraRotation, FOV, AspectRatio);
+	if (CurrentFrustumHash == LastFrustumHash)
+	{
+		// Frustum identical to last frame - skip expensive query
+		UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Frustum unchanged (hash=%u), skipping octree query"), CurrentFrustumHash);
+
+		// Still need to update time tracking
+		LastUpdateTime = CurrentTime;
+
+		// Still process unload timers
+		const double TimeSinceMovement = CurrentTime - LastCameraMovementTime;
+		if (TimeSinceMovement < 5.0)
+		{
+			ProcessUnloadTimers(TimeSinceUpdate);
+		}
+
+		return;  // Early exit - frustum unchanged
+	}
 
 	// Build camera frustum
 	FConvexVolume Frustum = BuildCameraFrustum(CameraLocation, CameraRotation, FOV, AspectRatio);
@@ -147,14 +202,62 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 	LastCameraRotation = CameraRotation;
 	LastUpdateTime = CurrentTime;
 
-	// Process unload timers
-	ProcessUnloadTimers(TimeSinceUpdate);
+	// Update frustum hash (for next frame comparison)
+	LastFrustumHash = CurrentFrustumHash;
+	LastAspectRatio = AspectRatio;
+
+	// OPTIMIZATION: Only process unload timers if camera moved recently
+	const double TimeSinceMovement = CurrentTime - LastCameraMovementTime;
+	if (TimeSinceMovement < 5.0)
+	{
+		ProcessUnloadTimers(TimeSinceUpdate);
+	}
+	else
+	{
+		UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Deferring unload timers: camera stationary for %.1fs"), TimeSinceMovement);
+	}
 }
 
 void UFragmentTileManager::UpdateTileStates(const TArray<UFragmentTile*>& NewVisibleTiles)
 {
-	// Build set of new visible tiles for fast lookup
+	// Build sets for comparison
 	TSet<UFragmentTile*> NewVisibleSet(NewVisibleTiles);
+	TSet<UFragmentTile*> OldVisibleSet(VisibleTiles);
+
+	// OPTIMIZATION: Early exit if sets are identical (common for stationary camera)
+	if (NewVisibleSet.Num() == OldVisibleSet.Num())
+	{
+		bool bSetsIdentical = true;
+		for (UFragmentTile* Tile : NewVisibleSet)
+		{
+			if (!OldVisibleSet.Contains(Tile))
+			{
+				bSetsIdentical = false;
+				break;
+			}
+		}
+
+		if (bSetsIdentical)
+		{
+			// No change - skip processing entirely
+			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Visible set unchanged, skipping state update"));
+
+			// Still touch tiles for LRU (but don't change state)
+			for (UFragmentTile* Tile : NewVisibleTiles)
+			{
+				TouchTile(Tile);
+			}
+
+			// Still check cache budget (tiles may have finished loading)
+			if (bEnableTileCache)
+			{
+				EvictTilesToFitBudget();
+			}
+
+			UpdateSpawnProgress();
+			return;  // Early exit - nothing changed!
+		}
+	}
 
 	// Handle newly visible tiles
 	for (UFragmentTile* Tile : NewVisibleTiles)
@@ -167,23 +270,41 @@ void UFragmentTileManager::UpdateTileStates(const TArray<UFragmentTile*>& NewVis
 		// Mark tile as recently used (for LRU tracking)
 		TouchTile(Tile);
 
+		// OPTIMIZATION: Skip if already in visible set AND already in Visible state
+		if (OldVisibleSet.Contains(Tile) && Tile->State == ETileState::Visible)
+		{
+			continue;  // Already visible, no state change needed
+		}
+
 		if (Tile->State == ETileState::Unloaded)
 		{
 			// Start loading this tile
 			StartLoadingTile(Tile);
+			DrawDebugTileBounds(Tile, FColor::Yellow, 3.0f);  // Yellow = starting to load
 		}
 		else if (Tile->State == ETileState::Loaded)
 		{
 			// Already loaded, just show it (cache hit!)
 			ShowTile(Tile);
+			DrawDebugTileBounds(Tile, FColor::Green, 2.0f);  // Green = cache hit, now visible
 			UE_LOG(LogFragmentTileManager, Verbose, TEXT("Tile %p made visible from cache"), Tile);
 		}
 		else if (Tile->State == ETileState::Unloading)
 		{
 			// Was unloading, but now visible again - cancel unload
 			ShowTile(Tile);
+			DrawDebugTileBounds(Tile, FColor::Green, 2.0f);  // Green = re-shown from unloading
 		}
-		// Loading and Visible states don't need changes
+		else if (Tile->State == ETileState::Loading)
+		{
+			// Actively loading (fragments being spawned)
+			DrawDebugTileBounds(Tile, FColor::Orange, 2.0f);  // Orange = actively loading
+		}
+		else if (Tile->State == ETileState::Visible)
+		{
+			// Already visible (no state change)
+			DrawDebugTileBounds(Tile, FColor::Cyan, 1.0f);  // Cyan = already visible (no change)
+		}
 	}
 
 	// Handle tiles that are no longer visible
@@ -200,16 +321,36 @@ void UFragmentTileManager::UpdateTileStates(const TArray<UFragmentTile*>& NewVis
 	{
 		// Hide tile but DON'T destroy actors (kept in cache)
 		HideTile(Tile);
+		DrawDebugTileBounds(Tile, FColor::Red, 2.0f);  // Red = being culled/hidden
 		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Tile %p hidden (kept in cache)"), Tile);
 	}
 
 	// Update visible tiles list
 	VisibleTiles = NewVisibleTiles;
 
-	// Check if we need to evict tiles due to memory budget
+	// OPTIMIZATION: Defer eviction on stationary camera to prevent unexpected pops
 	if (bEnableTileCache)
 	{
-		EvictTilesToFitBudget();
+		// Only evict if camera moved recently OR memory critically over budget
+		const bool bCriticallyOverBudget = CurrentCacheBytes > (MaxCachedBytes * 1.2f);  // 20% over limit
+		const double TimeSinceMovement = FPlatformTime::Seconds() - LastCameraMovementTime;
+		const bool bCameraMovedRecently = TimeSinceMovement < 5.0;  // Moved in last 5 seconds
+
+		if (bCriticallyOverBudget || bCameraMovedRecently)
+		{
+			EvictTilesToFitBudget();
+
+			if (bCriticallyOverBudget && !bCameraMovedRecently)
+			{
+				UE_LOG(LogFragmentTileManager, Warning, TEXT("Cache critically over budget (%.0f%%), forcing eviction on stationary camera"),
+				       GetCacheUsagePercent());
+			}
+		}
+		else
+		{
+			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Deferring eviction: camera stationary for %.1fs, cache at %.0f%%"),
+			       TimeSinceMovement, GetCacheUsagePercent());
+		}
 	}
 
 	UpdateSpawnProgress();
@@ -230,19 +371,34 @@ void UFragmentTileManager::StartLoadingTile(UFragmentTile* Tile)
 		return;
 	}
 
-	// Expand tile fragments to include entire subtrees (hierarchy preservation)
-	// This ensures parent-child relationships are maintained
-	// Use TArray to preserve parent-first ordering (important for spawning)
-	TSet<int32> VisitedSet; // Avoid duplicates
-	TArray<int32> OrderedFragments; // Parent-first order
-	for (int32 LocalID : Tile->FragmentLocalIDs)
+	// OPTIMIZATION: Only expand hierarchy if not already cached
+	if (!Tile->bHierarchyExpanded)
 	{
-		AddFragmentSubtreeOrdered(LocalID, Wrapper, VisitedSet, OrderedFragments);
-	}
+		// Expand tile fragments to include entire subtrees (hierarchy preservation)
+		// This ensures parent-child relationships are maintained
+		// Use TArray to preserve parent-first ordering (important for spawning)
+		TSet<int32> VisitedSet; // Avoid duplicates
+		TArray<int32> OrderedFragments; // Parent-first order
+		for (int32 LocalID : Tile->FragmentLocalIDs)
+		{
+			AddFragmentSubtreeOrdered(LocalID, Wrapper, VisitedSet, OrderedFragments);
+		}
 
-	// Update tile's fragment list with expanded subtrees
-	const int32 OriginalCount = Tile->FragmentLocalIDs.Num();
-	Tile->FragmentLocalIDs = OrderedFragments;
+		// Update tile's fragment list with expanded subtrees
+		const int32 OriginalCount = Tile->FragmentLocalIDs.Num();
+		Tile->FragmentLocalIDs = OrderedFragments;
+
+		// Mark as expanded (cache for future loads)
+		Tile->bHierarchyExpanded = true;
+
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Expanded tile hierarchy: %d → %d fragments (with children)"),
+		       OriginalCount, Tile->FragmentLocalIDs.Num());
+	}
+	else
+	{
+		UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile hierarchy already expanded, using cached (%d fragments)"),
+		       Tile->FragmentLocalIDs.Num());
+	}
 
 	Tile->State = ETileState::Loading;
 	Tile->CurrentSpawnIndex = 0;
@@ -254,8 +410,8 @@ void UFragmentTileManager::StartLoadingTile(UFragmentTile* Tile)
 	// Update total fragments to spawn
 	TotalFragmentsToSpawn += Tile->FragmentLocalIDs.Num();
 
-	UE_LOG(LogFragmentTileManager, Log, TEXT("Started loading tile: %d fragments expanded to %d (with children)"),
-	       OriginalCount, Tile->FragmentLocalIDs.Num());
+	UE_LOG(LogFragmentTileManager, Log, TEXT("Started loading tile: %d fragments"),
+	       Tile->FragmentLocalIDs.Num());
 
 	UpdateSpawnProgress();
 }
@@ -377,6 +533,7 @@ void UFragmentTileManager::UnloadTile(UFragmentTile* Tile)
 	Tile->State = ETileState::Unloaded;
 	Tile->CurrentSpawnIndex = 0;
 	Tile->TimeLeftFrustum = 0.0f;
+	Tile->bHierarchyExpanded = false;  // Reset hierarchy cache
 
 	// Remove from loaded tiles
 	LoadedTiles.Remove(Tile);
@@ -687,6 +844,57 @@ float UFragmentTileManager::CalculateTilePriority(const UFragmentTile* Tile, con
 	const float Priority = (ScreenSize * 100.0f) + DistancePriority + FragmentPriority;
 
 	return Priority;
+}
+
+void UFragmentTileManager::DrawDebugTileBounds(UFragmentTile* Tile, const FColor& Color, float Thickness)
+{
+	if (!Tile || !Importer)
+	{
+		return;
+	}
+
+	// Only draw if debug enabled
+	if (!Importer->bShowDebugTileBounds)
+	{
+		return;
+	}
+
+	// Get world through owner actor (importer may be owned by component)
+	AActor* Owner = Importer->GetOwnerRef();
+	if (!Owner)
+	{
+		return;
+	}
+
+	UWorld* World = Owner->GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// Draw wireframe box (2 second lifetime for smooth updates)
+	DrawDebugBox(
+		World,
+		Tile->Bounds.GetCenter(),
+		Tile->Bounds.GetExtent(),
+		Color,
+		false,  // Not persistent
+		2.0f,   // 2 second lifetime (refreshed every update)
+		0,      // Depth priority
+		Thickness
+	);
+
+	// Draw fragment count label at center
+	const FString Label = FString::Printf(TEXT("%d frags"), Tile->FragmentLocalIDs.Num());
+	DrawDebugString(
+		World,
+		Tile->Bounds.GetCenter(),
+		Label,
+		nullptr,
+		Color,
+		2.0f,
+		true  // Draw shadow
+	);
 }
 
 void UFragmentTileManager::UpdateSpawnProgress()

@@ -164,11 +164,20 @@ private:
 	/** Last update time */
 	double LastUpdateTime = 0.0;
 
+	/** Time of last significant camera movement (for deferring eviction/unload) */
+	double LastCameraMovementTime = 0.0;
+
 	/** Last camera location for priority sorting */
 	FVector LastPriorityCameraLocation = FVector::ZeroVector;
 
 	/** Last FOV for priority sorting */
 	float LastPriorityFOV = 90.0f;
+
+	/** Hash of last frustum state (for change detection) */
+	uint32 LastFrustumHash = 0;
+
+	/** Last aspect ratio used for frustum */
+	float LastAspectRatio = 1.777f;
 
 	/** Total fragments to spawn across all loading tiles */
 	int32 TotalFragmentsToSpawn = 0;
@@ -259,6 +268,14 @@ private:
 	 * @return Priority score (higher = more important)
 	 */
 	float CalculateTilePriority(const UFragmentTile* Tile, const FVector& CameraLocation, float FOV) const;
+
+	/**
+	 * Draw debug wireframe for tile bounds (if debug enabled)
+	 * @param Tile Tile to visualize
+	 * @param Color Box color
+	 * @param Thickness Line thickness
+	 */
+	void DrawDebugTileBounds(UFragmentTile* Tile, const FColor& Color, float Thickness = 2.0f);
 
 	/**
 	 * Update spawn progress tracking
