@@ -55,11 +55,25 @@ public:
 	UPROPERTY()
 	float TimeLeftFrustum;
 
-	// Spawn queue index (for chunked spawning)
+	// Spawn queue index (for chunked spawning - actor mode)
 	int32 CurrentSpawnIndex;
 
 	// Has hierarchy subtree been expanded? (cached to avoid recalculation)
 	bool bHierarchyExpanded;
+
+	// --- HISM Mode Fields ---
+
+	/** Use HISM instancing instead of actor spawning */
+	UPROPERTY()
+	bool bUseHISM;
+
+	/** Number of instances added to this tile (HISM mode) */
+	UPROPERTY()
+	int32 InstanceCount;
+
+	/** Are instances currently visible? (HISM mode) */
+	UPROPERTY()
+	bool bInstancesVisible;
 
 	UFragmentTile()
 		: Bounds(ForceInit)
@@ -68,6 +82,9 @@ public:
 		, TimeLeftFrustum(0.0f)
 		, CurrentSpawnIndex(0)
 		, bHierarchyExpanded(false)
+		, bUseHISM(false)
+		, InstanceCount(0)
+		, bInstancesVisible(false)
 	{
 	}
 
@@ -79,5 +96,15 @@ public:
 		TimeLeftFrustum = 0.0f;
 		CurrentSpawnIndex = 0;
 		bHierarchyExpanded = false;
+		bUseHISM = false;
+		InstanceCount = 0;
+		bInstancesVisible = false;
+	}
+
+	/** Initialize with HISM mode enabled */
+	void InitializeWithHISM(const FBox& InBounds, float InGeometricError)
+	{
+		Initialize(InBounds, InGeometricError);
+		bUseHISM = true;
 	}
 };
