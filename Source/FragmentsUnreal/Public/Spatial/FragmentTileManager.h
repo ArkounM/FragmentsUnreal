@@ -8,7 +8,6 @@
 // Forward declarations
 class UFragmentOctree;
 class UFragmentsImporter;
-class UFragmentHISMManager;
 
 /**
  * Manages tile-based fragment streaming based on camera frustum.
@@ -91,12 +90,6 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "1.0", ClampMax = "128.0"))
 	float MaximumScreenSpaceError = 16.0f;
 
-	// --- Rendering Mode ---
-
-	/** Use HISM GPU instancing instead of actor spawning (60-260x faster) */
-	UPROPERTY(EditAnywhere, Category = "Streaming|Rendering")
-	bool bUseHISM = true;
-
 	// --- Cache Configuration ---
 
 	/** Maximum memory budget for tile cache in bytes (default: 512 MB) */
@@ -154,10 +147,6 @@ private:
 	/** Importer reference for spawning */
 	UPROPERTY()
 	UFragmentsImporter* Importer = nullptr;
-
-	/** HISM manager for GPU instancing (if bUseHISM = true) */
-	UPROPERTY()
-	UFragmentHISMManager* HISMManager = nullptr;
 
 	/** Currently visible tiles */
 	UPROPERTY()

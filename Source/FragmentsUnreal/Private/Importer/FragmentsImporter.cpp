@@ -22,6 +22,7 @@
 #include "Misc/ScopedSlowTask.h"
 #include "Importer/FragmentsAsyncLoader.h"
 #include "Spatial/FragmentTileManager.h"
+#include "Spatial/FragmentSemanticTileManager.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -437,6 +438,16 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 	UFragmentTileManager* TileManager = NewObject<UFragmentTileManager>(this);
 	TileManager->Initialize(InModelGuid, Octree, this);
 	TileManagers.Add(InModelGuid, TileManager);
+
+	// Create and initialize semantic tile manager for IFC class-based grouping
+	UFragmentSemanticTileManager* SemanticTileMgr = NewObject<UFragmentSemanticTileManager>(this);
+	SemanticTileMgr->Initialize(InModelGuid, this);
+	SemanticTileMgr->BuildSemanticTiles();
+	SemanticTileManagers.Add(InModelGuid, SemanticTileMgr);
+
+	UE_LOG(LogFragments, Log, TEXT("Built semantic tiles: %d IFC classes, %d total fragments"),
+	       SemanticTileMgr->GetSemanticTiles().Num(),
+	       SemanticTileMgr->GetTotalFragmentCount());
 
 	// Start spawn processing timer if not already running
 	UWorld* World = GetWorld();

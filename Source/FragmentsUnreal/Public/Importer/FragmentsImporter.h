@@ -17,6 +17,7 @@ FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
 // Forward Declarations
 class UFragmentsAsyncLoader;
 class UFragmentTileManager;
+class UFragmentSemanticTileManager;
 
 // Use FlatBuffers Model type
 using Model = ::Model;
@@ -170,6 +171,10 @@ private:
 	// Tile managers for streaming (one per loaded model)
 	UPROPERTY()
 	TMap<FString, UFragmentTileManager*> TileManagers;
+
+	// Semantic tile managers for IFC class-based grouping (one per loaded model)
+	UPROPERTY()
+	TMap<FString, UFragmentSemanticTileManager*> SemanticTileManagers;
 
 	UPROPERTY()
 	TMap<FString, UStaticMesh*> MeshCache;
