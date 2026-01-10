@@ -3,6 +3,7 @@
 #include "Importer/FragmentModelWrapper.h"
 #include "Utils/FragmentsUtils.h"
 #include "DrawDebugHelpers.h"
+#include "ProceduralMeshComponent.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSemanticTiles, Log, All);
 
@@ -20,6 +21,7 @@ void UFragmentSemanticTileManager::Initialize(const FString& InModelGuid, UFragm
 
 	ModelGuid = InModelGuid;
 	Importer = InImporter;
+	RootActor = InImporter->GetOwnerRef(); // Store root actor for component attachment
 
 	UE_LOG(LogSemanticTiles, Log, TEXT("Initialized Semantic Tile Manager for model: %s"), *ModelGuid);
 }
@@ -141,13 +143,85 @@ void UFragmentSemanticTileManager::BuildSemanticTiles()
 void UFragmentSemanticTileManager::Tick(float DeltaTime, const FVector& CameraLocation,
                                          const FRotator& CameraRotation, float FOV, float ViewportHeight)
 {
-	// Phase 1: Placeholder - no LOD logic yet
-	// Phase 2+ will implement:
-	// - Calculate screen coverage for each semantic tile
-	// - Determine target LOD (Wireframe, SimpleBox, HighDetail)
-	// - Trigger LOD generation/loading
+	// Phase 2: LOD system implementation
+	// Calculate screen coverage for each semantic tile and transition LODs
 
-	// Draw debug bounds if enabled
+	if (!Importer)
+	{
+		return;
+	}
+
+	const double CurrentTime = FPlatformTime::Seconds();
+
+	// Debug: Log first tick and periodically log LOD states
+	static bool bFirstTick = true;
+	static double LastDebugTime = 0.0;
+	const double DebugInterval = 2.0; // Log every 2 seconds
+
+	if (bFirstTick)
+	{
+		UE_LOG(LogSemanticTiles, Log, TEXT("First Tick called - %d semantic tiles, %d priority levels"),
+		       AllSemanticTiles.Num(), 4);
+		UE_LOG(LogSemanticTiles, Log, TEXT("Camera: Loc=%s, FOV=%.1f, ViewportH=%.1f"),
+		       *CameraLocation.ToString(), FOV, ViewportHeight);
+		bFirstTick = false;
+		LastDebugTime = CurrentTime;
+	}
+
+	// Periodic debug logging
+	bool bDoPeriodicDebug = (CurrentTime - LastDebugTime) >= DebugInterval;
+	if (bDoPeriodicDebug)
+	{
+		UE_LOG(LogSemanticTiles, Log, TEXT("=== Semantic Tile LOD Status (Camera: %s) ==="),
+		       *CameraLocation.ToString());
+		LastDebugTime = CurrentTime;
+	}
+
+	// Process tiles by priority (structural first, details last)
+	for (int32 PriorityIdx = 0; PriorityIdx < 4; PriorityIdx++)
+	{
+		for (USemanticTile* Tile : TilesByPriority[PriorityIdx])
+		{
+			if (!Tile)
+			{
+				continue;
+			}
+
+			// Calculate screen coverage
+			float ScreenCoverage = CalculateScreenCoverage(Tile, CameraLocation, CameraRotation,
+			                                                FOV, ViewportHeight);
+			Tile->ScreenCoverage = ScreenCoverage;
+			Tile->LastUpdateTime = CurrentTime;
+
+			// Determine target LOD
+			ESemanticLOD TargetLOD = DetermineLODLevel(ScreenCoverage);
+			Tile->TargetLOD = TargetLOD;
+
+			// Periodic debug logging
+			if (bDoPeriodicDebug && PriorityIdx == 0) // Only log structural tiles to avoid spam
+			{
+				FVector TileCenter = Tile->CombinedBounds.GetCenter();
+				float Distance = FVector::Dist(CameraLocation, TileCenter);
+				UE_LOG(LogSemanticTiles, Log, TEXT("  %s: Coverage=%.4f%%, Dist=%.1fcm, LOD=%d → %d"),
+				       *Tile->IFCClassName, ScreenCoverage * 100.0f, Distance,
+				       static_cast<int32>(Tile->CurrentLOD), static_cast<int32>(TargetLOD));
+			}
+
+			// Transition to target LOD if different from current
+			if (Tile->CurrentLOD != TargetLOD)
+			{
+				TransitionToLOD(Tile, TargetLOD);
+			}
+
+			// CRITICAL FIX: Redraw wireframe every frame (DrawDebugBox only lasts one frame)
+			if (Tile->CurrentLOD == ESemanticLOD::Wireframe)
+			{
+				ShowWireframe(Tile);
+			}
+		}
+	}
+
+	// Draw debug bounds if enabled (in addition to LOD visualization)
 	if (Config.bDrawDebugBounds && Importer)
 	{
 		AActor* Owner = Importer->GetOwnerRef();
@@ -158,9 +232,10 @@ void UFragmentSemanticTileManager::Tick(float DeltaTime, const FVector& CameraLo
 			{
 				for (USemanticTile* Tile : AllSemanticTiles)
 				{
-					FColor Color = Tile->RepresentativeColor.ToFColor(true);
+					// Draw white debug bounds (separate from LOD wireframe)
 					DrawDebugBox(World, Tile->CombinedBounds.GetCenter(),
-					            Tile->CombinedBounds.GetExtent(), Color, false, -1.0f, 0, 5.0f);
+					            Tile->CombinedBounds.GetExtent(), FColor::White,
+					            false, -1.0f, 0, 1.0f);
 				}
 			}
 		}
@@ -389,4 +464,276 @@ void UFragmentSemanticTileManager::CalculateCombinedBounds(USemanticTile* Tile)
 		UE_LOG(LogSemanticTiles, Verbose, TEXT("  %s: Bounds size = (%.2f, %.2f, %.2f)"),
 		       *Tile->IFCClassName, Size.X, Size.Y, Size.Z);
 	}
+}
+
+// ===================================================================
+// Phase 2: LOD Management Implementation
+// ===================================================================
+
+float UFragmentSemanticTileManager::CalculateScreenCoverage(USemanticTile* Tile,
+                                                              const FVector& CameraLocation,
+                                                              const FRotator& CameraRotation,
+                                                              float FOV, float ViewportHeight)
+{
+	if (!Tile || !Tile->CombinedBounds.IsValid)
+	{
+		return 0.0f;
+	}
+
+	// Calculate distance from camera to tile center
+	FVector TileCenter = Tile->CombinedBounds.GetCenter();
+	float Distance = FVector::Dist(CameraLocation, TileCenter);
+
+	if (Distance < 1.0f)
+	{
+		Distance = 1.0f; // Prevent division by zero
+	}
+
+	// Get tile bounding box size (use maximum dimension)
+	FVector TileSize = Tile->CombinedBounds.GetSize();
+	float TileDimension = TileSize.GetMax();
+
+	// Calculate screen coverage using engine_fragment formula:
+	// ScreenSize = (Dimension / Distance) * (ViewportHeight / (2 * tan(FOV/2)))
+	float HalfFOVRadians = FMath::DegreesToRadians(FOV * 0.5f);
+	float TanHalfFOV = FMath::Tan(HalfFOVRadians);
+
+	if (TanHalfFOV < SMALL_NUMBER)
+	{
+		return 0.0f;
+	}
+
+	// Screen size in pixels
+	float ScreenSizePixels = (TileDimension / Distance) * (ViewportHeight / (2.0f * TanHalfFOV));
+
+	// Convert to percentage of viewport height (0.0 to 1.0)
+	float ScreenCoverage = ScreenSizePixels / ViewportHeight;
+
+	return FMath::Clamp(ScreenCoverage, 0.0f, 1.0f);
+}
+
+ESemanticLOD UFragmentSemanticTileManager::DetermineLODLevel(float ScreenCoverage)
+{
+	if (!Config.bEnableLOD)
+	{
+		return ESemanticLOD::HighDetail; // Always high detail if LOD disabled
+	}
+
+	// Determine LOD based on screen coverage thresholds
+	if (ScreenCoverage >= Config.LOD1ToLOD2Threshold)
+	{
+		return ESemanticLOD::HighDetail; // > 5% = LOD 2
+	}
+	else if (ScreenCoverage >= Config.LOD0ToLOD1Threshold)
+	{
+		return ESemanticLOD::SimpleBox; // 1% - 5% = LOD 1
+	}
+	else if (ScreenCoverage > 0.0f)
+	{
+		return ESemanticLOD::Wireframe; // < 1% = LOD 0
+	}
+	else
+	{
+		return ESemanticLOD::Unloaded; // Not visible
+	}
+}
+
+void UFragmentSemanticTileManager::TransitionToLOD(USemanticTile* Tile, ESemanticLOD TargetLOD)
+{
+	if (!Tile || Tile->CurrentLOD == TargetLOD)
+	{
+		return; // Already at target LOD
+	}
+
+	// Hide current LOD
+	HideLOD(Tile);
+
+	// Show target LOD
+	switch (TargetLOD)
+	{
+	case ESemanticLOD::Unloaded:
+		// Already hidden
+		break;
+
+	case ESemanticLOD::Wireframe:
+		ShowWireframe(Tile);
+		break;
+
+	case ESemanticLOD::SimpleBox:
+		ShowSimpleBox(Tile);
+		break;
+
+	case ESemanticLOD::HighDetail:
+		ShowHighDetail(Tile);
+		break;
+	}
+
+	Tile->CurrentLOD = TargetLOD;
+
+	if (Config.bEnableDebugLogging)
+	{
+		UE_LOG(LogSemanticTiles, Verbose, TEXT("  %s: LOD transition → %d (coverage: %.3f%%)"),
+		       *Tile->IFCClassName, static_cast<int32>(TargetLOD), Tile->ScreenCoverage * 100.0f);
+	}
+}
+
+void UFragmentSemanticTileManager::ShowWireframe(USemanticTile* Tile)
+{
+	if (!Tile || !Importer)
+	{
+		static bool bLoggedOnce = false;
+		if (!bLoggedOnce)
+		{
+			UE_LOG(LogSemanticTiles, Warning, TEXT("ShowWireframe: Null tile or importer"));
+			bLoggedOnce = true;
+		}
+		return;
+	}
+
+	// Get world for drawing
+	AActor* Owner = Importer->GetOwnerRef();
+	if (!Owner)
+	{
+		static bool bLoggedOnce = false;
+		if (!bLoggedOnce)
+		{
+			UE_LOG(LogSemanticTiles, Warning, TEXT("ShowWireframe: No owner actor"));
+			bLoggedOnce = true;
+		}
+		return;
+	}
+
+	UWorld* World = Owner->GetWorld();
+	if (!World)
+	{
+		static bool bLoggedOnce = false;
+		if (!bLoggedOnce)
+		{
+			UE_LOG(LogSemanticTiles, Warning, TEXT("ShowWireframe: No world from owner actor"));
+			bLoggedOnce = true;
+		}
+		return;
+	}
+
+	// Draw wireframe bounding box using DrawDebugBox
+	FColor WireframeColor = Tile->RepresentativeColor.ToFColor(true);
+	DrawDebugBox(World, Tile->CombinedBounds.GetCenter(),
+	            Tile->CombinedBounds.GetExtent(), WireframeColor,
+	            false, -1.0f, 0, 2.0f); // Persistent, depth priority 0, thickness 2
+}
+
+void UFragmentSemanticTileManager::ShowSimpleBox(USemanticTile* Tile)
+{
+	if (!Tile || !Importer)
+	{
+		return;
+	}
+
+	AActor* Owner = Importer->GetOwnerRef();
+	if (!Owner)
+	{
+		return;
+	}
+
+	// Create procedural mesh component if it doesn't exist
+	if (!Tile->SimpleBoxMesh)
+	{
+		Tile->SimpleBoxMesh = NewObject<UProceduralMeshComponent>(Owner);
+		Tile->SimpleBoxMesh->RegisterComponent();
+		Tile->SimpleBoxMesh->AttachToComponent(Owner->GetRootComponent(),
+		                                         FAttachmentTransformRules::KeepWorldTransform);
+	}
+
+	// Generate box mesh data
+	TArray<FVector> Vertices;
+	TArray<int32> Triangles;
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	TArray<FLinearColor> VertexColors;
+
+	FVector Center = Tile->CombinedBounds.GetCenter();
+	FVector Extent = Tile->CombinedBounds.GetExtent();
+
+	// Define 8 corners of the box
+	FVector Corners[8] = {
+		Center + FVector(-Extent.X, -Extent.Y, -Extent.Z),
+		Center + FVector(Extent.X, -Extent.Y, -Extent.Z),
+		Center + FVector(Extent.X, Extent.Y, -Extent.Z),
+		Center + FVector(-Extent.X, Extent.Y, -Extent.Z),
+		Center + FVector(-Extent.X, -Extent.Y, Extent.Z),
+		Center + FVector(Extent.X, -Extent.Y, Extent.Z),
+		Center + FVector(Extent.X, Extent.Y, Extent.Z),
+		Center + FVector(-Extent.X, Extent.Y, Extent.Z)
+	};
+
+	// Build 6 faces (12 triangles)
+	// Front face (-Y)
+	Vertices.Append({Corners[0], Corners[1], Corners[5], Corners[4]});
+	Triangles.Append({0, 2, 1, 0, 3, 2});
+
+	// Back face (+Y)
+	Vertices.Append({Corners[3], Corners[2], Corners[6], Corners[7]});
+	Triangles.Append({4, 6, 5, 4, 7, 6});
+
+	// Left face (-X)
+	Vertices.Append({Corners[3], Corners[0], Corners[4], Corners[7]});
+	Triangles.Append({8, 10, 9, 8, 11, 10});
+
+	// Right face (+X)
+	Vertices.Append({Corners[1], Corners[2], Corners[6], Corners[5]});
+	Triangles.Append({12, 14, 13, 12, 15, 14});
+
+	// Bottom face (-Z)
+	Vertices.Append({Corners[0], Corners[3], Corners[2], Corners[1]});
+	Triangles.Append({16, 18, 17, 16, 19, 18});
+
+	// Top face (+Z)
+	Vertices.Append({Corners[4], Corners[5], Corners[6], Corners[7]});
+	Triangles.Append({20, 22, 21, 20, 23, 22});
+
+	// Generate normals and vertex colors
+	for (int32 i = 0; i < Vertices.Num(); i++)
+	{
+		Normals.Add(FVector::UpVector); // Placeholder normal
+		UVs.Add(FVector2D(0, 0)); // Placeholder UV
+		VertexColors.Add(Tile->RepresentativeColor);
+	}
+
+	// Create mesh section
+	Tile->SimpleBoxMesh->CreateMeshSection_LinearColor(0, Vertices, Triangles, Normals,
+	                                                     UVs, VertexColors, TArray<FProcMeshTangent>(), true);
+	Tile->SimpleBoxMesh->SetVisibility(true);
+}
+
+void UFragmentSemanticTileManager::ShowHighDetail(USemanticTile* Tile)
+{
+	if (!Tile || !Importer)
+	{
+		return;
+	}
+
+	// Phase 2: Placeholder - triggers existing tile manager spawning
+	// In Phase 4, this will integrate with octree spatial subdivision
+	// For now, mark tile as loaded (actual spawning happens via existing FragmentTileManager)
+	Tile->bIsLoaded = true;
+
+	UE_LOG(LogSemanticTiles, Verbose, TEXT("  %s: High detail loading triggered (%d fragments)"),
+	       *Tile->IFCClassName, Tile->Count);
+}
+
+void UFragmentSemanticTileManager::HideLOD(USemanticTile* Tile)
+{
+	if (!Tile)
+	{
+		return;
+	}
+
+	// Hide simple box mesh if it exists
+	if (Tile->SimpleBoxMesh)
+	{
+		Tile->SimpleBoxMesh->SetVisibility(false);
+	}
+
+	// Wireframe is drawn with DrawDebugBox (persistent = false), so it clears automatically
+	// High detail hiding will be handled by FragmentTileManager in Phase 4
 }

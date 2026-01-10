@@ -1152,6 +1152,16 @@ void UFragmentsImporter::UpdateTileStreaming(const FVector& CameraLocation, cons
 			TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
 		}
 	}
+
+	// Update all semantic tile managers (Phase 2: LOD system)
+	for (auto& Pair : SemanticTileManagers)
+	{
+		UFragmentSemanticTileManager* SemanticTileMgr = Pair.Value;
+		if (SemanticTileMgr)
+		{
+			SemanticTileMgr->Tick(0.0f, CameraLocation, CameraRotation, FOV, ViewportHeight);
+		}
+	}
 }
 
 void UFragmentsImporter::StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes)
