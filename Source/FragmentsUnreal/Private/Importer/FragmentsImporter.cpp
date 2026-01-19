@@ -22,7 +22,6 @@
 #include "Misc/ScopedSlowTask.h"
 #include "Importer/FragmentsAsyncLoader.h"
 #include "Spatial/FragmentTileManager.h"
-#include "Spatial/FragmentSemanticTileManager.h"
 #include "Utils/FragmentOcclusionClassifier.h"
 
 
@@ -428,48 +427,24 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 	BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
 	BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
 
-	// Create tile manager for streaming
-	UFragmentOctree* Octree = Wrapper->GetSpatialIndex();
-	if (!Octree)
+	// Build fragment registry for per-sample visibility
+	Wrapper->BuildFragmentRegistry(InModelGuid);
+	UFragmentRegistry* Registry = Wrapper->GetFragmentRegistry();
+
+	if (!Registry || !Registry->IsBuilt())
 	{
-		UE_LOG(LogFragments, Error, TEXT("ProcessLoadedFragment: No spatial index for model %s"), *InModelGuid);
+		UE_LOG(LogFragments, Error, TEXT("ProcessLoadedFragment: Failed to build fragment registry for model %s"), *InModelGuid);
 		return;
 	}
 
+	// Create tile manager for per-sample visibility streaming
 	UFragmentTileManager* TileManager = NewObject<UFragmentTileManager>(this);
-	TileManager->Initialize(InModelGuid, Octree, this);
+	TileManager->Initialize(InModelGuid, this);
+	TileManager->InitializePerSampleVisibility(Registry);
 	TileManagers.Add(InModelGuid, TileManager);
 
-	// Initialize per-sample visibility if enabled (Phase 1 optimization)
-	if (TileManager->bUsePerSampleVisibility)
-	{
-		// Build fragment registry for per-sample visibility
-		Wrapper->BuildFragmentRegistry(InModelGuid);
-		UFragmentRegistry* Registry = Wrapper->GetFragmentRegistry();
-
-		if (Registry && Registry->IsBuilt())
-		{
-			TileManager->InitializePerSampleVisibility(Registry);
-			UE_LOG(LogFragments, Log, TEXT("Per-sample visibility enabled for model: %s (%d fragments)"),
-			       *InModelGuid, Registry->GetFragmentCount());
-		}
-		else
-		{
-			UE_LOG(LogFragments, Warning, TEXT("Per-sample visibility disabled: registry build failed for model %s"),
-			       *InModelGuid);
-			TileManager->bUsePerSampleVisibility = false;
-		}
-	}
-
-	// Create and initialize semantic tile manager for IFC class-based grouping
-	UFragmentSemanticTileManager* SemanticTileMgr = NewObject<UFragmentSemanticTileManager>(this);
-	SemanticTileMgr->Initialize(InModelGuid, this);
-	SemanticTileMgr->BuildSemanticTiles();
-	SemanticTileManagers.Add(InModelGuid, SemanticTileMgr);
-
-	UE_LOG(LogFragments, Log, TEXT("Built semantic tiles: %d IFC classes, %d total fragments"),
-	       SemanticTileMgr->GetSemanticTiles().Num(),
-	       SemanticTileMgr->GetTotalFragmentCount());
+	UE_LOG(LogFragments, Log, TEXT("Per-sample visibility initialized for model: %s (%d fragments)"),
+	       *InModelGuid, Registry->GetFragmentCount());
 
 	// Start spawn processing timer if not already running
 	UWorld* World = GetWorld();
@@ -1167,7 +1142,7 @@ void UFragmentsImporter::ProcessSpawnChunk()
 
 void UFragmentsImporter::ProcessAllTileManagerChunks()
 {
-	// Process spawn chunks for all tile managers
+	// Process spawn chunks for all tile managers (per-sample visibility only)
 	for (auto& Pair : TileManagers)
 	{
 		UFragmentTileManager* TileManager = Pair.Value;
@@ -1176,17 +1151,8 @@ void UFragmentsImporter::ProcessAllTileManagerChunks()
 			continue;
 		}
 
-		// Use per-sample visibility path when enabled
-		if (TileManager->bUsePerSampleVisibility)
-		{
-			// Per-sample mode: process spawning based on dynamic tiles
-			TileManager->ProcessSpawnChunk_PerSample();
-		}
-		else if (TileManager->IsLoading())
-		{
-			// Original tile-based mode
-			TileManager->ProcessSpawnChunk();
-		}
+		// Per-sample mode: process spawning based on dynamic tiles
+		TileManager->ProcessSpawnChunk();
 	}
 
 	// Check if all tile managers are idle
@@ -1210,31 +1176,13 @@ void UFragmentsImporter::ProcessAllTileManagerChunks()
 void UFragmentsImporter::UpdateTileStreaming(const FVector& CameraLocation, const FRotator& CameraRotation,
                                               float FOV, float AspectRatio, float ViewportHeight)
 {
-	// Update all tile managers with current camera (pass viewport height for SSE calculation)
+	// Update all tile managers with current camera (per-sample visibility only)
 	for (auto& Pair : TileManagers)
 	{
 		UFragmentTileManager* TileManager = Pair.Value;
 		if (TileManager)
 		{
-			// Use per-sample visibility path when enabled
-			if (TileManager->bUsePerSampleVisibility)
-			{
-				TileManager->UpdateVisibleTiles_PerSample(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
-			}
-			else
-			{
-				TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
-			}
-		}
-	}
-
-	// Update all semantic tile managers (Phase 2: LOD system)
-	for (auto& Pair : SemanticTileManagers)
-	{
-		UFragmentSemanticTileManager* SemanticTileMgr = Pair.Value;
-		if (SemanticTileMgr)
-		{
-			SemanticTileMgr->Tick(0.0f, CameraLocation, CameraRotation, FOV, ViewportHeight);
+			TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
 		}
 	}
 }

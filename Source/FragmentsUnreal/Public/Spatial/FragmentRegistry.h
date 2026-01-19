@@ -1,7 +1,6 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Spatial/FragmentVisibility.h"
 #include "Utils/FragmentOcclusionTypes.h"
 #include "FragmentRegistry.generated.h"
 

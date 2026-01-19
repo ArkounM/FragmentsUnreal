@@ -1,9 +1,60 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Spatial/FragmentVisibility.h"
 #include "Spatial/FragmentRegistry.h"
 #include "PerSampleVisibilityController.generated.h"
+
+/**
+ * LOD levels for fragment visibility.
+ * Simplified to just Visible/Invisible since we don't use wire LOD.
+ */
+UENUM(BlueprintType)
+enum class EFragmentLod : uint8
+{
+	/** Fragment is not visible (culled) */
+	Invisible,
+	/** Fragment is visible and should be rendered */
+	Visible
+};
+
+/**
+ * Cached view state for frustum culling.
+ * Contains frustum planes built from camera parameters.
+ */
+USTRUCT()
+struct FFragmentViewState
+{
+	GENERATED_BODY()
+
+	/** Camera world position */
+	FVector CameraPosition = FVector::ZeroVector;
+
+	/** Camera forward direction */
+	FVector CameraForward = FVector::ForwardVector;
+
+	/** Field of view in degrees */
+	float FOV = 90.0f;
+
+	/** Viewport width in pixels */
+	float ViewportWidth = 1920.0f;
+
+	/** Viewport height in pixels */
+	float ViewportHeight = 1080.0f;
+
+	/** Graphics quality multiplier */
+	float GraphicsQuality = 1.0f;
+
+	/** Orthogonal dimension for orthographic projection (0 = perspective) */
+	float OrthogonalDimension = 0.0f;
+
+	/** Frustum planes (5 planes: left, right, bottom, top, far - near excluded) */
+	TArray<FPlane> FrustumPlanes;
+
+	FFragmentViewState()
+	{
+		FrustumPlanes.SetNum(5);
+	}
+};
 
 // Forward declarations
 class UFragmentRegistry;
