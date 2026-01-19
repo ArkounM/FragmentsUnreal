@@ -8,7 +8,7 @@
 #include "Utils/FragmentsUtils.h"
 #include "Importer/DeferredPackageSaveManager.h"
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
-
+#include "Optimization/GeometryDeduplicationManager.h"
 #include "FragmentsImporter.generated.h"
 
 
@@ -73,25 +73,9 @@ public:
 		return FragmentModels;
 	}
 
-	// Get model wrapper by GUID
-	FORCEINLINE class UFragmentModelWrapper* GetFragmentModel(const FString& ModelGuid) const
-	{
-		UFragmentModelWrapper* const* Found = FragmentModels.Find(ModelGuid);
-		return Found ? *Found : nullptr;
-	}
+	UPROPERTY()
+	UGeometryDeduplicationManager* DeduplicationManager;
 
-	// Get owner actor reference
-	FORCEINLINE AActor* GetOwnerRef() const { return OwnerRef; }
-
-	/**
-	 * Spawn a single fragment (used by TileManager for streaming)
-	 * @param Item Fragment item to spawn
-	 * @param ParentActor Parent actor to attach to
-	 * @param MeshesRef Meshes reference from FlatBuffers model
-	 * @param bSaveMeshes Whether to save meshes to disk
-	 * @return Spawned fragment actor or nullptr
-	 */
-	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes);
 
 protected:
 	// Call when Async Loading Completes
@@ -119,7 +103,8 @@ private:
 
 	FName AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial);
 
-	bool TriangulatePolygonWithHoles(const TArray<FVector>& Points,
+	bool TriangulatePolygonWithHoles(
+		const TArray<FVector>& Points,
 		const TArray<int32>& Profiles,
 		const TArray<TArray<int32>>& Holes,
 		TArray<FVector>& OutVertices,
@@ -149,6 +134,25 @@ private:
 
 	//Start Chunk Spawning
 	void StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes);
+
+	// Extract geometry from shell representation
+	void ExtractShellGeometry(
+		const Shell* ShellRef,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs
+	);
+
+	// Extract geometry from circle extrusion representation
+
+	void ExtractCircleExtrusionGeometry(
+		const CircleExtrusion* ExtrusionRef,
+		TArray<FVector>& OutVertices,
+		TArray<int32>& OutTriangles,
+		TArray<FVector>& OutNormals,
+		TArray<FVector2D>& OutUVs
+	);
 
 private:
 

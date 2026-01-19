@@ -88,7 +88,7 @@ DEFINE_LOG_CATEGORY(LogFragments);
 
 UFragmentsImporter::UFragmentsImporter()
 {
-
+	DeduplicationManager = CreateDefaultSubobject<UGeometryDeduplicationManager>(TEXT("DeduplicationManager"));
 }
 
 FString UFragmentsImporter::Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes)
@@ -773,13 +773,194 @@ void UFragmentsImporter::SpawnFragmentModel(AFragment* InFragmentModel, AActor* 
 	}
 }
 
+void UFragmentsImporter::ExtractShellGeometry(
+	const Shell* ShellRef,
+	TArray<FVector>& OutVertices,
+	TArray<int32>& OutTriangles,
+	TArray<FVector>& OutNormals,
+	TArray<FVector2D>& OutUVs)
+{
+	if (!ShellRef || !ShellRef->points())
+	{
+		return;
+	}
+
+	const auto* Points = ShellRef->points();
+
+	// Extract vertices (convert from FlatBuffers FloatVector to FVector)
+	for (flatbuffers::uoffset_t i = 0; i < Points->size(); i++)
+	{
+		const auto& P = *Points->Get(i);
+		// Convert: m to cm (×100), swap Y and Z for Unreal coordinate system
+		FVector Vertex(P.x() * 100.0f, P.z() * 100.0f, P.y() * 100.0f);
+		OutVertices.Add(Vertex);
+	}
+
+	// Build hole map (profile_id → hole indices)
+	const auto* Holes = ShellRef->holes();
+	TMap<int32, TArray<TArray<int32>>> ProfileHolesMap;
+
+	if (Holes)
+	{
+		for (flatbuffers::uoffset_t j = 0; j < Holes->size(); j++)
+		{
+			const auto* Hole = Holes->Get(j);
+			const auto* HoleIndices = Hole->indices();
+			const auto Profile_id = Hole->profile_id();
+
+			TArray<int32> HoleIdx;
+			for (flatbuffers::uoffset_t k = 0; k < HoleIndices->size(); k++)
+			{
+				HoleIdx.Add(HoleIndices->Get(k));
+			}
+
+			if (ProfileHolesMap.Contains(Profile_id))
+			{
+				ProfileHolesMap[Profile_id].Add(HoleIdx);
+			}
+			else
+			{
+				TArray<TArray<int32>> HolesForProfile;
+				HolesForProfile.Add(HoleIdx);
+				ProfileHolesMap.Add(Profile_id, HolesForProfile);
+			}
+		}
+	}
+
+	// Process profiles
+	const auto* Profiles = ShellRef->profiles();
+	if (!Profiles)
+	{
+		return;
+	}
+
+	for (flatbuffers::uoffset_t i = 0; i < Profiles->size(); i++)
+	{
+		const ShellProfile* Profile = Profiles->Get(i);
+		const auto* Indices = Profile->indices();
+
+		if (!Indices || Indices->size() < 3)
+		{
+			continue;
+		}
+
+		// Check if this profile has holes
+		bool bHasHoles = ProfileHolesMap.Contains(i);
+
+		if (bHasHoles)
+		{
+			// Extract contour indices
+			TArray<int32> ContourIndices;
+			for (flatbuffers::uoffset_t j = 0; j < Indices->size(); j++)
+			{
+				ContourIndices.Add(Indices->Get(j));
+			}
+
+			// Triangulate polygon with holes
+			// This creates NEW vertices and indices (not reusing OutVertices!)
+			TArray<FVector> TriangulatedVertices;
+			TArray<int32> TriangulatedIndices;
+
+			if (TriangulatePolygonWithHoles(
+				OutVertices,           // All vertices (for lookup)
+				ContourIndices,        // Contour as indices
+				ProfileHolesMap[i],    // Holes
+				TriangulatedVertices,  // Output: new vertices
+				TriangulatedIndices    // Output: new indices
+			))
+			{
+				// Add triangulated vertices to output
+				int32 VertexOffset = OutVertices.Num();
+				OutVertices.Append(TriangulatedVertices);
+
+				// Adjust indices and add to output
+				for (int32 Idx : TriangulatedIndices)
+				{
+					OutTriangles.Add(VertexOffset + Idx);
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("Triangulation failed for profile %d"), i);
+			}
+		}
+		else
+		{
+			// Simple fan triangulation for convex polygons (no holes)
+			if (Indices->size() >= 3)
+			{
+				int32 V0 = Indices->Get(0);
+
+				for (flatbuffers::uoffset_t j = 1; j < Indices->size() - 1; j++)
+				{
+					int32 V1 = Indices->Get(j);
+					int32 V2 = Indices->Get(j + 1);
+
+					OutTriangles.Add(V0);
+					OutTriangles.Add(V1);
+					OutTriangles.Add(V2);
+				}
+			}
+		}
+	}
+
+	// Calculate normals (per-face)
+	OutNormals.SetNum(OutVertices.Num());
+	for (int32 i = 0; i < OutTriangles.Num(); i += 3)
+	{
+		if (i + 2 < OutTriangles.Num())
+		{
+			int32 Idx0 = OutTriangles[i + 0];
+			int32 Idx1 = OutTriangles[i + 1];
+			int32 Idx2 = OutTriangles[i + 2];
+
+			if (Idx0 < OutVertices.Num() && Idx1 < OutVertices.Num() && Idx2 < OutVertices.Num())
+			{
+				FVector V0 = OutVertices[Idx0];
+				FVector V1 = OutVertices[Idx1];
+				FVector V2 = OutVertices[Idx2];
+
+				FVector Normal = FVector::CrossProduct(V1 - V0, V2 - V0).GetSafeNormal();
+
+				OutNormals[Idx0] = Normal;
+				OutNormals[Idx1] = Normal;
+				OutNormals[Idx2] = Normal;
+			}
+		}
+	}
+
+	// Simple planar UV projection
+	OutUVs.SetNum(OutVertices.Num());
+	for (int32 i = 0; i < OutVertices.Num(); i++)
+	{
+		OutUVs[i] = FVector2D(OutVertices[i].X * 0.01f, OutVertices[i].Y * 0.01f);
+	}
+}
+
+void UFragmentsImporter::ExtractCircleExtrusionGeometry(
+	const CircleExtrusion* ExtrusionRef,
+	TArray<FVector>& OutVertices,
+	TArray<int32>& OutTriangles,
+	TArray<FVector>& OutNormals,
+	TArray<FVector2D>& OutUVs)
+{
+	// For now, we'll skip circle extrusion deduplication
+	// and fall back to the existing CreateStaticMeshFromCircleExtrusion
+	// TODO: Implement full extraction in future optimization
+
+	UE_LOG(LogTemp, Warning, TEXT("Circle extrusion geometry extraction not yet implemented for deduplication"));
+
+	// Leave arrays empty - the calling code will skip if Vertices.Num() == 0
+}
+
 void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor* InParent, const Meshes* MeshesRef, bool bSaveMeshes)
 {
 	UE_LOG(LogFragments, Log, TEXT("SpawnFragmentModel Start - In Parent: %p, OwnerRef: %p"), InParent, OwnerRef);
 
-	if (!InParent) return;
+	if (!InParent)
 	{
 		UE_LOG(LogFragments, Error, TEXT("SpawnFragmentModel: InParent is NULL! Early return. "));
+		return;
 	}
 
 	// Create AFragment
@@ -853,38 +1034,75 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 			}
 			else
 			{
+				// Create package first (needed for both deduplication and fallback)
 				UPackage* MeshPackage = CreatePackage(*PackagePath);
+
+				// Extract geometry data first
+				TArray<FVector> Vertices;
+				TArray<int32> Triangles;
+				TArray<FVector> Normals;
+				TArray<FVector2D> UVs;
+
 				if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
 				{
 					const auto* shell = MeshesRef->shells()->Get(representation->id());
-					Mesh = CreateStaticMeshFromShell(shell, material, *MeshName, MeshPackage);
-
+					ExtractShellGeometry(shell, Vertices, Triangles, Normals, UVs);
 				}
 				else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
 				{
 					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-					Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+					ExtractCircleExtrusionGeometry(circleExtrusion, Vertices, Triangles, Normals, UVs);
 				}
 
-				if (Mesh)
+				if (Vertices.Num() > 0 && Triangles.Num() > 0)
 				{
-					if (!FPaths::FileExists(PackageFileName) && bSaveMeshes)
+					// Use deduplication manager
+
+					FGeometryTemplate* Template = DeduplicationManager->GetOrCreateTemplate(
+						Vertices,
+						Triangles,
+						Normals,
+						UVs,
+						Sample.MaterialIndex,
+						*MeshName,
+						MeshPackage
+					);
+
+					if (Template)
 					{
+						// Check if this is a newly created template (ReferenceCount will be 0)
+						bool bIsNewTemplate = (Template->ReferenceCount == 0);
+
+						//Add this instance to the template
+						DeduplicationManager->AddInstance(
+							Template->GeometryHash,
+							LocalTransform,
+							FragmentModel->GetLocalId(),
+							Sample.MaterialIndex
+						);
+						Mesh = Template->SharedMesh;
+
+						// Apply material to newly created mesh
+						if (bIsNewTemplate && Mesh)
+						{
+							AddMaterialToMesh(Mesh, material);
+						}
+
+						// Only save the package if this is a newly created mesh
+						if (bIsNewTemplate && Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
+						{
 #if WITH_EDITOR
-						MeshPackage->FullyLoad();
-
-						Mesh->Rename(*MeshName, MeshPackage);
-						Mesh->SetFlags(RF_Public | RF_Standalone);
-						//Mesh->Build();
-						MeshPackage->MarkPackageDirty();
-						FAssetRegistryModule::AssetCreated(Mesh);
-
-						FSavePackageArgs SaveArgs;
-						SaveArgs.SaveFlags = RF_Public | RF_Standalone;
-
-						PackagesToSave.Add(MeshPackage);
+							MeshPackage->FullyLoad();
+							Mesh->Rename(*MeshName, MeshPackage);
+							Mesh->SetFlags(RF_Public | RF_Standalone);
+							MeshPackage->MarkPackageDirty();
+							FAssetRegistryModule::AssetCreated(Mesh);
+							PackagesToSave.Add(MeshPackage);
 #endif
-						//UPackage::SavePackage(MeshPackage, Mesh, *PackageFileName, SaveArgs);
+						}
+
+						UE_LOG(LogTemp, Verbose, TEXT("Using deduplicated mesh (hash: %llu, instances: %d, new: %d)"),
+							Template->GeometryHash, Template->ReferenceCount, bIsNewTemplate ? 1 : 0);
 					}
 				}
 
@@ -993,24 +1211,95 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					Mesh = FindObject<UStaticMesh>(ExistingPackage, *MeshName);
 				}
 			}
-			// Create new mesh
+			// Create new mesh using deduplication
 			else
 			{
-				UPackage* MeshPackage = CreatePackage(*PackagePath);
+				// Extract geometry data first
+				TArray<FVector> Vertices;
+				TArray<int32> Triangles;
+				TArray<FVector> Normals;
+				TArray<FVector2D> UVs;
+
 				if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
 				{
 					const auto* shell = MeshesRef->shells()->Get(representation->id());
-					Mesh = CreateStaticMeshFromShell(shell, material, *MeshName, MeshPackage);
+					ExtractShellGeometry(shell, Vertices, Triangles, Normals, UVs);
 				}
 				else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
 				{
 					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-					Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+					ExtractCircleExtrusionGeometry(circleExtrusion, Vertices, Triangles, Normals, UVs);
 				}
 
-				if (Mesh)
+				if (Vertices.Num() > 0 && Triangles.Num() > 0)
 				{
-					if (!FPaths::FileExists(PackageFileName) && bSaveMeshes)
+					// Use deduplication manager
+					UPackage* MeshPackage = CreatePackage(*PackagePath);
+
+					FGeometryTemplate* Template = DeduplicationManager->GetOrCreateTemplate(
+						Vertices,
+						Triangles,
+						Normals,
+						UVs,
+						Sample.MaterialIndex,
+						*MeshName,
+						MeshPackage
+					);
+
+					if (Template)
+					{
+						// Check if this is a newly created template (ReferenceCount will be 0)
+						bool bIsNewTemplate = (Template->ReferenceCount == 0);
+
+						// Add this instance to the template
+						DeduplicationManager->AddInstance(
+							Template->GeometryHash,
+							LocalTransform,
+							FragmentModel->GetLocalId(),
+							Sample.MaterialIndex
+						);
+
+						Mesh = Template->SharedMesh;
+
+						// Apply material to newly created mesh
+						if (bIsNewTemplate && Mesh)
+						{
+							AddMaterialToMesh(Mesh, material);
+						}
+
+						// Only save the package if this is a newly created mesh
+						if (bIsNewTemplate && Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
+						{
+#if WITH_EDITOR
+							MeshPackage->FullyLoad();
+							Mesh->Rename(*MeshName, MeshPackage);
+							Mesh->SetFlags(RF_Public | RF_Standalone);
+							MeshPackage->MarkPackageDirty();
+							FAssetRegistryModule::AssetCreated(Mesh);
+							PackagesToSave.Add(MeshPackage);
+#endif
+						}
+
+						UE_LOG(LogTemp, Verbose, TEXT("Using deduplicated mesh (hash: %llu, instances: %d, new: %d)"),
+							Template->GeometryHash, Template->ReferenceCount, bIsNewTemplate ? 1 : 0);
+					}
+				}
+				else
+				{
+					// Fallback to old method if extraction failed
+					UPackage* MeshPackage = CreatePackage(*PackagePath);
+					if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+					{
+						const auto* shell = MeshesRef->shells()->Get(representation->id());
+						Mesh = CreateStaticMeshFromShell(shell, material, *MeshName, MeshPackage);
+					}
+					else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
+					{
+						const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
+						Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+					}
+
+					if (Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
 					{
 #if WITH_EDITOR
 						MeshPackage->FullyLoad();
@@ -1023,7 +1312,10 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					}
 				}
 
-				MeshCache.Add(SamplePath, Mesh);
+				if (Mesh)
+				{
+					MeshCache.Add(SamplePath, Mesh);
+				}
 			}
 
 			if (Mesh)
@@ -1215,6 +1507,22 @@ void UFragmentsImporter::StartChunkedSpawning(const FFragmentItem& RootItem, AAc
 			0.016f, // ~60 FPS 
 			true // Loop
 		);
+	}
+	// At the end of StartChunkedSpawning:
+	if (DeduplicationManager)
+	{
+		int32 UniqueGeometries = 0;
+		int32 TotalInstances = 0;
+		float Ratio = 0.0f;
+
+		DeduplicationManager->GetStats(UniqueGeometries, TotalInstances, Ratio);
+
+		UE_LOG(LogFragments, Log, TEXT("=== DEDUPLICATION STATS ==="));
+		UE_LOG(LogFragments, Log, TEXT("Unique geometries: %d"), UniqueGeometries);
+		UE_LOG(LogFragments, Log, TEXT("Total instances: %d"), TotalInstances);
+		UE_LOG(LogFragments, Log, TEXT("Deduplication ratio: %.1fx"), Ratio);
+		UE_LOG(LogFragments, Log, TEXT("Memory saved: ~%.0f%%"),
+			(1.0f - (1.0f / Ratio)) * 100.0f);
 	}
 
 	UE_LOG(LogFragments, Log, TEXT("Chunked Spawning Started. Processing %d fragments per frame."), FragmentsPerChunk);

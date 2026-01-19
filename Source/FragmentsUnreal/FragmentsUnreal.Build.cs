@@ -32,6 +32,7 @@ public class FragmentsUnreal : ModuleRules
                 "ProceduralMeshComponent",
 				"MeshDescription",
 				"StaticMeshDescription",
+				"MeshConversion",
 				"GeometryScriptingCore",
 				"GeometryCore",
 				"zlib"
