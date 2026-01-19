@@ -154,7 +154,7 @@ public:
 
 	/** Minimum camera movement to trigger update (cm) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|Update")
-	float MinCameraMovement = 2500.0f;
+	float MinCameraMovement = 100.0f;  // 1 meter - matches FragmentTileManager
 
 	/** Minimum camera rotation to trigger update (degrees) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|Update")

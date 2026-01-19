@@ -13,6 +13,7 @@ class UFragmentVisibility;
 class UFragmentRegistry;
 class UPerSampleVisibilityController;
 class UDynamicTileGenerator;
+struct FFragmentItem;
 
 /**
  * Manages tile-based fragment streaming based on camera frustum.
@@ -85,7 +86,7 @@ public:
 
 	/** Minimum camera movement to trigger update (cm) */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
-	float MinCameraMovement = 2500.0f; // CHANGED from 500.0f (5m → 25m)
+	float MinCameraMovement = 100.0f; // 1 meter - matches engine_fragment per-frame updates
 
 	/** Minimum camera rotation to trigger update (degrees) */
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.0", ClampMax = "90.0"))
@@ -160,6 +161,32 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
 	int32 GetVisibleTileCount() const { return VisibleTiles.Num(); }
 
+	// --- Per-Sample Cache Statistics ---
+
+	/** Get number of visible fragments (per-sample mode) */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	int32 GetVisibleFragmentCount() const { return SpawnedFragments.Num(); }
+
+	/** Get number of hidden (cached) fragments (per-sample mode) */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	int32 GetHiddenFragmentCount() const { return HiddenFragments.Num(); }
+
+	/** Get total cached fragments (visible + hidden) (per-sample mode) */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	int32 GetTotalCachedFragmentCount() const { return SpawnedFragmentActors.Num(); }
+
+	/** Get per-sample cache usage in MB */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	float GetPerSampleCacheUsageMB() const { return PerSampleCacheBytes / (1024.0f * 1024.0f); }
+
+	/** Get per-sample cache usage as percentage */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	float GetPerSampleCacheUsagePercent() const
+	{
+		if (MaxCachedBytes == 0) return 0.0f;
+		return (PerSampleCacheBytes * 100.0f) / MaxCachedBytes;
+	}
+
 private:
 	// --- State ---
 
@@ -195,9 +222,18 @@ private:
 	/** Set of currently spawned fragments (per-sample mode) */
 	TSet<int32> SpawnedFragments;
 
+	/** Set of currently hidden (but cached) fragments (per-sample mode) */
+	TSet<int32> HiddenFragments;
+
 	/** Map of spawned fragment actors (LocalId -> Actor) */
 	UPROPERTY()
 	TMap<int32, class AFragment*> SpawnedFragmentActors;
+
+	/** Current memory used by per-sample cached fragments (bytes) */
+	int64 PerSampleCacheBytes = 0;
+
+	/** Last used time for each fragment (for LRU eviction) */
+	TMap<int32, double> FragmentLastUsedTime;
 
 	/** Currently visible tiles */
 	UPROPERTY()
@@ -421,8 +457,48 @@ private:
 	bool SpawnFragmentById(int32 LocalId);
 
 	/**
-	 * Unload a single fragment (per-sample mode).
+	 * Hide a single fragment (per-sample mode) - keeps in cache.
+	 * Matches engine_fragment behavior: visibility toggle instead of destroy.
+	 * @param LocalId Fragment local ID to hide
+	 */
+	void HideFragmentById(int32 LocalId);
+
+	/**
+	 * Show a previously hidden fragment (per-sample mode) - cache hit.
+	 * @param LocalId Fragment local ID to show
+	 * @return true if fragment was shown (existed in cache)
+	 */
+	bool ShowFragmentById(int32 LocalId);
+
+	/**
+	 * Destroy and unload a single fragment (per-sample mode).
+	 * Only called during memory pressure eviction.
 	 * @param LocalId Fragment local ID to unload
 	 */
 	void UnloadFragmentById(int32 LocalId);
+
+	/**
+	 * Calculate approximate memory usage of a single fragment actor.
+	 * @param Actor Fragment actor to measure
+	 * @return Memory usage in bytes
+	 */
+	int64 CalculateFragmentMemoryUsage(class AFragment* Actor) const;
+
+	/**
+	 * Evict least recently used fragments to fit under memory budget (per-sample mode).
+	 * Matches engine_fragment: only evict when memory overflow AND fragment invisible.
+	 */
+	void EvictFragmentsToFitBudget();
+
+	/**
+	 * Mark fragment as recently used (updates LRU tracking).
+	 * @param LocalId Fragment that was accessed
+	 */
+	void TouchFragment(int32 LocalId);
+
+	/**
+	 * Check if memory is over budget (per-sample mode).
+	 * @return true if over budget
+	 */
+	bool IsPerSampleMemoryOverBudget() const;
 };

@@ -79,11 +79,16 @@ float UFragmentVisibility::CalculateScreenSize(float Dimension, float Distance) 
 	// const viewDimension = this.getViewDimension(distance);
 	// const screenDimension = dimension / viewDimension;
 	// return screenDimension * this._virtualView.viewSize;
-
-	// Avoid division by zero for very close objects
+	//
+	// Match engine_fragment: when camera is inside/very close to object,
+	// return maximum screen size (object fills entire screen).
+	// In engine_fragment, Distance=0 causes division by zero → INFINITY screen size.
+	// INFINITY < any_threshold = FALSE → always visible.
+	// We emulate this by returning a guaranteed-large value.
 	if (Distance < 1.0f)
 	{
-		Distance = 1.0f;
+		// Camera inside or touching bounds - object fills screen
+		return ViewState.ViewportHeight * 10.0f;  // Guaranteed to pass any threshold
 	}
 
 	const float ViewDimension = GetViewDimension(Distance);
@@ -91,7 +96,7 @@ float UFragmentVisibility::CalculateScreenSize(float Dimension, float Distance) 
 	// Avoid division by zero
 	if (ViewDimension < KINDA_SMALL_NUMBER)
 	{
-		return ViewState.ViewportHeight;  // Object fills screen
+		return ViewState.ViewportHeight * 10.0f;  // Object fills screen
 	}
 
 	const float ScreenDimension = Dimension / ViewDimension;
@@ -158,9 +163,12 @@ void UFragmentVisibility::BuildFrustumPlanes(const FVector& CameraLocation, cons
 	// Combine into view-projection matrix
 	const FMatrix ViewProjectionMatrix = ViewMatrix * ProjectionMatrix;
 
-	// Extract 6 frustum planes from the view-projection matrix
+	// Extract 5 frustum planes from the view-projection matrix
 	// Using the Gribb/Hartmann method
-	ViewState.FrustumPlanes.Empty(6);
+	// NOTE: We skip the NEAR plane to prevent close objects from being culled
+	// This matches engine_fragment behavior where close objects get large screen sizes
+	// and should remain visible, not be clipped by near plane
+	ViewState.FrustumPlanes.Empty(5);
 
 	// Row vectors of the matrix
 	const FVector4 Row0(ViewProjectionMatrix.M[0][0], ViewProjectionMatrix.M[0][1], ViewProjectionMatrix.M[0][2], ViewProjectionMatrix.M[0][3]);
@@ -212,16 +220,8 @@ void UFragmentVisibility::BuildFrustumPlanes(const FVector& CameraLocation, cons
 		}
 	}
 
-	// Near plane: Row3 + Row2
-	{
-		FVector4 P = Row3 + Row2;
-		float Length = FVector(P.X, P.Y, P.Z).Size();
-		if (Length > KINDA_SMALL_NUMBER)
-		{
-			P /= Length;
-			ViewState.FrustumPlanes.Add(FPlane(P.X, P.Y, P.Z, P.W));
-		}
-	}
+	// SKIP Near plane (Row3 + Row2) - this was causing close objects to be culled
+	// Near plane culling is handled by the renderer, not visibility system
 
 	// Far plane: Row3 - Row2
 	{
@@ -234,36 +234,34 @@ void UFragmentVisibility::BuildFrustumPlanes(const FVector& CameraLocation, cons
 		}
 	}
 
-	UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("Built %d frustum planes"), ViewState.FrustumPlanes.Num());
+	UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("Built %d frustum planes (near plane excluded)"),
+	       ViewState.FrustumPlanes.Num());
 }
 
 bool UFragmentVisibility::BoxIntersectsPlane(const FBox& Box, const FPlane& Plane)
 {
-	// Port of engine_fragment's PlanesUtils.collides() / getPointDistance()
-	// This is the optimized AABB-plane intersection test.
+	// FIX: Corrected frustum plane test
+	// The Gribb/Hartmann extraction produces planes with normals pointing OUTWARD from frustum.
+	// For a box to be "inside" the frustum, it must be on the NEGATIVE side of all planes.
 	//
-	// For each plane, we find the corner of the box that is CLOSEST to the plane
-	// (in the direction of the plane normal). If this corner is behind the plane,
-	// the entire box is culled.
-	//
-	// The "closest" corner depends on the sign of each component of the plane normal:
-	// - If normal.x >= 0, use Box.Max.X (farthest in +X direction)
-	// - If normal.x < 0, use Box.Min.X (farthest in -X direction)
-	// etc.
+	// We use the "n-vertex" (negative vertex) - the corner CLOSEST to the plane in normal direction.
+	// If the n-vertex is in front of the plane (positive side), the entire box is outside.
 
 	const FVector Normal(Plane.X, Plane.Y, Plane.Z);
 
-	// Find the "positive vertex" (p-vertex) - the corner farthest in the direction of the normal
-	FVector PVertex;
-	PVertex.X = (Normal.X >= 0.0f) ? Box.Max.X : Box.Min.X;
-	PVertex.Y = (Normal.Y >= 0.0f) ? Box.Max.Y : Box.Min.Y;
-	PVertex.Z = (Normal.Z >= 0.0f) ? Box.Max.Z : Box.Min.Z;
+	// Find the "negative vertex" (n-vertex) - corner closest in normal direction
+	// This is the OPPOSITE of p-vertex selection
+	FVector NVertex;
+	NVertex.X = (Normal.X >= 0.0f) ? Box.Min.X : Box.Max.X;
+	NVertex.Y = (Normal.Y >= 0.0f) ? Box.Min.Y : Box.Max.Y;
+	NVertex.Z = (Normal.Z >= 0.0f) ? Box.Min.Z : Box.Max.Z;
 
-	// Distance from p-vertex to plane (positive = in front of plane)
-	const float Distance = Plane.PlaneDot(PVertex);
+	// Distance from n-vertex to plane
+	const float Distance = Plane.PlaneDot(NVertex);
 
-	// If p-vertex is behind plane, entire box is outside frustum
-	return Distance >= 0.0f;
+	// If n-vertex is in front of plane (positive), entire box is outside frustum
+	// Box is inside/intersecting if n-vertex is behind or on plane (negative or zero)
+	return Distance <= 0.0f;
 }
 
 bool UFragmentVisibility::IsInFrustum(const FBox& Box) const
@@ -300,14 +298,13 @@ EFragmentLod UFragmentVisibility::FetchLodLevel(const UFragmentTile* Tile) const
 	// === FRUSTUM CULLING ===
 	if (!IsInFrustum(Tile->Bounds))
 	{
-		UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("Tile culled: outside frustum"));
 		return EFragmentLod::Invisible;
 	}
 
 	// === SCREEN SIZE CHECK (optional culling of tiny objects) ===
+	const float Distance = GetDistanceToBox(Tile->Bounds);
 	const FVector Extent = Tile->Bounds.GetExtent();
 	const float Dimension = FMath::Max3(Extent.X, Extent.Y, Extent.Z) * 2.0f;
-	const float Distance = GetDistanceToBox(Tile->Bounds);
 	const float ScreenSize = CalculateScreenSize(Dimension, Distance);
 
 	// Apply graphics quality multiplier
@@ -316,11 +313,9 @@ EFragmentLod UFragmentVisibility::FetchLodLevel(const UFragmentTile* Tile) const
 	// Cull if too small on screen
 	if (ScreenSize < MinScreen)
 	{
-		UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("Tile culled: screen size %.2f < %.2f"), ScreenSize, MinScreen);
 		return EFragmentLod::Invisible;
 	}
 
 	// Visible - render full geometry
-	UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("Tile visible: screen size %.2f px"), ScreenSize);
 	return EFragmentLod::Visible;
 }

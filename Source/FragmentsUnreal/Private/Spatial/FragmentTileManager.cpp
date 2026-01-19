@@ -126,20 +126,22 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 	);
 	const bool bRotatedSignificantly = RotationChange >= MinCameraRotation;
 
-	if (!bTimeThresholdMet && !bMovedSignificantly && !bRotatedSignificantly)
-	{
-		// OPTIMIZATION: Only process unload timers if camera moved recently (prevents delayed pops)
-		const double TimeSinceMovement = CurrentTime - LastCameraMovementTime;
-		if (TimeSinceMovement < 5.0)
-		{
-			ProcessUnloadTimers(TimeSinceUpdate);
-		}
-		else
-		{
-			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Deferring unload timers: camera stationary for %.1fs"), TimeSinceMovement);
-		}
-		return;
-	}
+	// FIX B: TEMPORARILY DISABLED - Force visibility updates every frame for debugging (tile-based path)
+	// TODO: Re-enable with optimized thresholds once close-object culling is fixed
+	// if (!bTimeThresholdMet && !bMovedSignificantly && !bRotatedSignificantly)
+	// {
+	// 	// OPTIMIZATION: Only process unload timers if camera moved recently (prevents delayed pops)
+	// 	const double TimeSinceMovement = CurrentTime - LastCameraMovementTime;
+	// 	if (TimeSinceMovement < 5.0)
+	// 	{
+	// 		ProcessUnloadTimers(TimeSinceUpdate);
+	// 	}
+	// 	else
+	// 	{
+	// 		UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Deferring unload timers: camera stationary for %.1fs"), TimeSinceMovement);
+	// 	}
+	// 	return;
+	// }
 
 	UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Update triggered: time=%d move=%d (%.0fcm) rotate=%d (%.1fdeg)"),
 	       bTimeThresholdMet, bMovedSignificantly, DistanceMoved, bRotatedSignificantly, RotationChange);
@@ -1223,10 +1225,13 @@ void UFragmentTileManager::InitializePerSampleVisibility(UFragmentRegistry* InRe
 
 	// Clear per-sample state
 	SpawnedFragments.Empty();
+	HiddenFragments.Empty();
 	SpawnedFragmentActors.Empty();
+	FragmentLastUsedTime.Empty();
+	PerSampleCacheBytes = 0;
 
-	UE_LOG(LogFragmentTileManager, Log, TEXT("Per-sample visibility initialized: %d fragments in registry"),
-	       FragmentRegistry->GetFragmentCount());
+	UE_LOG(LogFragmentTileManager, Log, TEXT("Per-sample visibility initialized: %d fragments in registry, Cache budget: %lld MB"),
+	       FragmentRegistry->GetFragmentCount(), MaxCachedBytes / (1024 * 1024));
 }
 
 void UFragmentTileManager::UpdateVisibleTiles_PerSample(const FVector& CameraLocation, const FRotator& CameraRotation,
@@ -1254,10 +1259,13 @@ void UFragmentTileManager::UpdateVisibleTiles_PerSample(const FVector& CameraLoc
 	);
 	const bool bRotatedSignificantly = RotationChange >= MinCameraRotation;
 
-	if (!bTimeThresholdMet && !bMovedSignificantly && !bRotatedSignificantly)
-	{
-		return;
-	}
+	// FIX B: TEMPORARILY DISABLED - Force visibility updates every frame for debugging
+	// This bypasses all thresholds to ensure visibility is always recalculated
+	// TODO: Re-enable with optimized thresholds once close-object culling is fixed
+	// if (!bTimeThresholdMet && !bMovedSignificantly && !bRotatedSignificantly)
+	// {
+	// 	return;
+	// }
 
 	UE_LOG(LogFragmentTileManager, VeryVerbose,
 	       TEXT("Per-sample update: time=%d move=%d (%.0fcm) rotate=%d (%.1fdeg)"),
@@ -1278,23 +1286,54 @@ void UFragmentTileManager::UpdateVisibleTiles_PerSample(const FVector& CameraLoc
 	const TArray<FFragmentVisibilityResult>& VisibleSamples = SampleVisibility->GetVisibleSamples();
 	TileGenerator->GenerateTiles(VisibleSamples, FragmentRegistry);
 
-	// === STEP 3: Determine fragments to spawn/unload ===
+	// === STEP 3: Determine fragments to spawn/show/hide ===
+	// Note: We check against SpawnedFragments only (not hidden ones) for spawn list
 	TArray<int32> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
-	TArray<int32> ToUnload = TileGenerator->GetFragmentsToUnload(SpawnedFragments);
+	TArray<int32> ToHide = TileGenerator->GetFragmentsToUnload(SpawnedFragments);
 
-	// Update spawn tracking
-	TotalFragmentsToSpawn = ToSpawn.Num();
+	// Check how many can be shown from cache vs need actual spawning
+	int32 CacheHits = 0;
+	TArray<int32> ActuallyNeedSpawn;
+	for (int32 LocalId : ToSpawn)
+	{
+		if (HiddenFragments.Contains(LocalId))
+		{
+			// Can be shown from cache
+			CacheHits++;
+		}
+		else
+		{
+			ActuallyNeedSpawn.Add(LocalId);
+		}
+	}
+
+	// Update spawn tracking (only count actual spawns, not cache hits)
+	TotalFragmentsToSpawn = ActuallyNeedSpawn.Num();
 	FragmentsSpawned = 0;
 
 	UE_LOG(LogFragmentTileManager, Verbose,
-	       TEXT("Per-sample visibility: %d visible, %d tiles, %d to spawn, %d to unload"),
-	       VisibleSamples.Num(), TileGenerator->GetTileCount(), ToSpawn.Num(), ToUnload.Num());
+	       TEXT("Per-sample visibility: %d visible, %d tiles, %d to show (%d cache hits), %d to hide"),
+	       VisibleSamples.Num(), TileGenerator->GetTileCount(), ToSpawn.Num(), CacheHits, ToHide.Num());
 
-	// === STEP 4: Unload fragments that left frustum ===
-	for (int32 LocalId : ToUnload)
+	// === STEP 4: Show cached fragments immediately (cache hits) ===
+	for (int32 LocalId : ToSpawn)
 	{
-		UnloadFragmentById(LocalId);
+		if (HiddenFragments.Contains(LocalId))
+		{
+			ShowFragmentById(LocalId);
+		}
 	}
+
+	// === STEP 5: Hide fragments that left frustum (don't destroy - keep in cache) ===
+	// Matches engine_fragment: visibility toggle instead of destroy
+	for (int32 LocalId : ToHide)
+	{
+		HideFragmentById(LocalId);
+	}
+
+	// === STEP 6: Evict hidden fragments if memory over budget ===
+	// Matches engine_fragment: only evict when memoryOverflow AND invisible
+	EvictFragmentsToFitBudget();
 
 	// Update last camera state
 	LastCameraPosition = CameraLocation;
@@ -1313,17 +1352,28 @@ void UFragmentTileManager::ProcessSpawnChunk_PerSample()
 		return;
 	}
 
-	// Get fragments to spawn
+	// Get fragments to spawn - filter out those already spawned or in hidden cache
+	// (hidden cache fragments are shown immediately in UpdateVisibleTiles_PerSample)
 	TArray<int32> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
 
-	if (ToSpawn.Num() == 0)
+	// Filter out fragments that are in hidden cache (already handled)
+	TArray<int32> ActuallyNeedSpawn;
+	for (int32 LocalId : ToSpawn)
 	{
-		if (TotalFragmentsToSpawn > 0)
+		if (!HiddenFragments.Contains(LocalId))
+		{
+			ActuallyNeedSpawn.Add(LocalId);
+		}
+	}
+
+	if (ActuallyNeedSpawn.Num() == 0)
+	{
+		if (TotalFragmentsToSpawn > 0 && FragmentsSpawned >= TotalFragmentsToSpawn)
 		{
 			LoadingStage = TEXT("Complete");
 			SpawnProgress = 1.0f;
 		}
-		else
+		else if (TotalFragmentsToSpawn == 0)
 		{
 			LoadingStage = TEXT("Idle");
 		}
@@ -1331,7 +1381,7 @@ void UFragmentTileManager::ProcessSpawnChunk_PerSample()
 	}
 
 	// Sort by distance (closest first) for better perceived loading
-	ToSpawn.Sort([this](const int32& A, const int32& B)
+	ActuallyNeedSpawn.Sort([this](const int32& A, const int32& B)
 	{
 		const FFragmentVisibilityData* DataA = FragmentRegistry ? FragmentRegistry->FindFragment(A) : nullptr;
 		const FFragmentVisibilityData* DataB = FragmentRegistry ? FragmentRegistry->FindFragment(B) : nullptr;
@@ -1348,7 +1398,7 @@ void UFragmentTileManager::ProcessSpawnChunk_PerSample()
 	const double MaxSpawnTimeSec = MaxSpawnTimeMs / 1000.0;
 	int32 SpawnedThisFrame = 0;
 
-	for (int32 LocalId : ToSpawn)
+	for (int32 LocalId : ActuallyNeedSpawn)
 	{
 		// Check time budget
 		const double ElapsedTime = FPlatformTime::Seconds() - StartTime;
@@ -1372,7 +1422,19 @@ void UFragmentTileManager::ProcessSpawnChunk_PerSample()
 
 bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
 {
-	if (!Importer || SpawnedFragments.Contains(LocalId))
+	// Skip if already spawned (visible)
+	if (SpawnedFragments.Contains(LocalId))
+	{
+		return false;
+	}
+
+	// Check if in hidden cache - show it instead of spawning
+	if (HiddenFragments.Contains(LocalId))
+	{
+		return ShowFragmentById(LocalId);
+	}
+
+	if (!Importer)
 	{
 		return false;
 	}
@@ -1441,11 +1503,71 @@ bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
 		SpawnedFragments.Add(LocalId);
 		SpawnedFragmentActors.Add(LocalId, SpawnedActor);
 
-		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Per-sample spawned fragment LocalId %d"), LocalId);
+		// Track memory usage
+		int64 FragmentMemory = CalculateFragmentMemoryUsage(SpawnedActor);
+		PerSampleCacheBytes += FragmentMemory;
+
+		// Update LRU tracking
+		TouchFragment(LocalId);
+
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Per-sample spawned fragment LocalId %d (%lld KB)"),
+		       LocalId, FragmentMemory / 1024);
 		return true;
 	}
 
 	return false;
+}
+
+void UFragmentTileManager::HideFragmentById(int32 LocalId)
+{
+	AFragment** ActorPtr = SpawnedFragmentActors.Find(LocalId);
+	if (!ActorPtr || !*ActorPtr)
+	{
+		return;
+	}
+
+	AFragment* Actor = *ActorPtr;
+
+	// Just hide the actor, don't destroy (matches engine_fragment behavior)
+	Actor->SetActorHiddenInGame(true);
+
+	// Move from spawned to hidden set
+	SpawnedFragments.Remove(LocalId);
+	HiddenFragments.Add(LocalId);
+
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Per-sample hid fragment LocalId %d (cached)"), LocalId);
+}
+
+bool UFragmentTileManager::ShowFragmentById(int32 LocalId)
+{
+	// Check if fragment is in hidden cache
+	if (!HiddenFragments.Contains(LocalId))
+	{
+		return false;
+	}
+
+	AFragment** ActorPtr = SpawnedFragmentActors.Find(LocalId);
+	if (!ActorPtr || !*ActorPtr)
+	{
+		// Actor was destroyed somehow, remove from hidden set
+		HiddenFragments.Remove(LocalId);
+		return false;
+	}
+
+	AFragment* Actor = *ActorPtr;
+
+	// Show the cached actor
+	Actor->SetActorHiddenInGame(false);
+
+	// Move from hidden to spawned set
+	HiddenFragments.Remove(LocalId);
+	SpawnedFragments.Add(LocalId);
+
+	// Update LRU tracking
+	TouchFragment(LocalId);
+
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Per-sample showed cached fragment LocalId %d (cache hit)"), LocalId);
+	return true;
 }
 
 void UFragmentTileManager::UnloadFragmentById(int32 LocalId)
@@ -1454,18 +1576,165 @@ void UFragmentTileManager::UnloadFragmentById(int32 LocalId)
 	if (!ActorPtr || !*ActorPtr)
 	{
 		SpawnedFragments.Remove(LocalId);
+		HiddenFragments.Remove(LocalId);
 		SpawnedFragmentActors.Remove(LocalId);
+		FragmentLastUsedTime.Remove(LocalId);
 		return;
 	}
 
 	AFragment* Actor = *ActorPtr;
 
+	// Calculate memory before destroying
+	int64 FragmentMemory = CalculateFragmentMemoryUsage(Actor);
+
 	// Destroy the actor
 	Actor->Destroy();
 
-	// Remove from tracking
+	// Remove from all tracking
 	SpawnedFragments.Remove(LocalId);
+	HiddenFragments.Remove(LocalId);
 	SpawnedFragmentActors.Remove(LocalId);
+	FragmentLastUsedTime.Remove(LocalId);
 
-	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Per-sample unloaded fragment LocalId %d"), LocalId);
+	// Update cache memory tracking
+	PerSampleCacheBytes = FMath::Max((int64)0, PerSampleCacheBytes - FragmentMemory);
+
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Per-sample unloaded fragment LocalId %d (%lld KB freed)"),
+	       LocalId, FragmentMemory / 1024);
+}
+
+int64 UFragmentTileManager::CalculateFragmentMemoryUsage(AFragment* Actor) const
+{
+	if (!Actor)
+	{
+		return 0;
+	}
+
+	int64 TotalBytes = 0;
+
+	// Get all static mesh components
+	TArray<UStaticMeshComponent*> MeshComponents;
+	Actor->GetComponents<UStaticMeshComponent>(MeshComponents);
+
+	for (UStaticMeshComponent* MeshComp : MeshComponents)
+	{
+		if (!MeshComp || !MeshComp->GetStaticMesh())
+		{
+			continue;
+		}
+
+		UStaticMesh* Mesh = MeshComp->GetStaticMesh();
+
+		// Get mesh resource size
+		if (Mesh->GetRenderData())
+		{
+			for (const FStaticMeshLODResources& LOD : Mesh->GetRenderData()->LODResources)
+			{
+				// Vertex buffer
+				TotalBytes += LOD.VertexBuffers.PositionVertexBuffer.GetNumVertices() * sizeof(FVector);
+				TotalBytes += LOD.VertexBuffers.StaticMeshVertexBuffer.GetResourceSize();
+				TotalBytes += LOD.VertexBuffers.ColorVertexBuffer.GetNumVertices() * sizeof(FColor);
+
+				// Index buffer
+				TotalBytes += LOD.IndexBuffer.GetAllocatedSize();
+			}
+		}
+
+		// Material instances (rough estimate)
+		TArray<UMaterialInterface*> Materials = MeshComp->GetMaterials();
+		TotalBytes += Materials.Num() * 1024;  // ~1 KB per material instance
+	}
+
+	// Actor overhead (rough estimate)
+	TotalBytes += 4096;  // ~4 KB per actor
+
+	return TotalBytes;
+}
+
+void UFragmentTileManager::TouchFragment(int32 LocalId)
+{
+	if (!Importer)
+	{
+		return;
+	}
+
+	UWorld* World = Importer->GetWorld();
+	if (World)
+	{
+		FragmentLastUsedTime.Add(LocalId, World->GetTimeSeconds());
+	}
+}
+
+bool UFragmentTileManager::IsPerSampleMemoryOverBudget() const
+{
+	return PerSampleCacheBytes > MaxCachedBytes;
+}
+
+void UFragmentTileManager::EvictFragmentsToFitBudget()
+{
+	if (!Importer)
+	{
+		return;
+	}
+
+	// Only evict if over budget (matches engine_fragment's memoryOverflow check)
+	if (!IsPerSampleMemoryOverBudget())
+	{
+		return;
+	}
+
+	UWorld* World = Importer->GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	const double CurrentTime = World->GetTimeSeconds();
+
+	UE_LOG(LogFragmentTileManager, Warning, TEXT("Per-sample cache over budget: %lld MB / %lld MB - evicting hidden fragments"),
+	       PerSampleCacheBytes / (1024 * 1024),
+	       MaxCachedBytes / (1024 * 1024));
+
+	// Build list of eviction candidates from HIDDEN fragments only
+	// (matches engine_fragment: only evict invisible fragments)
+	TArray<int32> EvictionCandidates;
+
+	for (int32 LocalId : HiddenFragments)
+	{
+		// Check if fragment has been hidden long enough
+		double* LastUsedPtr = FragmentLastUsedTime.Find(LocalId);
+		double TimeSinceUsed = CurrentTime - (LastUsedPtr ? *LastUsedPtr : 0.0);
+
+		if (TimeSinceUsed >= MinTimeBeforeUnload)
+		{
+			EvictionCandidates.Add(LocalId);
+		}
+	}
+
+	// Sort by last used time (LRU first - oldest first)
+	EvictionCandidates.Sort([this](const int32& A, const int32& B)
+	{
+		double TimeA = FragmentLastUsedTime.FindRef(A);
+		double TimeB = FragmentLastUsedTime.FindRef(B);
+		return TimeA < TimeB;  // Oldest first
+	});
+
+	// Evict fragments until we're under budget
+	int32 EvictedCount = 0;
+	for (int32 LocalId : EvictionCandidates)
+	{
+		if (!IsPerSampleMemoryOverBudget())
+		{
+			break;  // Under budget now
+		}
+
+		UnloadFragmentById(LocalId);
+		EvictedCount++;
+	}
+
+	if (EvictedCount > 0)
+	{
+		UE_LOG(LogFragmentTileManager, Log, TEXT("Evicted %d hidden fragments - Cache now: %lld MB"),
+		       EvictedCount, PerSampleCacheBytes / (1024 * 1024));
+	}
 }

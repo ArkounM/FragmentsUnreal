@@ -168,6 +168,18 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 			const int32 Index = Fragments.Num();
 			Fragments.Add(VisData);
 			LocalIdToIndex.Add(Item.LocalId, Index);
+
+			// DEBUG: Log bounds for first few fragments to validate coordinate system
+			if (Index < 5)
+			{
+				UE_LOG(LogFragmentRegistry, Log,
+				       TEXT("Fragment %d bounds: Min=%s Max=%s Center=%s MaxDim=%.1f"),
+				       Item.LocalId,
+				       *VisData.WorldBounds.Min.ToString(),
+				       *VisData.WorldBounds.Max.ToString(),
+				       *VisData.WorldBounds.GetCenter().ToString(),
+				       VisData.MaxDimension);
+			}
 		}
 		else
 		{

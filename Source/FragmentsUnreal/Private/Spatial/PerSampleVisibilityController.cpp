@@ -94,13 +94,14 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		}
 
 		// === FRUSTUM TEST (per-fragment, not per-tile!) ===
-		if (!IsInFrustum(Sample.WorldBounds))
+		const bool bInFrustum = IsInFrustum(Sample.WorldBounds);
+		if (!bInFrustum)
 		{
 			FrustumCulled++;
 			continue;
 		}
 
-		// === DISTANCE & SCREEN SIZE CALCULATION ===
+		// === DISTANCE AND SCREEN SIZE CALCULATION ===
 		const float Distance = GetDistanceToBox(Sample.WorldBounds);
 		const float ScreenSize = CalculateScreenSize(Sample.MaxDimension, Distance);
 
@@ -108,6 +109,14 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		if (ScreenSize < MinScreen)
 		{
 			ScreenSizeCulled++;
+
+			// Debug log for screen size culled (sample first few)
+			if (ScreenSizeCulled <= 5)
+			{
+				UE_LOG(LogPerSampleVisibility, Log,
+				       TEXT("Screen size culled: LocalId=%d, ScreenSize=%.2f < MinScreen=%.2f, Distance=%.1fcm"),
+				       Sample.LocalId, ScreenSize, MinScreen, Distance);
+			}
 			continue;
 		}
 
@@ -128,9 +137,11 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 	LastCameraPosition = CameraPos;
 	LastCameraRotation = CameraRot;
 
-	UE_LOG(LogPerSampleVisibility, Verbose,
-	       TEXT("Visibility update: %d/%d visible, %d frustum culled, %d screen size culled"),
-	       VisibleSamples.Num(), EndIndex - StartIndex, FrustumCulled, ScreenSizeCulled);
+	// Debug logging - per-frame visibility stats
+	UE_LOG(LogPerSampleVisibility, Log,
+	       TEXT("Visibility: %d visible / %d total | Culled: %d frustum, %d screensize | Camera: %s"),
+	       VisibleSamples.Num(), EndIndex - StartIndex,
+	       FrustumCulled, ScreenSizeCulled, *CameraPos.ToString());
 }
 
 bool UPerSampleVisibilityController::NeedsUpdate(const FVector& NewPosition, const FRotator& NewRotation) const
@@ -190,11 +201,16 @@ float UPerSampleVisibilityController::GetViewDimension(float Distance) const
 float UPerSampleVisibilityController::CalculateScreenSize(float Dimension, float Distance) const
 {
 	// Port of engine_fragment's screenSize()
-
-	// Avoid division by zero for very close objects
+	//
+	// Match engine_fragment: when camera is inside/very close to object,
+	// return maximum screen size (object fills entire screen).
+	// In engine_fragment, Distance=0 causes division by zero → INFINITY screen size.
+	// INFINITY < any_threshold = FALSE → always visible.
+	// We emulate this by returning a guaranteed-large value.
 	if (Distance < 1.0f)
 	{
-		Distance = 1.0f;
+		// Camera inside or touching bounds - object fills screen
+		return ViewState.ViewportHeight * 10.0f;  // Guaranteed to pass any threshold
 	}
 
 	const float ViewDimension = GetViewDimension(Distance);
@@ -202,7 +218,7 @@ float UPerSampleVisibilityController::CalculateScreenSize(float Dimension, float
 	// Avoid division by zero
 	if (ViewDimension < KINDA_SMALL_NUMBER)
 	{
-		return ViewState.ViewportHeight; // Object fills screen
+		return ViewState.ViewportHeight * 10.0f;  // Object fills screen
 	}
 
 	const float ScreenDimension = Dimension / ViewDimension;
@@ -225,22 +241,28 @@ float UPerSampleVisibilityController::GetDistanceToBox(const FBox& Box) const
 
 bool UPerSampleVisibilityController::BoxIntersectsPlane(const FBox& Box, const FPlane& Plane)
 {
-	// Port of engine_fragment's PlanesUtils.collides()
-	// Optimized AABB-plane test using p-vertex
+	// FIX: Corrected frustum plane test
+	// The Gribb/Hartmann extraction produces planes with normals pointing OUTWARD from frustum.
+	// For a box to be "inside" the frustum, it must be on the NEGATIVE side of all planes.
+	//
+	// We use the "n-vertex" (negative vertex) - the corner CLOSEST to the plane in normal direction.
+	// If the n-vertex is in front of the plane (positive side), the entire box is outside.
 
 	const FVector Normal(Plane.X, Plane.Y, Plane.Z);
 
-	// Find the "positive vertex" (p-vertex) - corner farthest in normal direction
-	FVector PVertex;
-	PVertex.X = (Normal.X >= 0.0f) ? Box.Max.X : Box.Min.X;
-	PVertex.Y = (Normal.Y >= 0.0f) ? Box.Max.Y : Box.Min.Y;
-	PVertex.Z = (Normal.Z >= 0.0f) ? Box.Max.Z : Box.Min.Z;
+	// Find the "negative vertex" (n-vertex) - corner closest in normal direction
+	// This is the OPPOSITE of p-vertex selection
+	FVector NVertex;
+	NVertex.X = (Normal.X >= 0.0f) ? Box.Min.X : Box.Max.X;
+	NVertex.Y = (Normal.Y >= 0.0f) ? Box.Min.Y : Box.Max.Y;
+	NVertex.Z = (Normal.Z >= 0.0f) ? Box.Min.Z : Box.Max.Z;
 
-	// Distance from p-vertex to plane
-	const float Distance = Plane.PlaneDot(PVertex);
+	// Distance from n-vertex to plane
+	const float Distance = Plane.PlaneDot(NVertex);
 
-	// If p-vertex is behind plane, entire box is outside frustum
-	return Distance >= 0.0f;
+	// If n-vertex is in front of plane (positive), entire box is outside frustum
+	// Box is inside/intersecting if n-vertex is behind or on plane (negative or zero)
+	return Distance <= 0.0f;
 }
 
 bool UPerSampleVisibilityController::IsInFrustum(const FBox& Box) const
@@ -281,8 +303,11 @@ void UPerSampleVisibilityController::BuildFrustumPlanes(const FVector& CameraLoc
 	// Combine into view-projection matrix
 	const FMatrix ViewProjectionMatrix = ViewMatrix * ProjectionMatrix;
 
-	// Extract 6 frustum planes using Gribb/Hartmann method
-	ViewState.FrustumPlanes.Empty(6);
+	// Extract 5 frustum planes using Gribb/Hartmann method
+	// NOTE: We skip the NEAR plane to prevent close objects from being culled
+	// This matches engine_fragment behavior where close objects get large screen sizes
+	// and should remain visible, not be clipped by near plane
+	ViewState.FrustumPlanes.Empty(5);
 
 	const FVector4 Row0(ViewProjectionMatrix.M[0][0], ViewProjectionMatrix.M[0][1], ViewProjectionMatrix.M[0][2], ViewProjectionMatrix.M[0][3]);
 	const FVector4 Row1(ViewProjectionMatrix.M[1][0], ViewProjectionMatrix.M[1][1], ViewProjectionMatrix.M[1][2], ViewProjectionMatrix.M[1][3]);
@@ -333,16 +358,8 @@ void UPerSampleVisibilityController::BuildFrustumPlanes(const FVector& CameraLoc
 		}
 	}
 
-	// Near plane: Row3 + Row2
-	{
-		FVector4 P = Row3 + Row2;
-		float Length = FVector(P.X, P.Y, P.Z).Size();
-		if (Length > KINDA_SMALL_NUMBER)
-		{
-			P /= Length;
-			ViewState.FrustumPlanes.Add(FPlane(P.X, P.Y, P.Z, P.W));
-		}
-	}
+	// SKIP Near plane (Row3 + Row2) - this was causing close objects to be culled
+	// Near plane culling is handled by the renderer, not visibility system
 
 	// Far plane: Row3 - Row2
 	{
@@ -354,4 +371,7 @@ void UPerSampleVisibilityController::BuildFrustumPlanes(const FVector& CameraLoc
 			ViewState.FrustumPlanes.Add(FPlane(P.X, P.Y, P.Z, P.W));
 		}
 	}
+
+	UE_LOG(LogPerSampleVisibility, VeryVerbose, TEXT("Built %d frustum planes (near plane excluded)"),
+	       ViewState.FrustumPlanes.Num());
 }
