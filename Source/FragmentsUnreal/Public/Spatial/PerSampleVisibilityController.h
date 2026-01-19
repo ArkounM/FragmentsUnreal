@@ -130,9 +130,9 @@ public:
 
 	// --- Configuration ---
 
-	/** LOD mode override */
+	/** Show all fragments regardless of frustum (debug mode) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility")
-	EFragmentLodMode LodMode = EFragmentLodMode::Default;
+	bool bShowAllVisible = false;
 
 	/** Graphics quality multiplier (affects screen size thresholds) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility", meta = (ClampMin = "0.5", ClampMax = "2.0"))
@@ -146,19 +146,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility", meta = (ClampMin = "1", ClampMax = "8"))
 	int32 FrameSpreadCount = 4;
 
-	// --- Screen Size Thresholds (matching engine_fragment) ---
+	// --- Screen Size Thresholds ---
 
-	/** Screen size below which small objects are hidden (pixels) */
+	/** Minimum screen size to show a fragment (pixels) - fragments smaller than this are culled */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|Thresholds")
-	float SmallScreenSize = 2.0f;
-
-	/** Screen size threshold for medium LOD (pixels) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|Thresholds")
-	float MediumScreenSize = 4.0f;
-
-	/** Screen size threshold for full geometry (pixels) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|Thresholds")
-	float LargeScreenSize = 16.0f;
+	float MinScreenSize = 2.0f;
 
 	/** Minimum camera movement to trigger update (cm) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|Update")
@@ -218,15 +210,6 @@ private:
 	 * @return Distance (0 if camera inside box)
 	 */
 	float GetDistanceToBox(const FBox& Box) const;
-
-	/**
-	 * Evaluate LOD level for a fragment.
-	 * Port of engine_fragment's fetchLodLevel().
-	 * @param Data Fragment visibility data
-	 * @param ScreenSize Calculated screen size
-	 * @return LOD level to use
-	 */
-	EFragmentLod EvaluateLod(const FFragmentVisibilityData& Data, float ScreenSize) const;
 
 	/**
 	 * Build frustum planes from camera parameters.

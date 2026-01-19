@@ -22,15 +22,13 @@ enum class EFragmentPriority : uint8
 };
 
 /**
- * LOD levels for semantic tiles
+ * LOD levels for semantic tiles - simplified to just Unloaded/Loaded
  */
 UENUM(BlueprintType)
 enum class ESemanticLOD : uint8
 {
-	Unloaded    UMETA(DisplayName = "Unloaded"),      // Not visible
-	Wireframe   UMETA(DisplayName = "Wireframe"),     // LOD 0: Bounding box wireframe
-	SimpleBox   UMETA(DisplayName = "SimpleBox"),     // LOD 1: Solid colored box
-	HighDetail  UMETA(DisplayName = "HighDetail")     // LOD 2: Full mesh detail
+	Unloaded    UMETA(DisplayName = "Unloaded"),      // Not visible / not loaded
+	Loaded      UMETA(DisplayName = "Loaded")         // Full mesh detail (geometry loaded)
 };
 
 /**
@@ -58,10 +56,6 @@ struct FSemanticSubTile
 	UPROPERTY()
 	ESemanticLOD TargetLOD;
 
-	/** Simple box mesh component (LOD 1) */
-	UPROPERTY()
-	class UProceduralMeshComponent* SimpleBoxMesh;
-
 	/** Current screen coverage */
 	float ScreenCoverage;
 
@@ -75,7 +69,6 @@ struct FSemanticSubTile
 		: Bounds(ForceInit)
 		, CurrentLOD(ESemanticLOD::Unloaded)
 		, TargetLOD(ESemanticLOD::Unloaded)
-		, SimpleBoxMesh(nullptr)
 		, ScreenCoverage(0.0f)
 		, Depth(0)
 	{
@@ -132,20 +125,15 @@ public:
 	/** Phase 4: Root sub-tile index */
 	int32 RootSubTileIndex;
 
-	// --- Legacy fields (Phase 2, deprecated in Phase 4) ---
-	/** @deprecated Use SpatialSubTiles instead */
+	/** Current LOD level */
 	UPROPERTY()
 	ESemanticLOD CurrentLOD;
 
-	/** @deprecated Use SpatialSubTiles instead */
+	/** Target LOD level */
 	UPROPERTY()
 	ESemanticLOD TargetLOD;
 
-	/** @deprecated Use SpatialSubTiles instead */
-	UPROPERTY()
-	class UProceduralMeshComponent* SimpleBoxMesh;
-
-	/** @deprecated Use SpatialSubTiles instead */
+	/** Screen coverage for visibility calculations */
 	float ScreenCoverage;
 
 	/** Last update time for this tile */
@@ -161,7 +149,6 @@ public:
 		, RootSubTileIndex(-1)
 		, CurrentLOD(ESemanticLOD::Unloaded)
 		, TargetLOD(ESemanticLOD::Unloaded)
-		, SimpleBoxMesh(nullptr)
 		, ScreenCoverage(0.0f)
 		, LastUpdateTime(0.0)
 	{
@@ -170,6 +157,7 @@ public:
 
 /**
  * Configuration for semantic tile system
+ * Simplified - LOD visualization removed, only frustum-based loading
  */
 USTRUCT(BlueprintType)
 struct FSemanticTileConfig
@@ -192,25 +180,9 @@ struct FSemanticTileConfig
 	UPROPERTY(EditAnywhere, Category = "Debug")
 	bool bDrawDebugBounds = false;
 
-	/** Screen coverage threshold for LOD 0 → LOD 1 transition (default: 1%) */
-	UPROPERTY(EditAnywhere, Category = "LOD", meta = (ClampMin = "0.001", ClampMax = "0.1"))
-	float LOD0ToLOD1Threshold = 0.01f;
-
-	/** Screen coverage threshold for LOD 1 → LOD 2 transition (default: 5%) */
-	UPROPERTY(EditAnywhere, Category = "LOD", meta = (ClampMin = "0.01", ClampMax = "0.5"))
-	float LOD1ToLOD2Threshold = 0.05f;
-
-	/** Enable LOD system (if false, always use high detail) */
-	UPROPERTY(EditAnywhere, Category = "LOD")
-	bool bEnableLOD = true;
-
-	/** Distance multiplier for HighDetail LOD (camera distance < radius × this value) */
-	UPROPERTY(EditAnywhere, Category = "LOD", meta = (ClampMin = "0.5", ClampMax = "10.0"))
-	float LOD2DistanceMultiplier = 2.5f;
-
-	/** Distance multiplier for SimpleBox LOD (camera distance < radius × this value) */
-	UPROPERTY(EditAnywhere, Category = "LOD", meta = (ClampMin = "1.0", ClampMax = "15.0"))
-	float LOD1DistanceMultiplier = 4.0f;
+	/** Distance multiplier for loading (camera distance < radius × this value triggers load) */
+	UPROPERTY(EditAnywhere, Category = "Loading", meta = (ClampMin = "0.5", ClampMax = "10.0"))
+	float LoadDistanceMultiplier = 2.5f;
 
 	// --- Phase 4: Spatial Subdivision Config ---
 
@@ -321,42 +293,19 @@ private:
 	                               const FRotator& CameraRotation, float FOV, float ViewportHeight);
 
 	/**
-	 * Determine target LOD level based on screen coverage
-	 * @param ScreenCoverage Screen coverage percentage (0.0 to 1.0)
-	 * @return Target LOD level
+	 * Determine if tile should be loaded based on distance
+	 * @param Tile Tile to evaluate
+	 * @param CameraLocation Camera position
+	 * @return true if tile should be loaded
 	 */
-	ESemanticLOD DetermineLODLevel(float ScreenCoverage);
+	bool ShouldLoadTile(USemanticTile* Tile, const FVector& CameraLocation);
 
 	/**
-	 * Transition a tile to target LOD level
+	 * Transition a tile to target LOD level (Loaded/Unloaded)
 	 * @param Tile Tile to transition
 	 * @param TargetLOD Target LOD level
 	 */
 	void TransitionToLOD(USemanticTile* Tile, ESemanticLOD TargetLOD);
-
-	/**
-	 * Show wireframe visualization for LOD 0
-	 * @param Tile Tile to visualize
-	 */
-	void ShowWireframe(USemanticTile* Tile);
-
-	/**
-	 * Show simple box visualization for LOD 1
-	 * @param Tile Tile to visualize
-	 */
-	void ShowSimpleBox(USemanticTile* Tile);
-
-	/**
-	 * Show high detail meshes for LOD 2
-	 * @param Tile Tile to load
-	 */
-	void ShowHighDetail(USemanticTile* Tile);
-
-	/**
-	 * Hide current LOD visualization for a tile
-	 * @param Tile Tile to hide
-	 */
-	void HideLOD(USemanticTile* Tile);
 
 	// --- Phase 4: Spatial Subdivision Methods ---
 
@@ -384,50 +333,30 @@ private:
 	void CalculateFragmentBounds(USemanticTile* Tile, TMap<int32, FBox>& OutFragmentBounds);
 
 	/**
-	 * Update LOD for a specific sub-tile
+	 * Update loading state for a specific sub-tile
 	 * @param Tile Parent semantic tile
 	 * @param SubTile Sub-tile to update
 	 * @param CameraLocation Camera position
 	 */
-	void UpdateSubTileLOD(USemanticTile* Tile, FSemanticSubTile& SubTile,
-	                       const FVector& CameraLocation);
+	void UpdateSubTileLoading(USemanticTile* Tile, FSemanticSubTile& SubTile,
+	                           const FVector& CameraLocation);
 
 	/**
-	 * Determine LOD level based on distance from camera to sub-tile
+	 * Determine if sub-tile should be loaded based on distance
 	 * Uses bounding sphere (box diagonal) for orientation-independent behavior
 	 * @param SubTile Sub-tile to evaluate
 	 * @param CameraLocation Camera position
-	 * @return Target LOD level
+	 * @return true if sub-tile should be loaded
 	 */
-	ESemanticLOD DetermineLODFromDistance(const FSemanticSubTile& SubTile, const FVector& CameraLocation) const;
+	bool ShouldLoadSubTile(const FSemanticSubTile& SubTile, const FVector& CameraLocation) const;
 
 	/**
-	 * Transition a sub-tile to target LOD
+	 * Transition a sub-tile to target LOD (Loaded/Unloaded)
 	 * @param Tile Parent semantic tile
 	 * @param SubTile Sub-tile to transition
 	 * @param TargetLOD Target LOD level
 	 */
 	void TransitionSubTileToLOD(USemanticTile* Tile, FSemanticSubTile& SubTile, ESemanticLOD TargetLOD);
-
-	/**
-	 * Show wireframe for a sub-tile
-	 * @param Tile Parent semantic tile
-	 * @param SubTile Sub-tile to visualize
-	 */
-	void ShowSubTileWireframe(USemanticTile* Tile, const FSemanticSubTile& SubTile);
-
-	/**
-	 * Show simple box for a sub-tile
-	 * @param Tile Parent semantic tile
-	 * @param SubTile Sub-tile to visualize
-	 */
-	void ShowSubTileSimpleBox(USemanticTile* Tile, FSemanticSubTile& SubTile);
-
-	/**
-	 * Hide sub-tile LOD visualization
-	 * @param SubTile Sub-tile to hide
-	 */
-	void HideSubTileLOD(FSemanticSubTile& SubTile);
 
 	// --- Existing Helper Methods ---
 

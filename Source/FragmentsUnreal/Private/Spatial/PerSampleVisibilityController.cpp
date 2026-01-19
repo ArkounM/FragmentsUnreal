@@ -65,12 +65,11 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		CurrentFrameIndex = (CurrentFrameIndex + 1) % FrameSpreadCount;
 	}
 
-	// Pre-compute quality-adjusted thresholds
-	const float SmallScreen = SmallScreenSize * GraphicsQuality;
-	const float MediumScreen = MediumScreenSize * GraphicsQuality;
+	// Pre-compute quality-adjusted threshold
+	const float MinScreen = MinScreenSize * GraphicsQuality;
 
 	int32 FrustumCulled = 0;
-	int32 LodCulled = 0;
+	int32 ScreenSizeCulled = 0;
 
 	// === MAIN VISIBILITY LOOP ===
 	// This is the core per-sample evaluation that tests EACH fragment individually
@@ -78,13 +77,13 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 	{
 		const FFragmentVisibilityData& Sample = AllFragments[i];
 
-		// === LOD MODE OVERRIDE ===
-		if (LodMode == EFragmentLodMode::AllVisible)
+		// === DEBUG MODE: SHOW ALL ===
+		if (bShowAllVisible)
 		{
 			// Skip frustum test, show everything
 			FFragmentVisibilityResult Result;
 			Result.LocalId = Sample.LocalId;
-			Result.LodLevel = EFragmentLod::Geometry;
+			Result.LodLevel = EFragmentLod::Visible;
 			Result.ScreenSize = ViewportHeight; // Max screen size
 			Result.Distance = 0.0f;
 			Result.MaterialIndex = Sample.MaterialIndex;
@@ -105,19 +104,17 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		const float Distance = GetDistanceToBox(Sample.WorldBounds);
 		const float ScreenSize = CalculateScreenSize(Sample.MaxDimension, Distance);
 
-		// === LOD EVALUATION ===
-		const EFragmentLod LodLevel = EvaluateLod(Sample, ScreenSize);
-
-		if (LodLevel == EFragmentLod::Invisible)
+		// === SCREEN SIZE CULLING ===
+		if (ScreenSize < MinScreen)
 		{
-			LodCulled++;
+			ScreenSizeCulled++;
 			continue;
 		}
 
 		// === ADD TO VISIBLE SAMPLES ===
 		FFragmentVisibilityResult Result;
 		Result.LocalId = Sample.LocalId;
-		Result.LodLevel = LodLevel;
+		Result.LodLevel = EFragmentLod::Visible;
 		Result.ScreenSize = ScreenSize;
 		Result.Distance = Distance;
 		Result.MaterialIndex = Sample.MaterialIndex;
@@ -132,8 +129,8 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 	LastCameraRotation = CameraRot;
 
 	UE_LOG(LogPerSampleVisibility, Verbose,
-	       TEXT("Visibility update: %d/%d visible, %d frustum culled, %d lod culled"),
-	       VisibleSamples.Num(), EndIndex - StartIndex, FrustumCulled, LodCulled);
+	       TEXT("Visibility update: %d/%d visible, %d frustum culled, %d screen size culled"),
+	       VisibleSamples.Num(), EndIndex - StartIndex, FrustumCulled, ScreenSizeCulled);
 }
 
 bool UPerSampleVisibilityController::NeedsUpdate(const FVector& NewPosition, const FRotator& NewRotation) const
@@ -169,48 +166,7 @@ int32 UPerSampleVisibilityController::GetCountByLod(EFragmentLod LodLevel) const
 	return Count;
 }
 
-EFragmentLod UPerSampleVisibilityController::EvaluateLod(const FFragmentVisibilityData& Data, float ScreenSize) const
-{
-	// Direct port of engine_fragment's fetchLodLevel() logic
-	// (virtual-tiles-controller.ts lines 775-835)
-
-	// Apply graphics quality to thresholds
-	const float SmallScreen = SmallScreenSize * GraphicsQuality;
-	const float MediumScreen = MediumScreenSize * GraphicsQuality;
-	const float LargeScreen = LargeScreenSize * GraphicsQuality;
-
-	// Screen size classification
-	const bool bIsSmallInScreen = ScreenSize < SmallScreen;      // < 2px
-	const bool bIsMediumInScreen = ScreenSize < MediumScreen;    // < 4px
-	const bool bIsLargeInScreen = ScreenSize < LargeScreen;      // < 16px
-
-	// Combined conditions (matching engine_fragment)
-	const bool bSmallAndFar = Data.bIsSmallObject && bIsMediumInScreen;
-	const bool bLargeAndVeryFar = !Data.bIsSmallObject && bIsSmallInScreen;
-	const bool bSmallAndClose = Data.bIsSmallObject && bIsLargeInScreen;
-	const bool bLargeAndFar = !Data.bIsSmallObject && bIsMediumInScreen;
-
-	// Very far away -> completely hide
-	if (bSmallAndFar || bLargeAndVeryFar)
-	{
-		return EFragmentLod::Invisible;
-	}
-
-	// All geometry mode -> show everything that passed frustum culling
-	if (LodMode == EFragmentLodMode::AllGeometry)
-	{
-		return EFragmentLod::Geometry;
-	}
-
-	// Far away but still visible -> use wireframe/simplified LOD
-	if (bSmallAndClose || bLargeAndFar)
-	{
-		return EFragmentLod::Wires;
-	}
-
-	// Default: full geometry detail
-	return EFragmentLod::Geometry;
-}
+// EvaluateLod removed - simplified to just Visible/Invisible based on frustum and screen size
 
 float UPerSampleVisibilityController::GetViewDimension(float Distance) const
 {

@@ -60,8 +60,9 @@ uint32 UDynamicTileGenerator::ComputeTileId(int32 MaterialIndex, EFragmentLod Lo
 {
 	// Port of engine_fragment's CRC tile ID generation
 	// Snap center to grid, then hash (material, lod, grid coords)
+	// Note: Wires LOD removed, always use geometry tile dimension
 
-	const float TileDim = (Lod == EFragmentLod::Wires) ? WiresTileDimension : GeometryTileDimension;
+	const float TileDim = GeometryTileDimension;
 
 	// Snap to grid (in cm, then convert to integer grid coords)
 	// Use floor to ensure consistent grid cell assignment

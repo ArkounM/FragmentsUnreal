@@ -108,9 +108,9 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Streaming")
 	bool bUsePerSampleVisibility = true;
 
-	/** LOD mode for engine_fragment visibility system */
+	/** Show all fragments regardless of frustum (debug mode) */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
-	EFragmentLodMode LodMode = EFragmentLodMode::Default;
+	bool bShowAllVisible = false;
 
 	/** Graphics quality multiplier (affects screen size thresholds) */
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.5", ClampMax = "2.0"))

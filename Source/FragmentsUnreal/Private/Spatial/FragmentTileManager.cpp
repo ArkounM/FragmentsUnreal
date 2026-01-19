@@ -69,15 +69,12 @@ void UFragmentTileManager::Initialize(const FString& InModelGuid, UFragmentOctre
 	// Initialize engine_fragment-style visibility system
 	Visibility = NewObject<UFragmentVisibility>(this);
 	FFragmentVisibilityParams VisParams;
-	VisParams.SmallObjectSize = 200.0f;           // 2m in cm
-	VisParams.SmallScreenSize = 2.0f;             // pixels
-	VisParams.MediumScreenSize = 4.0f;            // pixels
-	VisParams.LargeScreenSize = 16.0f;            // pixels
+	VisParams.MinScreenSize = 2.0f;               // pixels - minimum screen size to show
 	VisParams.UpdateViewPosition = MinCameraMovement;
 	VisParams.UpdateViewOrientation = MinCameraRotation;
 	VisParams.UpdateTime = MaxSpawnTimeMs;
 	Visibility->Initialize(VisParams);
-	Visibility->LodMode = LodMode;
+	Visibility->bShowAllVisible = bShowAllVisible;
 
 	UE_LOG(LogFragmentTileManager, Log, TEXT("TileManager initialized for model: %s, Cache budget: %lld MB, UseEngineFragmentVis: %d"),
 	       *ModelGuid, MaxCachedBytes / (1024 * 1024), bUseEngineFragmentVisibility);
@@ -179,7 +176,7 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 		// Update the visibility system with current camera state
 		Visibility->UpdateView(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
 		Visibility->ViewState.GraphicsQuality = GraphicsQuality;
-		Visibility->LodMode = LodMode;
+		Visibility->bShowAllVisible = bShowAllVisible;
 
 		// Get ALL tiles from octree (no FConvexVolume needed - we'll use our own frustum test)
 		TArray<UFragmentTile*> AllTiles;
@@ -1216,7 +1213,7 @@ void UFragmentTileManager::InitializePerSampleVisibility(UFragmentRegistry* InRe
 	// Create per-sample visibility controller
 	SampleVisibility = NewObject<UPerSampleVisibilityController>(this);
 	SampleVisibility->Initialize(FragmentRegistry);
-	SampleVisibility->LodMode = LodMode;
+	SampleVisibility->bShowAllVisible = bShowAllVisible;
 	SampleVisibility->GraphicsQuality = GraphicsQuality;
 	SampleVisibility->MinCameraMovement = MinCameraMovement;
 	SampleVisibility->MinCameraRotation = MinCameraRotation;
@@ -1273,7 +1270,7 @@ void UFragmentTileManager::UpdateVisibleTiles_PerSample(const FVector& CameraLoc
 	}
 
 	// === STEP 1: Per-sample visibility evaluation ===
-	SampleVisibility->LodMode = LodMode;
+	SampleVisibility->bShowAllVisible = bShowAllVisible;
 	SampleVisibility->GraphicsQuality = GraphicsQuality;
 	SampleVisibility->UpdateVisibility(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
 

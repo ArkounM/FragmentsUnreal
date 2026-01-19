@@ -7,36 +7,17 @@
 class UFragmentTile;
 
 /**
- * LOD levels matching engine_fragment's CurrentLod enum.
- * Used to determine rendering detail level based on screen size.
+ * Fragment visibility state - simplified to just Visible or Invisible.
+ * Frustum culling determines visibility; no intermediate LOD levels.
  */
 UENUM(BlueprintType)
 enum class EFragmentLod : uint8
 {
-	/** Full geometry detail */
-	Geometry = 0  UMETA(DisplayName = "Geometry"),
+	/** Visible - render full geometry */
+	Visible = 0   UMETA(DisplayName = "Visible"),
 
-	/** Simplified wireframe/lines representation */
-	Wires = 1     UMETA(DisplayName = "Wires"),
-
-	/** Not rendered at all */
-	Invisible = 2 UMETA(DisplayName = "Invisible")
-};
-
-/**
- * LOD mode matching engine_fragment's LodMode enum.
- */
-UENUM(BlueprintType)
-enum class EFragmentLodMode : uint8
-{
-	/** Hides invisible items, displays far away items as LOD geometry, close items as full geometry */
-	Default = 0   UMETA(DisplayName = "Default"),
-
-	/** Displays all items as full geometry (no culling) */
-	AllVisible = 1 UMETA(DisplayName = "All Visible"),
-
-	/** Hides invisible items, displays the rest as full geometry */
-	AllGeometry = 2 UMETA(DisplayName = "All Geometry")
+	/** Not rendered (outside frustum or too small) */
+	Invisible = 1 UMETA(DisplayName = "Invisible")
 };
 
 /**
@@ -81,29 +62,17 @@ struct FFragmentViewState
 };
 
 /**
- * Screen size thresholds matching engine_fragment.
- * Values are in pixels.
+ * Visibility parameters for frustum culling.
+ * Simplified - no intermediate LOD thresholds.
  */
 USTRUCT(BlueprintType)
 struct FFragmentVisibilityParams
 {
 	GENERATED_BODY()
 
-	/** Objects smaller than this world size are considered "small" (in cm) */
+	/** Screen size threshold for hiding tiny objects (pixels) - objects smaller than this are culled */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Thresholds")
-	float SmallObjectSize = 200.0f;  // 2 meters in engine_fragment units * 100
-
-	/** Screen size threshold for hiding tiny objects (pixels) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Thresholds")
-	float SmallScreenSize = 2.0f;
-
-	/** Screen size threshold for wireframe/simplified LOD (pixels) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Thresholds")
-	float MediumScreenSize = 4.0f;
-
-	/** Screen size threshold for full geometry (pixels) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Thresholds")
-	float LargeScreenSize = 16.0f;
+	float MinScreenSize = 2.0f;
 
 	/** Minimum camera movement to trigger update (cm) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Update")
@@ -196,13 +165,13 @@ public:
 
 	// --- Configuration ---
 
-	/** Current LOD mode */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility")
-	EFragmentLodMode LodMode = EFragmentLodMode::Default;
-
-	/** Visibility parameters (screen size thresholds, etc.) */
+	/** Visibility parameters (frustum culling settings) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility")
 	FFragmentVisibilityParams Params;
+
+	/** Show all fragments regardless of frustum (debug mode) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility")
+	bool bShowAllVisible = false;
 
 	/** Current view state */
 	UPROPERTY(BlueprintReadOnly, Category = "Visibility")

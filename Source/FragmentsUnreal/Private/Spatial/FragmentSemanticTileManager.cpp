@@ -3,9 +3,6 @@
 #include "Importer/FragmentModelWrapper.h"
 #include "Utils/FragmentsUtils.h"
 #include "DrawDebugHelpers.h"
-#include "ProceduralMeshComponent.h"
-#include "Materials/Material.h"
-#include "Materials/MaterialInstanceDynamic.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSemanticTiles, Log, All);
 
@@ -154,8 +151,7 @@ void UFragmentSemanticTileManager::BuildSemanticTiles()
 void UFragmentSemanticTileManager::Tick(float DeltaTime, const FVector& CameraLocation,
                                          const FRotator& CameraRotation, float FOV, float ViewportHeight)
 {
-	// Phase 2: LOD system implementation
-	// Calculate screen coverage for each semantic tile and transition LODs
+	// Simplified: No wireframe/simple box LOD - just determine if tiles should be loaded
 
 	if (!Importer)
 	{
@@ -164,28 +160,13 @@ void UFragmentSemanticTileManager::Tick(float DeltaTime, const FVector& CameraLo
 
 	const double CurrentTime = FPlatformTime::Seconds();
 
-	// Debug: Log first tick and periodically log LOD states
+	// Debug: Log first tick
 	static bool bFirstTick = true;
-	static double LastDebugTime = 0.0;
-	const double DebugInterval = 2.0; // Log every 2 seconds
-
 	if (bFirstTick)
 	{
-		UE_LOG(LogSemanticTiles, Log, TEXT("First Tick called - %d semantic tiles, %d priority levels"),
-		       AllSemanticTiles.Num(), 4);
-		UE_LOG(LogSemanticTiles, Log, TEXT("Camera: Loc=%s, FOV=%.1f, ViewportH=%.1f"),
-		       *CameraLocation.ToString(), FOV, ViewportHeight);
+		UE_LOG(LogSemanticTiles, Log, TEXT("First Tick called - %d semantic tiles"),
+		       AllSemanticTiles.Num());
 		bFirstTick = false;
-		LastDebugTime = CurrentTime;
-	}
-
-	// Periodic debug logging
-	bool bDoPeriodicDebug = (CurrentTime - LastDebugTime) >= DebugInterval;
-	if (bDoPeriodicDebug)
-	{
-		UE_LOG(LogSemanticTiles, Log, TEXT("=== Semantic Tile LOD Status (Camera: %s, Rotation: %s) ==="),
-		       *CameraLocation.ToString(), *CameraRotation.ToString());
-		LastDebugTime = CurrentTime;
 	}
 
 	// Process tiles by priority (structural first, details last)
@@ -211,19 +192,8 @@ void UFragmentSemanticTileManager::Tick(float DeltaTime, const FVector& CameraLo
 
 					FSemanticSubTile& SubTile = Tile->SpatialSubTiles[SubTileIndex];
 
-					// Update LOD for this sub-tile
-					UpdateSubTileLOD(Tile, SubTile, CameraLocation);
-
-					// Periodic debug logging (only for root sub-tiles of structural tiles)
-					if (bDoPeriodicDebug && PriorityIdx == 0 && SubTile.Depth == 0)
-					{
-						FVector SubTileCenter = SubTile.Bounds.GetCenter();
-						float Distance = FVector::Dist(CameraLocation, SubTileCenter);
-						UE_LOG(LogSemanticTiles, Log, TEXT("  %s: Depth=%d, Frags=%d, Coverage=%.4f%%, Dist=%.1fcm, LOD=%d → %d"),
-						       *Tile->IFCClassName, SubTile.Depth, SubTile.FragmentIDs.Num(),
-						       SubTile.ScreenCoverage * 100.0f, Distance,
-						       static_cast<int32>(SubTile.CurrentLOD), static_cast<int32>(SubTile.TargetLOD));
-					}
+					// Update loading state for this sub-tile
+					UpdateSubTileLoading(Tile, SubTile, CameraLocation);
 
 					// Process child sub-tiles
 					for (int32 i = 0; i < 8; i++)
@@ -240,43 +210,24 @@ void UFragmentSemanticTileManager::Tick(float DeltaTime, const FVector& CameraLo
 			}
 			else
 			{
-				// Phase 2: Legacy whole-tile LOD processing (no spatial subdivision)
-				// Calculate screen coverage
-				float ScreenCoverage = CalculateScreenCoverage(Tile, CameraLocation, CameraRotation,
-				                                                FOV, ViewportHeight);
-				Tile->ScreenCoverage = ScreenCoverage;
+				// Whole-tile loading (no spatial subdivision)
 				Tile->LastUpdateTime = CurrentTime;
 
-				// Determine target LOD
-				ESemanticLOD TargetLOD = DetermineLODLevel(ScreenCoverage);
+				// Determine if tile should be loaded based on distance
+				bool bShouldLoad = ShouldLoadTile(Tile, CameraLocation);
+				ESemanticLOD TargetLOD = bShouldLoad ? ESemanticLOD::Loaded : ESemanticLOD::Unloaded;
 				Tile->TargetLOD = TargetLOD;
-
-				// Periodic debug logging
-				if (bDoPeriodicDebug && PriorityIdx == 0) // Only log structural tiles to avoid spam
-				{
-					FVector TileCenter = Tile->CombinedBounds.GetCenter();
-					float Distance = FVector::Dist(CameraLocation, TileCenter);
-					UE_LOG(LogSemanticTiles, Log, TEXT("  %s: Coverage=%.4f%%, Dist=%.1fcm, LOD=%d → %d"),
-					       *Tile->IFCClassName, ScreenCoverage * 100.0f, Distance,
-					       static_cast<int32>(Tile->CurrentLOD), static_cast<int32>(TargetLOD));
-				}
 
 				// Transition to target LOD if different from current
 				if (Tile->CurrentLOD != TargetLOD)
 				{
 					TransitionToLOD(Tile, TargetLOD);
 				}
-
-				// CRITICAL FIX: Redraw wireframe every frame (DrawDebugBox only lasts one frame)
-				if (Tile->CurrentLOD == ESemanticLOD::Wireframe)
-				{
-					ShowWireframe(Tile);
-				}
 			}
 		}
 	}
 
-	// Draw debug bounds if enabled (in addition to LOD visualization)
+	// Draw debug bounds if enabled
 	if (Config.bDrawDebugBounds && Importer)
 	{
 		AActor* Owner = Importer->GetOwnerRef();
@@ -287,10 +238,10 @@ void UFragmentSemanticTileManager::Tick(float DeltaTime, const FVector& CameraLo
 			{
 				for (USemanticTile* Tile : AllSemanticTiles)
 				{
-					// Draw white debug bounds (separate from LOD wireframe)
+					// Draw white debug bounds
 					DrawDebugBox(World, Tile->CombinedBounds.GetCenter(),
 					            Tile->CombinedBounds.GetExtent(), FColor::White,
-					            false, -1.0f, 0, 1.0f);
+					            false, 0.0f, 0, 1.0f);
 				}
 			}
 		}
@@ -522,7 +473,7 @@ void UFragmentSemanticTileManager::CalculateCombinedBounds(USemanticTile* Tile)
 }
 
 // ===================================================================
-// Phase 2: LOD Management Implementation
+// Simplified LOD Management (Loaded/Unloaded only - no wireframe/simple box)
 // ===================================================================
 
 float UFragmentSemanticTileManager::CalculateScreenCoverage(USemanticTile* Tile,
@@ -548,8 +499,7 @@ float UFragmentSemanticTileManager::CalculateScreenCoverage(USemanticTile* Tile,
 	FVector TileSize = Tile->CombinedBounds.GetSize();
 	float TileDimension = TileSize.GetMax();
 
-	// Calculate screen coverage using engine_fragment formula:
-	// ScreenSize = (Dimension / Distance) * (ViewportHeight / (2 * tan(FOV/2)))
+	// Calculate screen coverage using engine_fragment formula
 	float HalfFOVRadians = FMath::DegreesToRadians(FOV * 0.5f);
 	float TanHalfFOV = FMath::Tan(HalfFOVRadians);
 
@@ -562,254 +512,49 @@ float UFragmentSemanticTileManager::CalculateScreenCoverage(USemanticTile* Tile,
 	float ScreenSizePixels = (TileDimension / Distance) * (ViewportHeight / (2.0f * TanHalfFOV));
 
 	// Convert to percentage of viewport height (0.0 to 1.0)
-	float ScreenCoverage = ScreenSizePixels / ViewportHeight;
-
-	return FMath::Clamp(ScreenCoverage, 0.0f, 1.0f);
+	return FMath::Clamp(ScreenSizePixels / ViewportHeight, 0.0f, 1.0f);
 }
 
-ESemanticLOD UFragmentSemanticTileManager::DetermineLODLevel(float ScreenCoverage)
+bool UFragmentSemanticTileManager::ShouldLoadTile(USemanticTile* Tile, const FVector& CameraLocation)
 {
-	if (!Config.bEnableLOD)
+	if (!Tile || !Tile->CombinedBounds.IsValid)
 	{
-		return ESemanticLOD::HighDetail; // Always high detail if LOD disabled
+		return false;
 	}
 
-	// Determine LOD based on screen coverage thresholds
-	if (ScreenCoverage >= Config.LOD1ToLOD2Threshold)
-	{
-		return ESemanticLOD::HighDetail; // > 5% = LOD 2
-	}
-	else if (ScreenCoverage >= Config.LOD0ToLOD1Threshold)
-	{
-		return ESemanticLOD::SimpleBox; // 1% - 5% = LOD 1
-	}
-	else if (ScreenCoverage > 0.0f)
-	{
-		return ESemanticLOD::Wireframe; // < 1% = LOD 0
-	}
-	else
-	{
-		return ESemanticLOD::Unloaded; // Not visible
-	}
+	// Calculate bounding sphere radius
+	FVector Extent = Tile->CombinedBounds.GetExtent();
+	float BoundingSphereRadius = Extent.Size();
+
+	// Calculate distance from camera to tile center
+	FVector TileCenter = Tile->CombinedBounds.GetCenter();
+	float Distance = FVector::Dist(CameraLocation, TileCenter);
+
+	// Load if within distance threshold
+	float LoadDistance = BoundingSphereRadius * Config.LoadDistanceMultiplier;
+	return Distance < LoadDistance;
 }
 
 void UFragmentSemanticTileManager::TransitionToLOD(USemanticTile* Tile, ESemanticLOD TargetLOD)
 {
 	if (!Tile || Tile->CurrentLOD == TargetLOD)
 	{
-		return; // Already at target LOD
+		return;
 	}
 
-	// Hide current LOD
-	HideLOD(Tile);
-
-	// Show target LOD
-	switch (TargetLOD)
+	// Simple state transition - no visualization components to manage
+	if (TargetLOD == ESemanticLOD::Loaded)
 	{
-	case ESemanticLOD::Unloaded:
-		// Already hidden
-		break;
-
-	case ESemanticLOD::Wireframe:
-		ShowWireframe(Tile);
-		break;
-
-	case ESemanticLOD::SimpleBox:
-		ShowSimpleBox(Tile);
-		break;
-
-	case ESemanticLOD::HighDetail:
-		ShowHighDetail(Tile);
-		break;
+		Tile->bIsLoaded = true;
+		UE_LOG(LogSemanticTiles, Verbose, TEXT("  %s: Loading triggered (%d fragments)"),
+		       *Tile->IFCClassName, Tile->Count);
+	}
+	else
+	{
+		Tile->bIsLoaded = false;
 	}
 
 	Tile->CurrentLOD = TargetLOD;
-
-	if (Config.bEnableDebugLogging)
-	{
-		UE_LOG(LogSemanticTiles, Verbose, TEXT("  %s: LOD transition → %d (coverage: %.3f%%)"),
-		       *Tile->IFCClassName, static_cast<int32>(TargetLOD), Tile->ScreenCoverage * 100.0f);
-	}
-}
-
-void UFragmentSemanticTileManager::ShowWireframe(USemanticTile* Tile)
-{
-	if (!Tile || !Importer)
-	{
-		static bool bLoggedOnce = false;
-		if (!bLoggedOnce)
-		{
-			UE_LOG(LogSemanticTiles, Warning, TEXT("ShowWireframe: Null tile or importer"));
-			bLoggedOnce = true;
-		}
-		return;
-	}
-
-	// Get world for drawing
-	AActor* Owner = Importer->GetOwnerRef();
-	if (!Owner)
-	{
-		static bool bLoggedOnce = false;
-		if (!bLoggedOnce)
-		{
-			UE_LOG(LogSemanticTiles, Warning, TEXT("ShowWireframe: No owner actor"));
-			bLoggedOnce = true;
-		}
-		return;
-	}
-
-	UWorld* World = Owner->GetWorld();
-	if (!World)
-	{
-		static bool bLoggedOnce = false;
-		if (!bLoggedOnce)
-		{
-			UE_LOG(LogSemanticTiles, Warning, TEXT("ShowWireframe: No world from owner actor"));
-			bLoggedOnce = true;
-		}
-		return;
-	}
-
-	// Draw wireframe bounding box using DrawDebugBox
-	// Use brighter, more visible colors and thicker lines
-	FColor WireframeColor = Tile->RepresentativeColor.ToFColor(true);
-	DrawDebugBox(World, Tile->CombinedBounds.GetCenter(),
-	            Tile->CombinedBounds.GetExtent(), WireframeColor,
-	            false, 0.0f, 0, 3.0f); // Non-persistent (redrawn every frame), depth priority 0, thickness 3.0
-}
-
-void UFragmentSemanticTileManager::ShowSimpleBox(USemanticTile* Tile)
-{
-	if (!Tile || !Importer)
-	{
-		return;
-	}
-
-	AActor* Owner = Importer->GetOwnerRef();
-	if (!Owner)
-	{
-		return;
-	}
-
-	// Create procedural mesh component if it doesn't exist
-	if (!Tile->SimpleBoxMesh)
-	{
-		Tile->SimpleBoxMesh = NewObject<UProceduralMeshComponent>(Owner);
-		Tile->SimpleBoxMesh->RegisterComponent();
-		Tile->SimpleBoxMesh->AttachToComponent(Owner->GetRootComponent(),
-		                                         FAttachmentTransformRules::KeepWorldTransform);
-
-		// Create simple material instance that shows the representative color
-		// ProceduralMeshComponent will use vertex colors by default with a basic material
-		UMaterialInterface* BaseMaterial = Tile->SimpleBoxMesh->GetMaterial(0);
-		if (!BaseMaterial)
-		{
-			// Use the engine's default material for procedural meshes
-			UMaterialInstanceDynamic* DynMaterial = Tile->SimpleBoxMesh->CreateAndSetMaterialInstanceDynamic(0);
-			if (DynMaterial)
-			{
-				DynMaterial->SetVectorParameterValue(FName("BaseColor"), Tile->RepresentativeColor);
-			}
-		}
-	}
-
-	// Generate box mesh data
-	TArray<FVector> Vertices;
-	TArray<int32> Triangles;
-	TArray<FVector> Normals;
-	TArray<FVector2D> UVs;
-	TArray<FLinearColor> VertexColors;
-
-	FVector Center = Tile->CombinedBounds.GetCenter();
-	FVector Extent = Tile->CombinedBounds.GetExtent();
-
-	// Define 8 corners of the box
-	FVector Corners[8] = {
-		Center + FVector(-Extent.X, -Extent.Y, -Extent.Z),
-		Center + FVector(Extent.X, -Extent.Y, -Extent.Z),
-		Center + FVector(Extent.X, Extent.Y, -Extent.Z),
-		Center + FVector(-Extent.X, Extent.Y, -Extent.Z),
-		Center + FVector(-Extent.X, -Extent.Y, Extent.Z),
-		Center + FVector(Extent.X, -Extent.Y, Extent.Z),
-		Center + FVector(Extent.X, Extent.Y, Extent.Z),
-		Center + FVector(-Extent.X, Extent.Y, Extent.Z)
-	};
-
-	// Build 6 faces (12 triangles) with PROPER NORMALS
-
-	// Front face (-Y)
-	int32 BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[0], Corners[1], Corners[5], Corners[4]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(0, -1, 0)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Back face (+Y)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[3], Corners[2], Corners[6], Corners[7]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(0, 1, 0)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Left face (-X)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[3], Corners[0], Corners[4], Corners[7]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(-1, 0, 0)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Right face (+X)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[1], Corners[2], Corners[6], Corners[5]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(1, 0, 0)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Bottom face (-Z)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[0], Corners[3], Corners[2], Corners[1]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(0, 0, -1)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Top face (+Z)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[4], Corners[5], Corners[6], Corners[7]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(0, 0, 1)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Create mesh section
-	Tile->SimpleBoxMesh->CreateMeshSection_LinearColor(0, Vertices, Triangles, Normals,
-	                                                     UVs, VertexColors, TArray<FProcMeshTangent>(), true);
-	Tile->SimpleBoxMesh->SetVisibility(true);
-}
-
-void UFragmentSemanticTileManager::ShowHighDetail(USemanticTile* Tile)
-{
-	if (!Tile || !Importer)
-	{
-		return;
-	}
-
-	// Phase 2: Placeholder - triggers existing tile manager spawning
-	// In Phase 4, this will integrate with octree spatial subdivision
-	// For now, mark tile as loaded (actual spawning happens via existing FragmentTileManager)
-	Tile->bIsLoaded = true;
-
-	UE_LOG(LogSemanticTiles, Verbose, TEXT("  %s: High detail loading triggered (%d fragments)"),
-	       *Tile->IFCClassName, Tile->Count);
-}
-
-void UFragmentSemanticTileManager::HideLOD(USemanticTile* Tile)
-{
-	if (!Tile)
-	{
-		return;
-	}
-
-	// Hide simple box mesh if it exists
-	if (Tile->SimpleBoxMesh)
-	{
-		Tile->SimpleBoxMesh->SetVisibility(false);
-	}
-
-	// Wireframe is drawn with DrawDebugBox (persistent = false), so it clears automatically
-	// High detail hiding will be handled by FragmentTileManager in Phase 4
 }
 
 // ===================================================================
@@ -835,7 +580,6 @@ void UFragmentSemanticTileManager::BuildSpatialSubdivision(USemanticTile* Tile)
 	RootSubTile.FragmentIDs = Tile->FragmentIDs;
 	RootSubTile.CurrentLOD = ESemanticLOD::Unloaded;
 	RootSubTile.TargetLOD = ESemanticLOD::Unloaded;
-	RootSubTile.SimpleBoxMesh = nullptr;
 	RootSubTile.ScreenCoverage = 0.0f;
 	RootSubTile.Depth = 0;
 
@@ -950,7 +694,6 @@ void UFragmentSemanticTileManager::SubdivideSubTile(USemanticTile* Tile, int32 S
 			ChildSubTile.FragmentIDs = OctantFragments;
 			ChildSubTile.CurrentLOD = ESemanticLOD::Unloaded;
 			ChildSubTile.TargetLOD = ESemanticLOD::Unloaded;
-			ChildSubTile.SimpleBoxMesh = nullptr;
 			ChildSubTile.ScreenCoverage = 0.0f;
 			ChildSubTile.Depth = CurrentDepth + 1;
 
@@ -1061,62 +804,40 @@ void UFragmentSemanticTileManager::CalculateFragmentBounds(USemanticTile* Tile,
 	}
 }
 
-void UFragmentSemanticTileManager::UpdateSubTileLOD(USemanticTile* Tile, FSemanticSubTile& SubTile,
-                                                      const FVector& CameraLocation)
+void UFragmentSemanticTileManager::UpdateSubTileLoading(USemanticTile* Tile, FSemanticSubTile& SubTile,
+                                                          const FVector& CameraLocation)
 {
-	// Determine LOD from distance (orientation-independent)
-	ESemanticLOD TargetLOD = DetermineLODFromDistance(SubTile, CameraLocation);
+	// Determine if sub-tile should be loaded based on distance
+	bool bShouldLoad = ShouldLoadSubTile(SubTile, CameraLocation);
+	ESemanticLOD TargetLOD = bShouldLoad ? ESemanticLOD::Loaded : ESemanticLOD::Unloaded;
 	SubTile.TargetLOD = TargetLOD;
 
-	// Transition if LOD changed
+	// Transition if state changed
 	if (SubTile.CurrentLOD != TargetLOD)
 	{
 		TransitionSubTileToLOD(Tile, SubTile, TargetLOD);
 	}
-
-	// Redraw wireframe every frame (DrawDebugBox only lasts one frame)
-	if (SubTile.CurrentLOD == ESemanticLOD::Wireframe)
-	{
-		ShowSubTileWireframe(Tile, SubTile);
-	}
 }
 
-ESemanticLOD UFragmentSemanticTileManager::DetermineLODFromDistance(const FSemanticSubTile& SubTile,
-                                                                     const FVector& CameraLocation) const
+bool UFragmentSemanticTileManager::ShouldLoadSubTile(const FSemanticSubTile& SubTile,
+                                                       const FVector& CameraLocation) const
 {
 	if (!SubTile.Bounds.IsValid)
 	{
-		return ESemanticLOD::Unloaded;
+		return false;
 	}
 
 	// Calculate bounding sphere radius (diagonal of box)
 	FVector Extent = SubTile.Bounds.GetExtent();
-	float BoundingSphereRadius = Extent.Size(); // sqrt(X² + Y² + Z²)
+	float BoundingSphereRadius = Extent.Size();
 
 	// Calculate distance from camera to box center
 	FVector BoxCenter = SubTile.Bounds.GetCenter();
 	float Distance = FVector::Dist(CameraLocation, BoxCenter);
 
-	// Distance-based LOD thresholds (orientation-independent)
-	float LOD2Distance = BoundingSphereRadius * Config.LOD2DistanceMultiplier;
-	float LOD1Distance = BoundingSphereRadius * Config.LOD1DistanceMultiplier;
-
-	// Debug logging for LOD transitions
-	UE_LOG(LogFragments, Log, TEXT("LOD Check - Radius: %.1f, Distance: %.1f, LOD2Thresh: %.1f, LOD1Thresh: %.1f, Extent: %s, Center: %s"),
-	       BoundingSphereRadius, Distance, LOD2Distance, LOD1Distance, *Extent.ToString(), *BoxCenter.ToString());
-
-	if (Distance < LOD2Distance)
-	{
-		return ESemanticLOD::HighDetail;  // Close - show full meshes
-	}
-	else if (Distance < LOD1Distance)
-	{
-		return ESemanticLOD::SimpleBox;   // Medium - show colored boxes
-	}
-	else
-	{
-		return ESemanticLOD::Wireframe;   // Far - show wireframe
-	}
+	// Load if within distance threshold
+	float LoadDistance = BoundingSphereRadius * Config.LoadDistanceMultiplier;
+	return Distance < LoadDistance;
 }
 
 void UFragmentSemanticTileManager::TransitionSubTileToLOD(USemanticTile* Tile,
@@ -1125,174 +846,16 @@ void UFragmentSemanticTileManager::TransitionSubTileToLOD(USemanticTile* Tile,
 {
 	if (SubTile.CurrentLOD == TargetLOD)
 	{
-		return; // Already at target LOD
+		return;
 	}
 
-	// Debug logging for LOD transitions
-	const TCHAR* LODNames[] = { TEXT("Unloaded"), TEXT("Wireframe"), TEXT("SimpleBox"), TEXT("HighDetail") };
-	UE_LOG(LogFragments, Log, TEXT("LOD Transition - %s: %s → %s (Frags: %d, Bounds: %s)"),
+	// Simple state logging
+	const TCHAR* LODNames[] = { TEXT("Unloaded"), TEXT("Loaded") };
+	UE_LOG(LogSemanticTiles, Verbose, TEXT("Sub-tile transition - %s: %s → %s (Frags: %d)"),
 	       *Tile->IFCClassName,
 	       LODNames[static_cast<int32>(SubTile.CurrentLOD)],
 	       LODNames[static_cast<int32>(TargetLOD)],
-	       SubTile.FragmentIDs.Num(),
-	       *SubTile.Bounds.ToString());
-
-	// Hide current LOD
-	HideSubTileLOD(SubTile);
-
-	// Show target LOD
-	switch (TargetLOD)
-	{
-	case ESemanticLOD::Unloaded:
-		// Already hidden
-		break;
-
-	case ESemanticLOD::Wireframe:
-		ShowSubTileWireframe(Tile, SubTile);
-		break;
-
-	case ESemanticLOD::SimpleBox:
-		ShowSubTileSimpleBox(Tile, SubTile);
-		break;
-
-	case ESemanticLOD::HighDetail:
-		// High detail loading will be integrated with existing FragmentTileManager
-		// For now, just mark as loaded
-		break;
-	}
+	       SubTile.FragmentIDs.Num());
 
 	SubTile.CurrentLOD = TargetLOD;
-}
-
-void UFragmentSemanticTileManager::ShowSubTileWireframe(USemanticTile* Tile,
-                                                          const FSemanticSubTile& SubTile)
-{
-	if (!Tile || !Importer)
-	{
-		return;
-	}
-
-	// Get world for drawing
-	AActor* Owner = Importer->GetOwnerRef();
-	if (!Owner)
-	{
-		return;
-	}
-
-	UWorld* World = Owner->GetWorld();
-	if (!World)
-	{
-		return;
-	}
-
-	// Draw wireframe bounding box using DrawDebugBox
-	// Use brighter, more visible colors and thicker lines
-	FColor WireframeColor = Tile->RepresentativeColor.ToFColor(true);
-	DrawDebugBox(World, SubTile.Bounds.GetCenter(),
-	            SubTile.Bounds.GetExtent(), WireframeColor,
-	            false, -1.0f, 0, 3.0f); // Persistent (lifetime -1 = infinite), depth priority 0, thickness 3.0
-}
-
-void UFragmentSemanticTileManager::ShowSubTileSimpleBox(USemanticTile* Tile,
-                                                          FSemanticSubTile& SubTile)
-{
-	if (!Tile || !Importer)
-	{
-		return;
-	}
-
-	AActor* Owner = Importer->GetOwnerRef();
-	if (!Owner)
-	{
-		return;
-	}
-
-	// Create procedural mesh component if it doesn't exist
-	if (!SubTile.SimpleBoxMesh)
-	{
-		SubTile.SimpleBoxMesh = NewObject<UProceduralMeshComponent>(Owner);
-		SubTile.SimpleBoxMesh->RegisterComponent();
-		SubTile.SimpleBoxMesh->AttachToComponent(Owner->GetRootComponent(),
-		                                           FAttachmentTransformRules::KeepWorldTransform);
-
-		// ProceduralMeshComponent uses vertex colors by default
-		// We'll use vertex colors to show the representative color
-	}
-
-	// Generate box mesh data
-	TArray<FVector> Vertices;
-	TArray<int32> Triangles;
-	TArray<FVector> Normals;
-	TArray<FVector2D> UVs;
-	TArray<FLinearColor> VertexColors;
-
-	FVector Center = SubTile.Bounds.GetCenter();
-	FVector Extent = SubTile.Bounds.GetExtent();
-
-	// Define 8 corners of the box
-	FVector Corners[8] = {
-		Center + FVector(-Extent.X, -Extent.Y, -Extent.Z),
-		Center + FVector(Extent.X, -Extent.Y, -Extent.Z),
-		Center + FVector(Extent.X, Extent.Y, -Extent.Z),
-		Center + FVector(-Extent.X, Extent.Y, -Extent.Z),
-		Center + FVector(-Extent.X, -Extent.Y, Extent.Z),
-		Center + FVector(Extent.X, -Extent.Y, Extent.Z),
-		Center + FVector(Extent.X, Extent.Y, Extent.Z),
-		Center + FVector(-Extent.X, Extent.Y, Extent.Z)
-	};
-
-	// Build 6 faces (12 triangles) with PROPER NORMALS
-
-	// Front face (-Y)
-	int32 BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[0], Corners[1], Corners[5], Corners[4]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(0, -1, 0)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Back face (+Y)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[3], Corners[2], Corners[6], Corners[7]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(0, 1, 0)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Left face (-X)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[3], Corners[0], Corners[4], Corners[7]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(-1, 0, 0)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Right face (+X)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[1], Corners[2], Corners[6], Corners[5]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(1, 0, 0)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Bottom face (-Z)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[0], Corners[3], Corners[2], Corners[1]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(0, 0, -1)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Top face (+Z)
-	BaseIdx = Vertices.Num();
-	Vertices.Append({Corners[4], Corners[5], Corners[6], Corners[7]});
-	Triangles.Append({BaseIdx + 0, BaseIdx + 2, BaseIdx + 1, BaseIdx + 0, BaseIdx + 3, BaseIdx + 2});
-	for (int32 i = 0; i < 4; i++) { Normals.Add(FVector(0, 0, 1)); UVs.Add(FVector2D(0, 0)); VertexColors.Add(Tile->RepresentativeColor); }
-
-	// Create mesh section
-	SubTile.SimpleBoxMesh->CreateMeshSection_LinearColor(0, Vertices, Triangles, Normals,
-	                                                       UVs, VertexColors, TArray<FProcMeshTangent>(), true);
-	SubTile.SimpleBoxMesh->SetVisibility(true);
-}
-
-void UFragmentSemanticTileManager::HideSubTileLOD(FSemanticSubTile& SubTile)
-{
-	// Hide simple box mesh if it exists
-	if (SubTile.SimpleBoxMesh)
-	{
-		SubTile.SimpleBoxMesh->SetVisibility(false);
-	}
-
-	// Wireframe is drawn with DrawDebugBox (persistent = false), so it clears automatically
-	// High detail hiding will be handled by FragmentTileManager integration
 }

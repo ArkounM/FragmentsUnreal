@@ -10,7 +10,7 @@ UFragmentVisibility::UFragmentVisibility()
 void UFragmentVisibility::Initialize(const FFragmentVisibilityParams& InParams)
 {
 	Params = InParams;
-	LodMode = EFragmentLodMode::Default;
+	bShowAllVisible = false;
 
 	// Reset cached values
 	CachedTanHalfFOV = 0.0f;
@@ -284,98 +284,43 @@ bool UFragmentVisibility::IsInFrustum(const FBox& Box) const
 
 EFragmentLod UFragmentVisibility::FetchLodLevel(const UFragmentTile* Tile) const
 {
-	// Direct port of engine_fragment's fetchLodLevel() function
-	// from virtual-tiles-controller.ts lines 775-835
+	// Simplified visibility check - just frustum culling + minimum screen size
 
 	if (!Tile)
 	{
 		return EFragmentLod::Invisible;
 	}
 
-	// === LOD MODE OVERRIDE ===
-	if (LodMode == EFragmentLodMode::AllVisible)
+	// Debug mode: show all fragments regardless of frustum
+	if (bShowAllVisible)
 	{
-		return EFragmentLod::Geometry;
+		return EFragmentLod::Visible;
 	}
 
 	// === FRUSTUM CULLING ===
-	// Check if tile is inside camera frustum
 	if (!IsInFrustum(Tile->Bounds))
 	{
 		UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("Tile culled: outside frustum"));
 		return EFragmentLod::Invisible;
 	}
 
-	// === SCREEN SIZE CALCULATION ===
-	// Get tile dimension (max extent of bounding box)
+	// === SCREEN SIZE CHECK (optional culling of tiny objects) ===
 	const FVector Extent = Tile->Bounds.GetExtent();
-	const float Dimension = FMath::Max3(Extent.X, Extent.Y, Extent.Z) * 2.0f;  // Full dimension, not half-extent
-
-	// Get distance to closest point on tile bounds (not center!)
+	const float Dimension = FMath::Max3(Extent.X, Extent.Y, Extent.Z) * 2.0f;
 	const float Distance = GetDistanceToBox(Tile->Bounds);
-
-	// Calculate projected screen size in pixels
-	const float ScreenDimension = CalculateScreenSize(Dimension, Distance);
+	const float ScreenSize = CalculateScreenSize(Dimension, Distance);
 
 	// Apply graphics quality multiplier
-	const float Quality = ViewState.GraphicsQuality;
-	const float SmallScreen = Params.SmallScreenSize * Quality;
-	const float MediumScreen = Params.MediumScreenSize * Quality;
-	const float LargeScreen = Params.LargeScreenSize * Quality;
+	const float MinScreen = Params.MinScreenSize * ViewState.GraphicsQuality;
 
-	// === OBJECT SIZE CLASSIFICATION ===
-	const bool bIsSmallObject = Dimension < Params.SmallObjectSize;
-	const bool bIsLargeObject = !bIsSmallObject;
-
-	// === SCREEN SIZE CLASSIFICATION ===
-	const bool bIsSmallInScreen = ScreenDimension < SmallScreen;      // < 2px
-	const bool bIsMediumInScreen = ScreenDimension < MediumScreen;    // < 4px
-	const bool bIsLargeInScreen = ScreenDimension < LargeScreen;      // < 16px
-
-	// === COMBINED CONDITIONS ===
-	// Port of engine_fragment logic:
-	// const smallAndFar = isSmall && isMediumInScreen;
-	// const largeAndVeryFar = isLarge && isSmallInScreen;
-	// const smallAndClose = isSmall && isLargeInScreen;
-	// const largeAndFar = isLarge && isMediumInScreen;
-
-	const bool bSmallAndFar = bIsSmallObject && bIsMediumInScreen;
-	const bool bLargeAndVeryFar = bIsLargeObject && bIsSmallInScreen;
-	const bool bSmallAndClose = bIsSmallObject && bIsLargeInScreen;
-	const bool bLargeAndFar = bIsLargeObject && bIsMediumInScreen;
-
-	UE_LOG(LogFragmentVisibility, VeryVerbose,
-	       TEXT("Tile LOD: dim=%.1f dist=%.1f screenPx=%.2f small=%d | SmallFar=%d LargeVeryFar=%d SmallClose=%d LargeFar=%d"),
-	       Dimension, Distance, ScreenDimension, bIsSmallObject,
-	       bSmallAndFar, bLargeAndVeryFar, bSmallAndClose, bLargeAndFar);
-
-	// === DECISION LOGIC ===
-
-	// Very far away -> completely hide
-	if (bSmallAndFar || bLargeAndVeryFar)
+	// Cull if too small on screen
+	if (ScreenSize < MinScreen)
 	{
-		UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("  -> INVISIBLE (too far/small)"));
+		UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("Tile culled: screen size %.2f < %.2f"), ScreenSize, MinScreen);
 		return EFragmentLod::Invisible;
 	}
 
-	// All geometry mode -> show everything that passed frustum culling
-	if (LodMode == EFragmentLodMode::AllGeometry)
-	{
-		return EFragmentLod::Geometry;
-	}
-
-	// Far away but still visible -> use wireframe/simplified LOD
-	if (bSmallAndClose || bLargeAndFar)
-	{
-		UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("  -> WIRES (far but visible)"));
-		return EFragmentLod::Wires;
-	}
-
-	// Note: engine_fragment also checks lodSize (simplified geometry size),
-	// but we'll skip that for now as Fragments doesn't have multi-LOD geometry.
-	// In the future, this could be used for mesh simplification.
-
-	// Default: full geometry detail
-	UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("  -> GEOMETRY (close enough)"));
-	return EFragmentLod::Geometry;
+	// Visible - render full geometry
+	UE_LOG(LogFragmentVisibility, VeryVerbose, TEXT("Tile visible: screen size %.2f px"), ScreenSize);
+	return EFragmentLod::Visible;
 }
