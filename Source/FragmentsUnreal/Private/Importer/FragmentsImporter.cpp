@@ -21,6 +21,8 @@
 #include "UObject/SavePackage.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Importer/FragmentsAsyncLoader.h"
+#include "Spatial/FragmentTileManager.h"
+#include "Utils/FragmentOcclusionClassifier.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -425,9 +427,39 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 	BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
 	BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
 
-	// Use chunked spawning instead of spawning all at once
-	UE_LOG(LogFragments, Log, TEXT("Starting chunked spawning for model: %s"), *InModelGuid);
-	StartChunkedSpawning(Wrapper->GetModelItem(), OwnerRef, ModelRef->meshes(), bInSaveMesh);
+	// Build fragment registry for per-sample visibility
+	Wrapper->BuildFragmentRegistry(InModelGuid);
+	UFragmentRegistry* Registry = Wrapper->GetFragmentRegistry();
+
+	if (!Registry || !Registry->IsBuilt())
+	{
+		UE_LOG(LogFragments, Error, TEXT("ProcessLoadedFragment: Failed to build fragment registry for model %s"), *InModelGuid);
+		return;
+	}
+
+	// Create tile manager for per-sample visibility streaming
+	UFragmentTileManager* TileManager = NewObject<UFragmentTileManager>(this);
+	TileManager->Initialize(InModelGuid, this);
+	TileManager->InitializePerSampleVisibility(Registry);
+	TileManagers.Add(InModelGuid, TileManager);
+
+	UE_LOG(LogFragments, Log, TEXT("Per-sample visibility initialized for model: %s (%d fragments)"),
+	       *InModelGuid, Registry->GetFragmentCount());
+
+	// Start spawn processing timer if not already running
+	UWorld* World = GetWorld();
+	if (World && !World->GetTimerManager().IsTimerActive(SpawnChunkTimerHandle))
+	{
+		World->GetTimerManager().SetTimer(
+			SpawnChunkTimerHandle,
+			this,
+			&UFragmentsImporter::ProcessAllTileManagerChunks,
+			0.016f, // ~60 FPS
+			true // Repeat
+		);
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("Tile-based streaming started for model: %s"), *InModelGuid);
 }
 
 
@@ -1293,8 +1325,41 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 				MeshComp->SetStaticMesh(Mesh);
 				MeshComp->SetRelativeTransform(LocalTransform);
 				MeshComp->AttachToComponent(RootSceneComponent, FAttachmentTransformRules::KeepRelativeTransform);
+
+				// Disable Lumen/Distance Field features to avoid "Preparing mesh distance fields/cards" delays
+				// These are expensive to compute at runtime for procedurally generated meshes
+				MeshComp->bAffectDistanceFieldLighting = false;  // Skip distance field generation
+				MeshComp->bAffectDynamicIndirectLighting = false; // Skip Lumen indirect lighting
+				MeshComp->bAffectIndirectLightingWhileHidden = false;
+
 				MeshComp->RegisterComponent();
 				FragmentModel->AddInstanceComponent(MeshComp);
+
+				// Configure occlusion culling based on fragment classification
+				const uint8 MaterialAlpha = material ? material->a() : 255;
+				const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
+					Item.Category, MaterialAlpha);
+
+				switch (Role)
+				{
+				case EOcclusionRole::Occluder:
+					// Large structural elements that block visibility
+					MeshComp->bUseAsOccluder = true;
+					MeshComp->SetCastShadow(true);
+					break;
+
+				case EOcclusionRole::Occludee:
+					// Objects that can be hidden by occluders
+					MeshComp->bUseAsOccluder = false;
+					MeshComp->SetCastShadow(true);
+					break;
+
+				case EOcclusionRole::NonOccluder:
+					// Glass/transparent - doesn't block anything
+					MeshComp->bUseAsOccluder = false;
+					MeshComp->SetCastShadow(false);
+					break;
+				}
 			}
 		}
 	}
@@ -1365,6 +1430,53 @@ void UFragmentsImporter::ProcessSpawnChunk()
 	SpawnProgress = (float)FragmentsSpawned / (float)FMath::Max(TotalFragmentsToSpawn, 1);
 
 	UE_LOG(LogFragments, Log, TEXT("Spawn progress: %d/%d (%.1f%%)"), FragmentsPerChunk, TotalFragmentsToSpawn, SpawnProgress * 100.0f);
+}
+
+void UFragmentsImporter::ProcessAllTileManagerChunks()
+{
+	// Process spawn chunks for all tile managers (per-sample visibility only)
+	for (auto& Pair : TileManagers)
+	{
+		UFragmentTileManager* TileManager = Pair.Value;
+		if (!TileManager)
+		{
+			continue;
+		}
+
+		// Per-sample mode: process spawning based on dynamic tiles
+		TileManager->ProcessSpawnChunk();
+	}
+
+	// Check if all tile managers are idle
+	bool bAnyLoading = false;
+	for (auto& Pair : TileManagers)
+	{
+		if (Pair.Value && Pair.Value->IsLoading())
+		{
+			bAnyLoading = true;
+			break;
+		}
+	}
+
+	// If no tile managers are loading, we can stop the timer (it will restart when streaming updates)
+	if (!bAnyLoading && TileManagers.Num() > 0)
+	{
+		UE_LOG(LogFragments, Verbose, TEXT("All tile managers idle, timer continues for streaming updates"));
+	}
+}
+
+void UFragmentsImporter::UpdateTileStreaming(const FVector& CameraLocation, const FRotator& CameraRotation,
+                                              float FOV, float AspectRatio, float ViewportHeight)
+{
+	// Update all tile managers with current camera (per-sample visibility only)
+	for (auto& Pair : TileManagers)
+	{
+		UFragmentTileManager* TileManager = Pair.Value;
+		if (TileManager)
+		{
+			TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
+		}
+	}
 }
 
 void UFragmentsImporter::StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes)

@@ -16,6 +16,7 @@ FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
 
 // Forward Declarations
 class UFragmentsAsyncLoader;
+class UFragmentTileManager;
 
 // Use FlatBuffers Model type
 using Model = ::Model;
@@ -54,6 +55,13 @@ public:
 	void ProcessLoadedFragment(const FString& ModelGuid, AActor* InOwnerRef, bool bInSaveMesh);
 	TArray<int32> GetElementsByCategory(const FString& InCategory, const FString& ModelGuid);
 	void UnloadFragment(const FString& ModelGuid);
+
+	/**
+	 * Update tile streaming based on camera parameters
+	 * Called by FragmentsComponent to update visible tiles
+	 */
+	void UpdateTileStreaming(const FVector& CameraLocation, const FRotator& CameraRotation,
+	                         float FOV, float AspectRatio, float ViewportHeight);
 
 	FORCEINLINE const TMap<FString, class UFragmentModelWrapper*>& GetFragmentModels() const
 	{
@@ -118,11 +126,11 @@ private:
 	// Build flat queue of all fragments to spawn (recursive)
 	void BuildSpawnQueue(const FFragmentItem& Item, AActor* ParentActor, TArray<FFragmentSpawnTask>& OutQueue);
 
-	// Spawn a single fragment (non-recursive)
-	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes);
-
 	// Process one chunk of spawning
 	void ProcessSpawnChunk();
+
+	// Process spawn chunks for all tile managers (called by timer)
+	void ProcessAllTileManagerChunks();
 
 	//Start Chunk Spawning
 	void StartChunkedSpawning(const FFragmentItem& RootItem, AActor* OwnerActor, const Meshes* MeshesRef, bool bSaveMeshes);
@@ -162,6 +170,10 @@ private:
 
 	UPROPERTY()
 	TMap<FString, FFragmentLookup> ModelFragmentsMap;
+
+	// Tile managers for streaming (one per loaded model)
+	UPROPERTY()
+	TMap<FString, UFragmentTileManager*> TileManagers;
 
 	UPROPERTY()
 	TMap<FString, UStaticMesh*> MeshCache;
@@ -209,5 +221,9 @@ private:
 public:
 
 	TArray<class AFragment*> FragmentActors;
+
+	/** Show debug wireframe bounds for streaming tiles (green=loading, red=culled) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
+	bool bShowDebugTileBounds = false;
 
 };

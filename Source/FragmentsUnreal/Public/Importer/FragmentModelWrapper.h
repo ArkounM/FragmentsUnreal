@@ -1,11 +1,10 @@
-
-
 #pragma once
 
 #include "CoreMinimal.h"
 #include "UObject/NoExportTypes.h"
 #include "Index/index_generated.h"
 #include "Utils/FragmentsUtils.h"
+#include "Spatial/FragmentRegistry.h"
 #include "FragmentModelWrapper.generated.h"
 
 /**
@@ -16,7 +15,7 @@ class FRAGMENTSUNREAL_API UFragmentModelWrapper : public UObject
 {
 	GENERATED_BODY()
 
-	
+
 private:
 
 	UPROPERTY()
@@ -26,6 +25,10 @@ private:
 
 	FFragmentItem ModelItem;
 
+	/** Fragment registry for per-sample visibility (Phase 1 optimization) */
+	UPROPERTY()
+	UFragmentRegistry* FragmentRegistry = nullptr;
+
 
 public:
 	void LoadModel(const TArray<uint8>& InBuffer)
@@ -34,9 +37,21 @@ public:
 		ParsedModel = GetModel(RawBuffer.GetData());
 	}
 
-	const Model* GetParsedModel() { return ParsedModel; }
+	const Model* GetParsedModel() const { return ParsedModel; }
 
 	void SetModelItem(FFragmentItem InModelItem) { ModelItem = InModelItem; }
 	FFragmentItem GetModelItem() { return ModelItem; }
+	const FFragmentItem& GetModelItemRef() const { return ModelItem; }
+
+	/**
+	 * Build fragment registry for per-sample visibility
+	 * @param ModelGuid Model identifier
+	 */
+	void BuildFragmentRegistry(const FString& ModelGuid);
+
+	/**
+	 * Get the fragment registry
+	 */
+	UFragmentRegistry* GetFragmentRegistry() const { return FragmentRegistry; }
 
 };
