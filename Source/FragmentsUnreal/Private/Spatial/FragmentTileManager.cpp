@@ -1,5 +1,6 @@
 #include "Spatial/FragmentTileManager.h"
 #include "Spatial/FragmentOctree.h"
+#include "Spatial/FragmentVisibility.h"
 #include "Importer/FragmentsImporter.h"
 #include "Importer/FragmentModelWrapper.h"
 #include "Fragment/Fragment.h"
@@ -62,8 +63,21 @@ void UFragmentTileManager::Initialize(const FString& InModelGuid, UFragmentOctre
 		MaxCachedBytes = CalculateDeviceMemoryBudget();
 	}
 
-	UE_LOG(LogFragmentTileManager, Log, TEXT("TileManager initialized for model: %s, Cache budget: %lld MB"),
-	       *ModelGuid, MaxCachedBytes / (1024 * 1024));
+	// Initialize engine_fragment-style visibility system
+	Visibility = NewObject<UFragmentVisibility>(this);
+	FFragmentVisibilityParams VisParams;
+	VisParams.SmallObjectSize = 200.0f;           // 2m in cm
+	VisParams.SmallScreenSize = 2.0f;             // pixels
+	VisParams.MediumScreenSize = 4.0f;            // pixels
+	VisParams.LargeScreenSize = 16.0f;            // pixels
+	VisParams.UpdateViewPosition = MinCameraMovement;
+	VisParams.UpdateViewOrientation = MinCameraRotation;
+	VisParams.UpdateTime = MaxSpawnTimeMs;
+	Visibility->Initialize(VisParams);
+	Visibility->LodMode = LodMode;
+
+	UE_LOG(LogFragmentTileManager, Log, TEXT("TileManager initialized for model: %s, Cache budget: %lld MB, UseEngineFragmentVis: %d"),
+	       *ModelGuid, MaxCachedBytes / (1024 * 1024), bUseEngineFragmentVisibility);
 }
 
 namespace
@@ -156,50 +170,103 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 		return;  // Early exit - frustum unchanged
 	}
 
-	// Build camera frustum
-	FConvexVolume Frustum = BuildCameraFrustum(CameraLocation, CameraRotation, FOV, AspectRatio);
-
-	// Query octree for tiles intersecting frustum
-	TArray<UFragmentTile*> FrustumTiles;
-	Octree->QueryVisibleTiles(Frustum, FrustumTiles);
-
-	// Filter by screen-space error (SSE) using industry-standard Cesium formula
-	TArray<UFragmentTile*> NewVisibleTiles;
-	for (UFragmentTile* Tile : FrustumTiles)
+	// ===== ENGINE_FRAGMENT-STYLE VISIBILITY (NEW) =====
+	if (bUseEngineFragmentVisibility && Visibility)
 	{
-		if (!Tile)
+		// Update the visibility system with current camera state
+		Visibility->UpdateView(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
+		Visibility->ViewState.GraphicsQuality = GraphicsQuality;
+		Visibility->LodMode = LodMode;
+
+		// Get ALL tiles from octree (no FConvexVolume needed - we'll use our own frustum test)
+		TArray<UFragmentTile*> AllTiles;
+		Octree->GetAllTiles(AllTiles);
+
+		// Filter tiles using engine_fragment-style visibility
+		TArray<UFragmentTile*> NewVisibleTiles;
+		for (UFragmentTile* Tile : AllTiles)
 		{
-			continue;
+			if (!Tile)
+			{
+				continue;
+			}
+
+			// Use engine_fragment's fetchLodLevel() logic
+			const EFragmentLod LodLevel = Visibility->FetchLodLevel(Tile);
+
+			// Only load tiles that need geometry or wires (not invisible)
+			if (LodLevel != EFragmentLod::Invisible)
+			{
+				NewVisibleTiles.Add(Tile);
+
+				// Calculate screen size for logging
+				const FVector Extent = Tile->Bounds.GetExtent();
+				const float Dimension = FMath::Max3(Extent.X, Extent.Y, Extent.Z) * 2.0f;
+				const float Distance = Visibility->GetDistanceToBox(Tile->Bounds);
+				const float ScreenSize = Visibility->CalculateScreenSize(Dimension, Distance);
+
+				UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile LOAD: LOD=%d screenPx=%.2f dim=%.0f dist=%.0f"),
+				       static_cast<int32>(LodLevel), ScreenSize, Dimension, Distance);
+			}
 		}
 
-		// Calculate screen space error (Cesium/3D Tiles standard)
-		const float SSE = CalculateScreenSpaceError(Tile, CameraLocation, FOV, ViewportHeight);
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Camera update (engine_fragment mode): %d total tiles, %d visible"),
+		       AllTiles.Num(), NewVisibleTiles.Num());
 
-		// CRITICAL: Load tile if SSE >= threshold (more error = needs refinement)
-		// This is INVERTED from old logic (screen coverage)
-		if (SSE >= MaximumScreenSpaceError)
-		{
-			NewVisibleTiles.Add(Tile);
+		// Store camera state for priority sorting
+		LastPriorityCameraLocation = CameraLocation;
+		LastPriorityFOV = FOV;
 
-			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile LOAD: SSE=%.2f >= threshold=%.2f (geomErr=%.2f)"),
-			       SSE, MaximumScreenSpaceError, Tile->GeometricError);
-		}
-		else
-		{
-			UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile SKIP: SSE=%.2f < threshold=%.2f (sufficient quality)"),
-			       SSE, MaximumScreenSpaceError);
-		}
+		// Update tile states based on new visible set
+		UpdateTileStates(NewVisibleTiles);
 	}
+	// ===== CESIUM-STYLE SSE (LEGACY) =====
+	else
+	{
+		// Build camera frustum (old method)
+		FConvexVolume Frustum = BuildCameraFrustum(CameraLocation, CameraRotation, FOV, AspectRatio);
 
-	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Camera update: %d frustum tiles, %d after SSE filter (threshold=%.1fpx)"),
-	       FrustumTiles.Num(), NewVisibleTiles.Num(), MaximumScreenSpaceError);
+		// Query octree for tiles intersecting frustum
+		TArray<UFragmentTile*> FrustumTiles;
+		Octree->QueryVisibleTiles(Frustum, FrustumTiles);
 
-	// Store camera state for priority sorting
-	LastPriorityCameraLocation = CameraLocation;
-	LastPriorityFOV = FOV;
+		// Filter by screen-space error (SSE) using industry-standard Cesium formula
+		TArray<UFragmentTile*> NewVisibleTiles;
+		for (UFragmentTile* Tile : FrustumTiles)
+		{
+			if (!Tile)
+			{
+				continue;
+			}
 
-	// Update tile states based on new visible set
-	UpdateTileStates(NewVisibleTiles);
+			// Calculate screen space error (Cesium/3D Tiles standard)
+			const float SSE = CalculateScreenSpaceError(Tile, CameraLocation, FOV, ViewportHeight);
+
+			// CRITICAL: Load tile if SSE >= threshold (more error = needs refinement)
+			if (SSE >= MaximumScreenSpaceError)
+			{
+				NewVisibleTiles.Add(Tile);
+
+				UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile LOAD: SSE=%.2f >= threshold=%.2f (geomErr=%.2f)"),
+				       SSE, MaximumScreenSpaceError, Tile->GeometricError);
+			}
+			else
+			{
+				UE_LOG(LogFragmentTileManager, VeryVerbose, TEXT("Tile SKIP: SSE=%.2f < threshold=%.2f (sufficient quality)"),
+				       SSE, MaximumScreenSpaceError);
+			}
+		}
+
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Camera update (Cesium SSE mode): %d frustum tiles, %d after SSE filter (threshold=%.1fpx)"),
+		       FrustumTiles.Num(), NewVisibleTiles.Num(), MaximumScreenSpaceError);
+
+		// Store camera state for priority sorting
+		LastPriorityCameraLocation = CameraLocation;
+		LastPriorityFOV = FOV;
+
+		// Update tile states based on new visible set
+		UpdateTileStates(NewVisibleTiles);
+	}
 
 	// Update last update tracking
 	LastCameraPosition = CameraLocation;

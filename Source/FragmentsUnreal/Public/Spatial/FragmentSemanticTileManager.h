@@ -34,8 +34,62 @@ enum class ESemanticLOD : uint8
 };
 
 /**
+ * Spatial sub-tile within a semantic tile (Phase 4)
+ * Represents a spatial region containing subset of an IFC class's fragments
+ */
+USTRUCT()
+struct FSemanticSubTile
+{
+	GENERATED_BODY()
+
+	/** Spatial bounds for this sub-tile */
+	UPROPERTY()
+	FBox Bounds;
+
+	/** Fragment LocalIDs in this spatial region */
+	UPROPERTY()
+	TArray<int32> FragmentIDs;
+
+	/** Current LOD level for this sub-tile */
+	UPROPERTY()
+	ESemanticLOD CurrentLOD;
+
+	/** Target LOD level */
+	UPROPERTY()
+	ESemanticLOD TargetLOD;
+
+	/** Simple box mesh component (LOD 1) */
+	UPROPERTY()
+	class UProceduralMeshComponent* SimpleBoxMesh;
+
+	/** Current screen coverage */
+	float ScreenCoverage;
+
+	/** Octree depth level (0 = root) */
+	int32 Depth;
+
+	/** Child sub-tile indices (8 octants, -1 = no child) */
+	int32 ChildIndices[8];
+
+	FSemanticSubTile()
+		: Bounds(ForceInit)
+		, CurrentLOD(ESemanticLOD::Unloaded)
+		, TargetLOD(ESemanticLOD::Unloaded)
+		, SimpleBoxMesh(nullptr)
+		, ScreenCoverage(0.0f)
+		, Depth(0)
+	{
+		for (int32 i = 0; i < 8; i++)
+		{
+			ChildIndices[i] = -1;
+		}
+	}
+};
+
+/**
  * Semantic tile representing all fragments of a specific IFC class
  * Groups elements by their IFC type (e.g., IfcWall, IfcWindow) for priority-based loading
+ * Phase 4: Now contains spatial subdivision via octree
  */
 UCLASS()
 class FRAGMENTSUNREAL_API USemanticTile : public UObject
@@ -71,19 +125,27 @@ public:
 	UPROPERTY()
 	FLinearColor RepresentativeColor;
 
-	/** Current LOD level */
+	/** Phase 4: Spatial sub-tiles (octree-based subdivision) */
+	UPROPERTY()
+	TArray<FSemanticSubTile> SpatialSubTiles;
+
+	/** Phase 4: Root sub-tile index */
+	int32 RootSubTileIndex;
+
+	// --- Legacy fields (Phase 2, deprecated in Phase 4) ---
+	/** @deprecated Use SpatialSubTiles instead */
 	UPROPERTY()
 	ESemanticLOD CurrentLOD;
 
-	/** Target LOD level (for transitions) */
+	/** @deprecated Use SpatialSubTiles instead */
 	UPROPERTY()
 	ESemanticLOD TargetLOD;
 
-	/** Simple box mesh component (LOD 1) */
+	/** @deprecated Use SpatialSubTiles instead */
 	UPROPERTY()
 	class UProceduralMeshComponent* SimpleBoxMesh;
 
-	/** Current screen coverage percentage (0.0 to 1.0) */
+	/** @deprecated Use SpatialSubTiles instead */
 	float ScreenCoverage;
 
 	/** Last update time for this tile */
@@ -96,6 +158,7 @@ public:
 		, Count(0)
 		, bIsLoaded(false)
 		, RepresentativeColor(FLinearColor::Gray)
+		, RootSubTileIndex(-1)
 		, CurrentLOD(ESemanticLOD::Unloaded)
 		, TargetLOD(ESemanticLOD::Unloaded)
 		, SimpleBoxMesh(nullptr)
@@ -140,6 +203,32 @@ struct FSemanticTileConfig
 	/** Enable LOD system (if false, always use high detail) */
 	UPROPERTY(EditAnywhere, Category = "LOD")
 	bool bEnableLOD = true;
+
+	/** Distance multiplier for HighDetail LOD (camera distance < radius × this value) */
+	UPROPERTY(EditAnywhere, Category = "LOD", meta = (ClampMin = "0.5", ClampMax = "10.0"))
+	float LOD2DistanceMultiplier = 2.5f;
+
+	/** Distance multiplier for SimpleBox LOD (camera distance < radius × this value) */
+	UPROPERTY(EditAnywhere, Category = "LOD", meta = (ClampMin = "1.0", ClampMax = "15.0"))
+	float LOD1DistanceMultiplier = 4.0f;
+
+	// --- Phase 4: Spatial Subdivision Config ---
+
+	/** Enable spatial subdivision per semantic tile */
+	UPROPERTY(EditAnywhere, Category = "Spatial")
+	bool bEnableSpatialSubdivision = true;
+
+	/** Maximum octree depth for spatial subdivision */
+	UPROPERTY(EditAnywhere, Category = "Spatial", meta = (ClampMin = "1", ClampMax = "8"))
+	int32 MaxSubdivisionDepth = 4;
+
+	/** Minimum fragments per sub-tile (stop subdividing if below this) */
+	UPROPERTY(EditAnywhere, Category = "Spatial", meta = (ClampMin = "1", ClampMax = "100"))
+	int32 MinFragmentsPerSubTile = 4;
+
+	/** Minimum sub-tile size in cm (stop subdividing if below this) */
+	UPROPERTY(EditAnywhere, Category = "Spatial", meta = (ClampMin = "100.0", ClampMax = "10000.0"))
+	float MinSubTileSize = 500.0f; // 5 meters
 };
 
 /**
@@ -268,6 +357,77 @@ private:
 	 * @param Tile Tile to hide
 	 */
 	void HideLOD(USemanticTile* Tile);
+
+	// --- Phase 4: Spatial Subdivision Methods ---
+
+	/**
+	 * Build spatial subdivision (octree) for a semantic tile
+	 * @param Tile Semantic tile to subdivide spatially
+	 */
+	void BuildSpatialSubdivision(USemanticTile* Tile);
+
+	/**
+	 * Recursively subdivide a sub-tile into octants
+	 * @param Tile Parent semantic tile
+	 * @param SubTileIndex Index of sub-tile to subdivide
+	 * @param CurrentDepth Current octree depth
+	 * @param FragmentBounds Map of fragment LocalID → world space bounds
+	 */
+	void SubdivideSubTile(USemanticTile* Tile, int32 SubTileIndex, int32 CurrentDepth,
+	                       const TMap<int32, FBox>& FragmentBounds);
+
+	/**
+	 * Calculate fragment bounds for a semantic tile's fragments
+	 * @param Tile Semantic tile
+	 * @param OutFragmentBounds Output map of LocalID → bounds
+	 */
+	void CalculateFragmentBounds(USemanticTile* Tile, TMap<int32, FBox>& OutFragmentBounds);
+
+	/**
+	 * Update LOD for a specific sub-tile
+	 * @param Tile Parent semantic tile
+	 * @param SubTile Sub-tile to update
+	 * @param CameraLocation Camera position
+	 */
+	void UpdateSubTileLOD(USemanticTile* Tile, FSemanticSubTile& SubTile,
+	                       const FVector& CameraLocation);
+
+	/**
+	 * Determine LOD level based on distance from camera to sub-tile
+	 * Uses bounding sphere (box diagonal) for orientation-independent behavior
+	 * @param SubTile Sub-tile to evaluate
+	 * @param CameraLocation Camera position
+	 * @return Target LOD level
+	 */
+	ESemanticLOD DetermineLODFromDistance(const FSemanticSubTile& SubTile, const FVector& CameraLocation) const;
+
+	/**
+	 * Transition a sub-tile to target LOD
+	 * @param Tile Parent semantic tile
+	 * @param SubTile Sub-tile to transition
+	 * @param TargetLOD Target LOD level
+	 */
+	void TransitionSubTileToLOD(USemanticTile* Tile, FSemanticSubTile& SubTile, ESemanticLOD TargetLOD);
+
+	/**
+	 * Show wireframe for a sub-tile
+	 * @param Tile Parent semantic tile
+	 * @param SubTile Sub-tile to visualize
+	 */
+	void ShowSubTileWireframe(USemanticTile* Tile, const FSemanticSubTile& SubTile);
+
+	/**
+	 * Show simple box for a sub-tile
+	 * @param Tile Parent semantic tile
+	 * @param SubTile Sub-tile to visualize
+	 */
+	void ShowSubTileSimpleBox(USemanticTile* Tile, FSemanticSubTile& SubTile);
+
+	/**
+	 * Hide sub-tile LOD visualization
+	 * @param SubTile Sub-tile to hide
+	 */
+	void HideSubTileLOD(FSemanticSubTile& SubTile);
 
 	// --- Existing Helper Methods ---
 

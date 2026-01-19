@@ -3,11 +3,13 @@
 #include "CoreMinimal.h"
 #include "UObject/NoExportTypes.h"
 #include "Spatial/FragmentTile.h"
+#include "Spatial/FragmentVisibility.h"
 #include "FragmentTileManager.generated.h"
 
 // Forward declarations
 class UFragmentOctree;
 class UFragmentsImporter;
+class UFragmentVisibility;
 
 /**
  * Manages tile-based fragment streaming based on camera frustum.
@@ -90,6 +92,18 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "1.0", ClampMax = "128.0"))
 	float MaximumScreenSpaceError = 16.0f;
 
+	/** Use engine_fragment-style visibility system (screen size based) instead of Cesium SSE */
+	UPROPERTY(EditAnywhere, Category = "Streaming")
+	bool bUseEngineFragmentVisibility = true;
+
+	/** LOD mode for engine_fragment visibility system */
+	UPROPERTY(EditAnywhere, Category = "Streaming")
+	EFragmentLodMode LodMode = EFragmentLodMode::Default;
+
+	/** Graphics quality multiplier (affects screen size thresholds) */
+	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.5", ClampMax = "2.0"))
+	float GraphicsQuality = 1.0f;
+
 	// --- Cache Configuration ---
 
 	/** Maximum memory budget for tile cache in bytes (default: 512 MB) */
@@ -147,6 +161,10 @@ private:
 	/** Importer reference for spawning */
 	UPROPERTY()
 	UFragmentsImporter* Importer = nullptr;
+
+	/** Engine_fragment-style visibility system */
+	UPROPERTY()
+	UFragmentVisibility* Visibility = nullptr;
 
 	/** Currently visible tiles */
 	UPROPERTY()
