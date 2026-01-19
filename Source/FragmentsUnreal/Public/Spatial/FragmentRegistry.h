@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Spatial/FragmentVisibility.h"
+#include "Utils/FragmentOcclusionTypes.h"
 #include "FragmentRegistry.generated.h"
 
 // Forward declarations
@@ -47,6 +48,14 @@ struct FFragmentVisibilityData
 	/** Category for filtering (e.g., "Wall", "Door", "Window") */
 	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
 	FString Category;
+
+	/** Occlusion role classification for GPU occlusion culling */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	EOcclusionRole OcclusionRole = EOcclusionRole::Occludee;
+
+	/** Material alpha value for transparency detection (0-255) */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	uint8 MaterialAlpha = 255;
 
 	FFragmentVisibilityData()
 		: WorldBounds(ForceInit)

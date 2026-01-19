@@ -4,11 +4,13 @@
 #include "Spatial/FragmentRegistry.h"
 #include "Spatial/PerSampleVisibilityController.h"
 #include "Spatial/DynamicTileGenerator.h"
+#include "Spatial/OcclusionSpawnController.h"
 #include "Importer/FragmentsImporter.h"
 #include "Importer/FragmentModelWrapper.h"
 #include "Fragment/Fragment.h"
 #include "HAL/PlatformTime.h"
 #include "SceneView.h"
+#include "Components/StaticMeshComponent.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFragmentTileManager, Log, All);
 
@@ -1223,6 +1225,11 @@ void UFragmentTileManager::InitializePerSampleVisibility(UFragmentRegistry* InRe
 	// Create dynamic tile generator
 	TileGenerator = NewObject<UDynamicTileGenerator>(this);
 
+	// Create occlusion spawn controller for deferred spawning
+	OcclusionController = NewObject<UOcclusionSpawnController>(this);
+	OcclusionController->Initialize(FragmentRegistry);
+	OcclusionController->bEnableOcclusionDeferral = bEnableOcclusionDeferral;
+
 	// Clear per-sample state
 	SpawnedFragments.Empty();
 	HiddenFragments.Empty();
@@ -1230,8 +1237,9 @@ void UFragmentTileManager::InitializePerSampleVisibility(UFragmentRegistry* InRe
 	FragmentLastUsedTime.Empty();
 	PerSampleCacheBytes = 0;
 
-	UE_LOG(LogFragmentTileManager, Log, TEXT("Per-sample visibility initialized: %d fragments in registry, Cache budget: %lld MB"),
-	       FragmentRegistry->GetFragmentCount(), MaxCachedBytes / (1024 * 1024));
+	UE_LOG(LogFragmentTileManager, Log, TEXT("Per-sample visibility initialized: %d fragments in registry, Cache budget: %lld MB, OcclusionDeferral: %s"),
+	       FragmentRegistry->GetFragmentCount(), MaxCachedBytes / (1024 * 1024),
+	       bEnableOcclusionDeferral ? TEXT("Enabled") : TEXT("Disabled"));
 }
 
 void UFragmentTileManager::UpdateVisibleTiles_PerSample(const FVector& CameraLocation, const FRotator& CameraRotation,
@@ -1380,7 +1388,8 @@ void UFragmentTileManager::ProcessSpawnChunk_PerSample()
 		return;
 	}
 
-	// Sort by distance (closest first) for better perceived loading
+	// Sort by priority: non-deferred first, then by distance (closest first)
+	// This ensures objects behind walls are spawned last
 	ActuallyNeedSpawn.Sort([this](const int32& A, const int32& B)
 	{
 		const FFragmentVisibilityData* DataA = FragmentRegistry ? FragmentRegistry->FindFragment(A) : nullptr;
@@ -1388,9 +1397,21 @@ void UFragmentTileManager::ProcessSpawnChunk_PerSample()
 
 		if (!DataA || !DataB) return false;
 
+		// Calculate base distances
 		const float DistA = FVector::DistSquared(DataA->WorldBounds.GetCenter(), LastPriorityCameraLocation);
 		const float DistB = FVector::DistSquared(DataB->WorldBounds.GetCenter(), LastPriorityCameraLocation);
-		return DistA < DistB;
+
+		// Apply occlusion deferral priority adjustment
+		float PriorityA = DistA;
+		float PriorityB = DistB;
+
+		if (OcclusionController && bEnableOcclusionDeferral)
+		{
+			PriorityA = OcclusionController->GetSpawnPriority(A, DistA);
+			PriorityB = OcclusionController->GetSpawnPriority(B, DistB);
+		}
+
+		return PriorityA < PriorityB;
 	});
 
 	// Time-based spawning within frame budget
@@ -1416,6 +1437,9 @@ void UFragmentTileManager::ProcessSpawnChunk_PerSample()
 			FragmentsSpawned++;
 		}
 	}
+
+	// Update occlusion tracking based on render results
+	UpdateOcclusionTracking();
 
 	UpdateSpawnProgress();
 }
@@ -1736,5 +1760,85 @@ void UFragmentTileManager::EvictFragmentsToFitBudget()
 	{
 		UE_LOG(LogFragmentTileManager, Log, TEXT("Evicted %d hidden fragments - Cache now: %lld MB"),
 		       EvictedCount, PerSampleCacheBytes / (1024 * 1024));
+	}
+}
+
+TSet<int32> UFragmentTileManager::CollectRenderedFragments() const
+{
+	TSet<int32> RenderedFragments;
+
+	if (!Importer)
+	{
+		return RenderedFragments;
+	}
+
+	UWorld* World = Importer->GetWorld();
+	if (!World)
+	{
+		return RenderedFragments;
+	}
+
+	const float CurrentTime = World->GetTimeSeconds();
+	// Allow ~2 frames of latency buffer (assuming 60fps, 2 frames = ~33ms)
+	const float RenderTimeThreshold = 0.033f;
+
+	// Iterate through all spawned (visible) fragment actors
+	for (const auto& Pair : SpawnedFragmentActors)
+	{
+		AFragment* Actor = Pair.Value;
+		if (!Actor || !SpawnedFragments.Contains(Pair.Key))
+		{
+			continue;
+		}
+
+		// Check if any mesh component was rendered recently
+		bool bWasRendered = false;
+		TArray<UStaticMeshComponent*> MeshComponents;
+		Actor->GetComponents<UStaticMeshComponent>(MeshComponents);
+
+		for (UStaticMeshComponent* MeshComp : MeshComponents)
+		{
+			if (MeshComp)
+			{
+				const float LastRenderTime = MeshComp->GetLastRenderTimeOnScreen();
+				if ((CurrentTime - LastRenderTime) < RenderTimeThreshold)
+				{
+					bWasRendered = true;
+					break;
+				}
+			}
+		}
+
+		if (bWasRendered)
+		{
+			RenderedFragments.Add(Pair.Key);
+		}
+	}
+
+	return RenderedFragments;
+}
+
+void UFragmentTileManager::UpdateOcclusionTracking()
+{
+	if (!OcclusionController || !bEnableOcclusionDeferral)
+	{
+		return;
+	}
+
+	// Collect fragments that were actually rendered this frame
+	TSet<int32> RenderedFragments = CollectRenderedFragments();
+
+	// Update occlusion controller with render results
+	OcclusionController->UpdateOcclusionTracking(RenderedFragments, SpawnedFragments);
+
+	// Log statistics periodically
+	static int32 FrameCounter = 0;
+	if (++FrameCounter % 300 == 0)  // Every ~5 seconds at 60fps
+	{
+		UE_LOG(LogFragmentTileManager, Verbose,
+		       TEXT("Occlusion tracking: %d/%d rendered, %d deferred"),
+		       RenderedFragments.Num(),
+		       SpawnedFragments.Num(),
+		       OcclusionController->GetDeferredFragmentCount());
 	}
 }

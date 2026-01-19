@@ -4,6 +4,10 @@
 #include "Spatial/FragmentTile.h"
 #include "FragmentOctree.generated.h"
 
+// Forward declarations
+struct FFragmentItem;
+struct Model;  // FlatBuffers Model type
+
 /**
  * Octree node (internal or leaf)
  */

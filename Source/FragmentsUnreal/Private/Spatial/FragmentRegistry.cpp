@@ -1,6 +1,7 @@
 #include "Spatial/FragmentRegistry.h"
 #include "Importer/FragmentModelWrapper.h"
 #include "Utils/FragmentsUtils.h"
+#include "Utils/FragmentOcclusionClassifier.h"
 #include "Index/index_generated.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFragmentRegistry, Log, All);
@@ -75,6 +76,7 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 
 		bool bHasValidBounds = false;
 		int32 PrimaryMaterialIndex = 0;
+		uint8 PrimaryMaterialAlpha = 255;  // Default to fully opaque
 
 		// Iterate through all samples (representations) for this fragment
 		for (const FFragmentSample& Sample : Item.Samples)
@@ -110,10 +112,21 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 				VisData.RepresentationIndex = Sample.RepresentationIndex;
 			}
 
-			// Get material index from FFragmentSample (not Representation)
+			// Get material index and alpha from FFragmentSample (not Representation)
 			if (Sample.MaterialIndex >= 0)
 			{
 				PrimaryMaterialIndex = Sample.MaterialIndex;
+
+				// Extract material alpha for occlusion classification
+				const auto* Materials = MeshesRef->materials();
+				if (Materials && Sample.MaterialIndex < static_cast<int32>(Materials->size()))
+				{
+					const Material* Mat = Materials->Get(Sample.MaterialIndex);
+					if (Mat)
+					{
+						PrimaryMaterialAlpha = Mat->a();
+					}
+				}
 			}
 
 			// Get bounding box from representation
@@ -161,8 +174,13 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 			// Classify as small or large object
 			VisData.bIsSmallObject = VisData.MaxDimension < SmallObjectSize;
 
-			// Store material index
+			// Store material index and alpha
 			VisData.MaterialIndex = PrimaryMaterialIndex;
+			VisData.MaterialAlpha = PrimaryMaterialAlpha;
+
+			// Classify occlusion role based on category and material transparency
+			VisData.OcclusionRole = UFragmentOcclusionClassifier::ClassifyFragment(
+				Item.Category, PrimaryMaterialAlpha);
 
 			// Add to registry
 			const int32 Index = Fragments.Num();
@@ -173,12 +191,13 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 			if (Index < 5)
 			{
 				UE_LOG(LogFragmentRegistry, Log,
-				       TEXT("Fragment %d bounds: Min=%s Max=%s Center=%s MaxDim=%.1f"),
+				       TEXT("Fragment %d bounds: Min=%s Max=%s Center=%s MaxDim=%.1f OcclusionRole=%s"),
 				       Item.LocalId,
 				       *VisData.WorldBounds.Min.ToString(),
 				       *VisData.WorldBounds.Max.ToString(),
 				       *VisData.WorldBounds.GetCenter().ToString(),
-				       VisData.MaxDimension);
+				       VisData.MaxDimension,
+				       *UFragmentOcclusionClassifier::GetOcclusionRoleString(VisData.OcclusionRole));
 			}
 		}
 		else
@@ -192,6 +211,11 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 			VisData.MaxDimension = FMath::Max3(Extent.X, Extent.Y, Extent.Z) * 2.0f;
 			VisData.bIsSmallObject = true; // Point-based = small
 			VisData.MaterialIndex = 0;
+			VisData.MaterialAlpha = PrimaryMaterialAlpha;
+
+			// Classify occlusion role (fallback fragments are typically small occludees)
+			VisData.OcclusionRole = UFragmentOcclusionClassifier::ClassifyFragment(
+				Item.Category, PrimaryMaterialAlpha);
 
 			const int32 Index = Fragments.Num();
 			Fragments.Add(VisData);

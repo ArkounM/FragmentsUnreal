@@ -13,6 +13,7 @@ class UFragmentVisibility;
 class UFragmentRegistry;
 class UPerSampleVisibilityController;
 class UDynamicTileGenerator;
+class UOcclusionSpawnController;
 struct FFragmentItem;
 
 /**
@@ -117,6 +118,10 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.5", ClampMax = "2.0"))
 	float GraphicsQuality = 1.0f;
 
+	/** Enable occlusion-based spawn deferral (fragments behind walls spawn later) */
+	UPROPERTY(EditAnywhere, Category = "Streaming|Occlusion")
+	bool bEnableOcclusionDeferral = true;
+
 	// --- Cache Configuration ---
 
 	/** Maximum memory budget for tile cache in bytes (default: 512 MB) */
@@ -218,6 +223,10 @@ private:
 	/** Dynamic tile generator for CRC-based grouping */
 	UPROPERTY()
 	UDynamicTileGenerator* TileGenerator = nullptr;
+
+	/** Occlusion-based spawn controller for deferred spawning */
+	UPROPERTY()
+	UOcclusionSpawnController* OcclusionController = nullptr;
 
 	/** Set of currently spawned fragments (per-sample mode) */
 	TSet<int32> SpawnedFragments;
@@ -501,4 +510,17 @@ private:
 	 * @return true if over budget
 	 */
 	bool IsPerSampleMemoryOverBudget() const;
+
+	/**
+	 * Collect set of fragments that were rendered this frame.
+	 * Uses GetLastRenderTimeOnScreen() to detect GPU-rendered fragments.
+	 * @return Set of LocalIds that were rendered
+	 */
+	TSet<int32> CollectRenderedFragments() const;
+
+	/**
+	 * Update occlusion tracking for deferred spawning.
+	 * Called after rendering to track which fragments are occluded.
+	 */
+	void UpdateOcclusionTracking();
 };

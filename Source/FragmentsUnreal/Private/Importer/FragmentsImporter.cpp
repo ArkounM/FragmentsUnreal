@@ -23,6 +23,7 @@
 #include "Importer/FragmentsAsyncLoader.h"
 #include "Spatial/FragmentTileManager.h"
 #include "Spatial/FragmentSemanticTileManager.h"
+#include "Utils/FragmentOcclusionClassifier.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -1057,8 +1058,41 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 				MeshComp->SetStaticMesh(Mesh);
 				MeshComp->SetRelativeTransform(LocalTransform);
 				MeshComp->AttachToComponent(RootSceneComponent, FAttachmentTransformRules::KeepRelativeTransform);
+
+				// Disable Lumen/Distance Field features to avoid "Preparing mesh distance fields/cards" delays
+				// These are expensive to compute at runtime for procedurally generated meshes
+				MeshComp->bAffectDistanceFieldLighting = false;  // Skip distance field generation
+				MeshComp->bAffectDynamicIndirectLighting = false; // Skip Lumen indirect lighting
+				MeshComp->bAffectIndirectLightingWhileHidden = false;
+
 				MeshComp->RegisterComponent();
 				FragmentModel->AddInstanceComponent(MeshComp);
+
+				// Configure occlusion culling based on fragment classification
+				const uint8 MaterialAlpha = material ? material->a() : 255;
+				const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
+					Item.Category, MaterialAlpha);
+
+				switch (Role)
+				{
+				case EOcclusionRole::Occluder:
+					// Large structural elements that block visibility
+					MeshComp->bUseAsOccluder = true;
+					MeshComp->SetCastShadow(true);
+					break;
+
+				case EOcclusionRole::Occludee:
+					// Objects that can be hidden by occluders
+					MeshComp->bUseAsOccluder = false;
+					MeshComp->SetCastShadow(true);
+					break;
+
+				case EOcclusionRole::NonOccluder:
+					// Glass/transparent - doesn't block anything
+					MeshComp->bUseAsOccluder = false;
+					MeshComp->SetCastShadow(false);
+					break;
+				}
 			}
 		}
 	}
