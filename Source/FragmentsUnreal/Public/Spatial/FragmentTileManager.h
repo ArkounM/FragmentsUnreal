@@ -10,6 +10,9 @@
 class UFragmentOctree;
 class UFragmentsImporter;
 class UFragmentVisibility;
+class UFragmentRegistry;
+class UPerSampleVisibilityController;
+class UDynamicTileGenerator;
 
 /**
  * Manages tile-based fragment streaming based on camera frustum.
@@ -96,6 +99,15 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Streaming")
 	bool bUseEngineFragmentVisibility = true;
 
+	/**
+	 * Use per-sample visibility (engine_fragment approach).
+	 * When true: Tests each fragment individually - prevents tile-based culling bugs.
+	 * When false: Uses octree tile-based visibility (original approach).
+	 * Default: true (new per-sample system)
+	 */
+	UPROPERTY(EditAnywhere, Category = "Streaming")
+	bool bUsePerSampleVisibility = true;
+
 	/** LOD mode for engine_fragment visibility system */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
 	EFragmentLodMode LodMode = EFragmentLodMode::Default;
@@ -165,6 +177,27 @@ private:
 	/** Engine_fragment-style visibility system */
 	UPROPERTY()
 	UFragmentVisibility* Visibility = nullptr;
+
+	// --- Per-Sample Visibility System (NEW) ---
+
+	/** Fragment registry for per-sample visibility */
+	UPROPERTY()
+	UFragmentRegistry* FragmentRegistry = nullptr;
+
+	/** Per-sample visibility controller */
+	UPROPERTY()
+	UPerSampleVisibilityController* SampleVisibility = nullptr;
+
+	/** Dynamic tile generator for CRC-based grouping */
+	UPROPERTY()
+	UDynamicTileGenerator* TileGenerator = nullptr;
+
+	/** Set of currently spawned fragments (per-sample mode) */
+	TSet<int32> SpawnedFragments;
+
+	/** Map of spawned fragment actors (LocalId -> Actor) */
+	UPROPERTY()
+	TMap<int32, class AFragment*> SpawnedFragmentActors;
 
 	/** Currently visible tiles */
 	UPROPERTY()
@@ -355,4 +388,41 @@ private:
 	 * @param Tile Tile that was accessed
 	 */
 	void TouchTile(UFragmentTile* Tile);
+
+public:
+	// --- Per-Sample Visibility Methods (Public for FragmentsImporter access) ---
+
+	/**
+	 * Initialize per-sample visibility system.
+	 * Called during Initialize() if bUsePerSampleVisibility is true.
+	 * @param InRegistry Fragment registry from model wrapper
+	 */
+	void InitializePerSampleVisibility(UFragmentRegistry* InRegistry);
+
+	/**
+	 * Update visible fragments using per-sample visibility.
+	 * Alternative to UpdateVisibleTiles() that tests each fragment individually.
+	 */
+	void UpdateVisibleTiles_PerSample(const FVector& CameraLocation, const FRotator& CameraRotation,
+	                                   float FOV, float AspectRatio, float ViewportHeight);
+
+	/**
+	 * Process spawning/unloading based on dynamic tiles.
+	 * Called each frame when using per-sample visibility.
+	 */
+	void ProcessSpawnChunk_PerSample();
+
+private:
+	/**
+	 * Spawn a single fragment (per-sample mode).
+	 * @param LocalId Fragment local ID to spawn
+	 * @return true if fragment was spawned successfully
+	 */
+	bool SpawnFragmentById(int32 LocalId);
+
+	/**
+	 * Unload a single fragment (per-sample mode).
+	 * @param LocalId Fragment local ID to unload
+	 */
+	void UnloadFragmentById(int32 LocalId);
 };

@@ -1,5 +1,3 @@
-
-
 #pragma once
 
 #include "CoreMinimal.h"
@@ -7,6 +5,7 @@
 #include "Index/index_generated.h"
 #include "Utils/FragmentsUtils.h"
 #include "Spatial/FragmentOctree.h"
+#include "Spatial/FragmentRegistry.h"
 #include "FragmentModelWrapper.generated.h"
 
 /**
@@ -29,6 +28,10 @@ private:
 
 	UPROPERTY()
 	UFragmentOctree* SpatialIndex = nullptr;
+
+	/** Fragment registry for per-sample visibility (Phase 1 optimization) */
+	UPROPERTY()
+	UFragmentRegistry* FragmentRegistry = nullptr;
 
 
 public:
@@ -54,5 +57,16 @@ public:
 	 * Get the spatial index
 	 */
 	UFragmentOctree* GetSpatialIndex() const { return SpatialIndex; }
+
+	/**
+	 * Build fragment registry for per-sample visibility
+	 * @param ModelGuid Model identifier
+	 */
+	void BuildFragmentRegistry(const FString& ModelGuid);
+
+	/**
+	 * Get the fragment registry
+	 */
+	UFragmentRegistry* GetFragmentRegistry() const { return FragmentRegistry; }
 
 };

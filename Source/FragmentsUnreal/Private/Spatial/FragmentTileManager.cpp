@@ -1,6 +1,9 @@
 #include "Spatial/FragmentTileManager.h"
 #include "Spatial/FragmentOctree.h"
 #include "Spatial/FragmentVisibility.h"
+#include "Spatial/FragmentRegistry.h"
+#include "Spatial/PerSampleVisibilityController.h"
+#include "Spatial/DynamicTileGenerator.h"
 #include "Importer/FragmentsImporter.h"
 #include "Importer/FragmentModelWrapper.h"
 #include "Fragment/Fragment.h"
@@ -1194,4 +1197,278 @@ void UFragmentTileManager::EvictTilesToFitBudget()
 		       TileMemory / 1024,
 		       CurrentCacheBytes / (1024 * 1024));
 	}
+}
+
+// =============================================================================
+// PER-SAMPLE VISIBILITY IMPLEMENTATION
+// =============================================================================
+
+void UFragmentTileManager::InitializePerSampleVisibility(UFragmentRegistry* InRegistry)
+{
+	if (!InRegistry || !InRegistry->IsBuilt())
+	{
+		UE_LOG(LogFragmentTileManager, Warning, TEXT("InitializePerSampleVisibility: Invalid registry"));
+		return;
+	}
+
+	FragmentRegistry = InRegistry;
+
+	// Create per-sample visibility controller
+	SampleVisibility = NewObject<UPerSampleVisibilityController>(this);
+	SampleVisibility->Initialize(FragmentRegistry);
+	SampleVisibility->LodMode = LodMode;
+	SampleVisibility->GraphicsQuality = GraphicsQuality;
+	SampleVisibility->MinCameraMovement = MinCameraMovement;
+	SampleVisibility->MinCameraRotation = MinCameraRotation;
+
+	// Create dynamic tile generator
+	TileGenerator = NewObject<UDynamicTileGenerator>(this);
+
+	// Clear per-sample state
+	SpawnedFragments.Empty();
+	SpawnedFragmentActors.Empty();
+
+	UE_LOG(LogFragmentTileManager, Log, TEXT("Per-sample visibility initialized: %d fragments in registry"),
+	       FragmentRegistry->GetFragmentCount());
+}
+
+void UFragmentTileManager::UpdateVisibleTiles_PerSample(const FVector& CameraLocation, const FRotator& CameraRotation,
+                                                         float FOV, float AspectRatio, float ViewportHeight)
+{
+	if (!SampleVisibility || !TileGenerator || !FragmentRegistry)
+	{
+		UE_LOG(LogFragmentTileManager, Warning, TEXT("UpdateVisibleTiles_PerSample: Per-sample system not initialized"));
+		return;
+	}
+
+	const double CurrentTime = FPlatformTime::Seconds();
+	const float TimeSinceUpdate = CurrentTime - LastUpdateTime;
+
+	// Check if update needed
+	const bool bTimeThresholdMet = TimeSinceUpdate >= CameraUpdateInterval;
+	const float DistanceMoved = FVector::Dist(LastCameraPosition, CameraLocation);
+	const bool bMovedSignificantly = DistanceMoved >= MinCameraMovement;
+
+	const FRotator RotationDelta = CameraRotation - LastCameraRotation;
+	const float RotationChange = FMath::Max3(
+		FMath::Abs(RotationDelta.Pitch),
+		FMath::Abs(RotationDelta.Yaw),
+		FMath::Abs(RotationDelta.Roll)
+	);
+	const bool bRotatedSignificantly = RotationChange >= MinCameraRotation;
+
+	if (!bTimeThresholdMet && !bMovedSignificantly && !bRotatedSignificantly)
+	{
+		return;
+	}
+
+	UE_LOG(LogFragmentTileManager, VeryVerbose,
+	       TEXT("Per-sample update: time=%d move=%d (%.0fcm) rotate=%d (%.1fdeg)"),
+	       bTimeThresholdMet, bMovedSignificantly, DistanceMoved, bRotatedSignificantly, RotationChange);
+
+	// Track camera movement
+	if (bMovedSignificantly || bRotatedSignificantly)
+	{
+		LastCameraMovementTime = CurrentTime;
+	}
+
+	// === STEP 1: Per-sample visibility evaluation ===
+	SampleVisibility->LodMode = LodMode;
+	SampleVisibility->GraphicsQuality = GraphicsQuality;
+	SampleVisibility->UpdateVisibility(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
+
+	// === STEP 2: Generate dynamic tiles from visible samples ===
+	const TArray<FFragmentVisibilityResult>& VisibleSamples = SampleVisibility->GetVisibleSamples();
+	TileGenerator->GenerateTiles(VisibleSamples, FragmentRegistry);
+
+	// === STEP 3: Determine fragments to spawn/unload ===
+	TArray<int32> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
+	TArray<int32> ToUnload = TileGenerator->GetFragmentsToUnload(SpawnedFragments);
+
+	// Update spawn tracking
+	TotalFragmentsToSpawn = ToSpawn.Num();
+	FragmentsSpawned = 0;
+
+	UE_LOG(LogFragmentTileManager, Verbose,
+	       TEXT("Per-sample visibility: %d visible, %d tiles, %d to spawn, %d to unload"),
+	       VisibleSamples.Num(), TileGenerator->GetTileCount(), ToSpawn.Num(), ToUnload.Num());
+
+	// === STEP 4: Unload fragments that left frustum ===
+	for (int32 LocalId : ToUnload)
+	{
+		UnloadFragmentById(LocalId);
+	}
+
+	// Update last camera state
+	LastCameraPosition = CameraLocation;
+	LastCameraRotation = CameraRotation;
+	LastUpdateTime = CurrentTime;
+	LastPriorityCameraLocation = CameraLocation;
+	LastPriorityFOV = FOV;
+
+	UpdateSpawnProgress();
+}
+
+void UFragmentTileManager::ProcessSpawnChunk_PerSample()
+{
+	if (!TileGenerator || !Importer)
+	{
+		return;
+	}
+
+	// Get fragments to spawn
+	TArray<int32> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
+
+	if (ToSpawn.Num() == 0)
+	{
+		if (TotalFragmentsToSpawn > 0)
+		{
+			LoadingStage = TEXT("Complete");
+			SpawnProgress = 1.0f;
+		}
+		else
+		{
+			LoadingStage = TEXT("Idle");
+		}
+		return;
+	}
+
+	// Sort by distance (closest first) for better perceived loading
+	ToSpawn.Sort([this](const int32& A, const int32& B)
+	{
+		const FFragmentVisibilityData* DataA = FragmentRegistry ? FragmentRegistry->FindFragment(A) : nullptr;
+		const FFragmentVisibilityData* DataB = FragmentRegistry ? FragmentRegistry->FindFragment(B) : nullptr;
+
+		if (!DataA || !DataB) return false;
+
+		const float DistA = FVector::DistSquared(DataA->WorldBounds.GetCenter(), LastPriorityCameraLocation);
+		const float DistB = FVector::DistSquared(DataB->WorldBounds.GetCenter(), LastPriorityCameraLocation);
+		return DistA < DistB;
+	});
+
+	// Time-based spawning within frame budget
+	const double StartTime = FPlatformTime::Seconds();
+	const double MaxSpawnTimeSec = MaxSpawnTimeMs / 1000.0;
+	int32 SpawnedThisFrame = 0;
+
+	for (int32 LocalId : ToSpawn)
+	{
+		// Check time budget
+		const double ElapsedTime = FPlatformTime::Seconds() - StartTime;
+		if (ElapsedTime >= MaxSpawnTimeSec && SpawnedThisFrame > 0)
+		{
+			UE_LOG(LogFragmentTileManager, VeryVerbose,
+			       TEXT("Per-sample spawn budget exhausted: %.2fms, %d spawned"),
+			       ElapsedTime * 1000.0, SpawnedThisFrame);
+			break;
+		}
+
+		if (SpawnFragmentById(LocalId))
+		{
+			SpawnedThisFrame++;
+			FragmentsSpawned++;
+		}
+	}
+
+	UpdateSpawnProgress();
+}
+
+bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
+{
+	if (!Importer || SpawnedFragments.Contains(LocalId))
+	{
+		return false;
+	}
+
+	// Get model wrapper
+	UFragmentModelWrapper* Wrapper = Importer->GetFragmentModel(ModelGuid);
+	if (!Wrapper)
+	{
+		UE_LOG(LogFragmentTileManager, Error, TEXT("SpawnFragmentById: No model wrapper for %s"), *ModelGuid);
+		return false;
+	}
+
+	// Get FFragmentItem from model hierarchy
+	FFragmentItem* FragmentItem = nullptr;
+	if (!Wrapper->GetModelItemRef().FindFragmentByLocalId(LocalId, FragmentItem))
+	{
+		UE_LOG(LogFragmentTileManager, Warning, TEXT("SpawnFragmentById: Could not find fragment LocalId %d"), LocalId);
+		return false;
+	}
+
+	// Get Meshes reference from parsed model
+	const Model* ParsedModel = Wrapper->GetParsedModel();
+	if (!ParsedModel || !ParsedModel->meshes())
+	{
+		UE_LOG(LogFragmentTileManager, Error, TEXT("SpawnFragmentById: No meshes in model"));
+		return false;
+	}
+
+	const Meshes* MeshesRef = ParsedModel->meshes();
+
+	// Find parent actor
+	AActor* ParentActor = nullptr;
+
+	// Check if parent fragment is already spawned
+	FFragmentItem* ParentItem = FindParentFragmentItem(&Wrapper->GetModelItemRef(), FragmentItem);
+	if (ParentItem && ParentItem->LocalId >= 0)
+	{
+		AFragment** FoundParent = SpawnedFragmentActors.Find(ParentItem->LocalId);
+		if (FoundParent && *FoundParent)
+		{
+			ParentActor = *FoundParent;
+		}
+		else
+		{
+			// Try global lookup
+			ParentActor = Importer->GetItemByLocalId(ParentItem->LocalId, ModelGuid);
+		}
+	}
+
+	// Fall back to owner actor
+	if (!ParentActor)
+	{
+		ParentActor = Importer->GetOwnerRef();
+		if (!ParentActor)
+		{
+			UE_LOG(LogFragmentTileManager, Error, TEXT("SpawnFragmentById: No parent or owner actor"));
+			return false;
+		}
+	}
+
+	// Spawn fragment
+	AFragment* SpawnedActor = Importer->SpawnSingleFragment(*FragmentItem, ParentActor, MeshesRef, false);
+
+	if (SpawnedActor)
+	{
+		SpawnedFragments.Add(LocalId);
+		SpawnedFragmentActors.Add(LocalId, SpawnedActor);
+
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Per-sample spawned fragment LocalId %d"), LocalId);
+		return true;
+	}
+
+	return false;
+}
+
+void UFragmentTileManager::UnloadFragmentById(int32 LocalId)
+{
+	AFragment** ActorPtr = SpawnedFragmentActors.Find(LocalId);
+	if (!ActorPtr || !*ActorPtr)
+	{
+		SpawnedFragments.Remove(LocalId);
+		SpawnedFragmentActors.Remove(LocalId);
+		return;
+	}
+
+	AFragment* Actor = *ActorPtr;
+
+	// Destroy the actor
+	Actor->Destroy();
+
+	// Remove from tracking
+	SpawnedFragments.Remove(LocalId);
+	SpawnedFragmentActors.Remove(LocalId);
+
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Per-sample unloaded fragment LocalId %d"), LocalId);
 }

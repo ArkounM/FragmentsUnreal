@@ -439,6 +439,27 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 	TileManager->Initialize(InModelGuid, Octree, this);
 	TileManagers.Add(InModelGuid, TileManager);
 
+	// Initialize per-sample visibility if enabled (Phase 1 optimization)
+	if (TileManager->bUsePerSampleVisibility)
+	{
+		// Build fragment registry for per-sample visibility
+		Wrapper->BuildFragmentRegistry(InModelGuid);
+		UFragmentRegistry* Registry = Wrapper->GetFragmentRegistry();
+
+		if (Registry && Registry->IsBuilt())
+		{
+			TileManager->InitializePerSampleVisibility(Registry);
+			UE_LOG(LogFragments, Log, TEXT("Per-sample visibility enabled for model: %s (%d fragments)"),
+			       *InModelGuid, Registry->GetFragmentCount());
+		}
+		else
+		{
+			UE_LOG(LogFragments, Warning, TEXT("Per-sample visibility disabled: registry build failed for model %s"),
+			       *InModelGuid);
+			TileManager->bUsePerSampleVisibility = false;
+		}
+	}
+
 	// Create and initialize semantic tile manager for IFC class-based grouping
 	UFragmentSemanticTileManager* SemanticTileMgr = NewObject<UFragmentSemanticTileManager>(this);
 	SemanticTileMgr->Initialize(InModelGuid, this);
@@ -1116,8 +1137,20 @@ void UFragmentsImporter::ProcessAllTileManagerChunks()
 	for (auto& Pair : TileManagers)
 	{
 		UFragmentTileManager* TileManager = Pair.Value;
-		if (TileManager && TileManager->IsLoading())
+		if (!TileManager)
 		{
+			continue;
+		}
+
+		// Use per-sample visibility path when enabled
+		if (TileManager->bUsePerSampleVisibility)
+		{
+			// Per-sample mode: process spawning based on dynamic tiles
+			TileManager->ProcessSpawnChunk_PerSample();
+		}
+		else if (TileManager->IsLoading())
+		{
+			// Original tile-based mode
 			TileManager->ProcessSpawnChunk();
 		}
 	}
@@ -1149,7 +1182,15 @@ void UFragmentsImporter::UpdateTileStreaming(const FVector& CameraLocation, cons
 		UFragmentTileManager* TileManager = Pair.Value;
 		if (TileManager)
 		{
-			TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
+			// Use per-sample visibility path when enabled
+			if (TileManager->bUsePerSampleVisibility)
+			{
+				TileManager->UpdateVisibleTiles_PerSample(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
+			}
+			else
+			{
+				TileManager->UpdateVisibleTiles(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
+			}
 		}
 	}
 
