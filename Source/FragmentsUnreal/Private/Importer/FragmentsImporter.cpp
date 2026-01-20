@@ -1212,10 +1212,33 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					Mesh = FindObject<UStaticMesh>(ExistingPackage, *MeshName);
 				}
 			}
-			// Create new mesh using deduplication
+			// Create new mesh using async or sync path
 			else
 			{
-				// Extract geometry data first
+				// ASYNC PATH: Submit Shell geometry to worker threads
+				// (CircleExtrusion still uses sync path - async not implemented)
+				if (bUseAsyncGeometryProcessing &&
+					representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+				{
+					const auto* shell = MeshesRef->shells()->Get(representation->id());
+					SubmitShellForAsyncProcessing(
+						shell,
+						material,
+						Item,
+						i,  // SampleIndex
+						MeshName,
+						PackagePath,
+						LocalTransform,
+						FragmentModel,
+						ParentActor,
+						bSaveMeshes
+					);
+					// Skip to next sample - mesh will be attached asynchronously
+					// via ProcessCompletedGeometry() -> FinalizeFragmentWithMesh()
+					continue;
+				}
+
+				// SYNC PATH: Extract geometry and use deduplication
 				TArray<FVector> Vertices;
 				TArray<int32> Triangles;
 				TArray<FVector> Normals;
@@ -1378,9 +1401,25 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 void UFragmentsImporter::ProcessSpawnChunk()
 {
+	// Process any completed async geometry work within frame budget
+	ProcessCompletedGeometry();
+
+	// Check if we still have pending async work
+	const bool bHasPendingAsyncWork = GeometryWorkerPool.IsValid() &&
+		(GeometryWorkerPool->GetPendingWorkCount() > 0 || PendingFragmentMap.Num() > 0);
+
 	if (PendingSpawnQueue.Num() == 0)
 	{
-		// Spawning complete
+		// All fragments spawned, but check if async geometry is still being processed
+		if (bHasPendingAsyncWork)
+		{
+			// Keep timer running to process remaining async work
+			UE_LOG(LogFragments, Verbose, TEXT("Spawn queue empty, waiting for %d async geometry items"),
+				PendingFragmentMap.Num());
+			return;
+		}
+
+		// Spawning and async processing complete
 		UE_LOG(LogFragments, Log, TEXT("Chunked spawning complete! Total fragments: %d"), FragmentsSpawned);
 
 		// Clear timer
@@ -2369,7 +2408,9 @@ void UFragmentsImporter::InitializeWorkerPool()
 	{
 		GeometryWorkerPool = MakeUnique<FGeometryWorkerPool>();
 		GeometryWorkerPool->Initialize();
-		UE_LOG(LogFragments, Log, TEXT("Geometry worker pool initialized"));
+		UE_LOG(LogFragments, Log, TEXT("=== ASYNC GEOMETRY PROCESSING ENABLED ==="));
+		UE_LOG(LogFragments, Log, TEXT("Geometry worker pool initialized with parallel tessellation support"));
+		UE_LOG(LogFragments, Log, TEXT("Shell geometry will be processed on background threads"));
 	}
 }
 
@@ -2528,6 +2569,7 @@ UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& G
 	StaticMeshDescription->SetPolygonGroupMaterialSlotName(PolygonGroupId, MaterialSlotName);
 
 	// Create triangles
+	int32 TrianglesCreated = 0;
 	for (int32 i = 0; i < GeometryData.Indices.Num(); i += 3)
 	{
 		uint32 I0 = GeometryData.Indices[i];
@@ -2542,25 +2584,32 @@ UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& G
 			TriangleInstance.Add(MeshDescription.CreateVertexInstance(Vertices[I2]));
 
 			// Set normals on vertex instances
-			if (i / 3 < GeometryData.Normals.Num())
+			if (I0 < (uint32)GeometryData.Normals.Num() &&
+				I1 < (uint32)GeometryData.Normals.Num() &&
+				I2 < (uint32)GeometryData.Normals.Num())
 			{
 				TVertexInstanceAttributesRef<FVector3f> VertexInstanceNormals =
 					MeshDescription.VertexInstanceAttributes().GetAttributesRef<FVector3f>(MeshAttribute::VertexInstance::Normal);
 
-				if (I0 < (uint32)GeometryData.Normals.Num())
-					VertexInstanceNormals[TriangleInstance[0]] = GeometryData.Normals[I0];
-				if (I1 < (uint32)GeometryData.Normals.Num())
-					VertexInstanceNormals[TriangleInstance[1]] = GeometryData.Normals[I1];
-				if (I2 < (uint32)GeometryData.Normals.Num())
-					VertexInstanceNormals[TriangleInstance[2]] = GeometryData.Normals[I2];
+				VertexInstanceNormals[TriangleInstance[0]] = GeometryData.Normals[I0];
+				VertexInstanceNormals[TriangleInstance[1]] = GeometryData.Normals[I1];
+				VertexInstanceNormals[TriangleInstance[2]] = GeometryData.Normals[I2];
 			}
 
 			MeshDescription.CreatePolygon(PolygonGroupId, TriangleInstance);
+			TrianglesCreated++;
 		}
 	}
 
-	// Compute tangents (normals already provided)
-	FStaticMeshOperations::ComputeTangentsAndNormals(MeshDescription, EComputeNTBsFlags::Tangents);
+	// Only proceed if we actually created triangles
+	if (TrianglesCreated == 0)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateMeshFromRawData: No valid triangles created for %s"), *GeometryData.MeshName);
+		return nullptr;
+	}
+
+	// Note: Tangents will be computed by BuildFromMeshDescriptions via build settings (bRecomputeTangents = true)
+	// We skip explicit ComputeTangentsAndNormals call as it can crash on certain mesh configurations
 
 	StaticMesh->BuildFromMeshDescriptions(TArray<const FMeshDescription*>{&MeshDescription}, MeshParams);
 
@@ -2647,6 +2696,7 @@ void UFragmentsImporter::SubmitShellForAsyncProcessing(
 	const FString& MeshName,
 	const FString& PackagePath,
 	const FTransform& LocalTransform,
+	AFragment* FragmentActor,
 	AActor* ParentActor,
 	bool bSaveMeshes)
 {
@@ -2674,18 +2724,21 @@ void UFragmentsImporter::SubmitShellForAsyncProcessing(
 
 	// Store pending fragment data for later completion
 	FPendingFragmentData PendingData;
+	PendingData.FragmentActor = FragmentActor;
 	PendingData.ParentActor = ParentActor;
 	PendingData.LocalTransform = LocalTransform;
 	PendingData.SampleIndex = SampleIndex;
 	PendingData.bSaveMeshes = bSaveMeshes;
 	PendingData.PackagePath = PackagePath;
 	PendingData.MeshName = MeshName;
-	// Note: FragmentActor will be set when we spawn the actor
 
 	PendingFragmentMap.Add(WorkItemId, MoveTemp(PendingData));
 
 	// Submit work to pool
 	GeometryWorkerPool->SubmitWork(MoveTemp(WorkItem));
+
+	UE_LOG(LogFragments, Verbose, TEXT("Submitted Shell for async processing: %s (WorkItemId: %llu)"),
+		*MeshName, WorkItemId);
 }
 
 void UFragmentsImporter::FinalizeFragmentWithMesh(const FRawGeometryData& GeometryData, UStaticMesh* Mesh)

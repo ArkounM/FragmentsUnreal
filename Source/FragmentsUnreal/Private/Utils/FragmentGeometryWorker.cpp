@@ -697,17 +697,33 @@ FGeometryWorkItem FGeometryDataExtractor::ExtractShellWorkItem(
 		WorkItem.bIsGlass = WorkItem.A < 255;
 	}
 
+	// Sanity check limits to prevent crashes from corrupted data
+	constexpr uint32 MaxPointCount = 1000000;
+	constexpr uint32 MaxProfileCount = 100000;
+	constexpr uint32 MaxIndicesPerProfile = 100000;
+
 	// Extract points from FlatBuffers (COPY for thread safety)
 	if (ShellRef && ShellRef->points())
 	{
 		const auto* Points = ShellRef->points();
-		WorkItem.Points.Reserve(Points->size());
+		const uint32 PointCount = Points->size();
 
-		for (flatbuffers::uoffset_t i = 0; i < Points->size(); i++)
+		if (PointCount > MaxPointCount)
 		{
-			const auto& P = *Points->Get(i);
-			// Convert to Unreal coordinates: Z-up, cm units
-			WorkItem.Points.Add(FVector(P.x() * 100, P.z() * 100, P.y() * 100));
+			UE_LOG(LogGeometryWorker, Warning, TEXT("ExtractShellWorkItem: Point count %u exceeds limit, skipping mesh %s"),
+				PointCount, *MeshName);
+			return WorkItem;
+		}
+
+		WorkItem.Points.Reserve(PointCount);
+		for (flatbuffers::uoffset_t i = 0; i < PointCount; i++)
+		{
+			const auto* P = Points->Get(i);
+			if (P)
+			{
+				// Convert to Unreal coordinates: Z-up, cm units
+				WorkItem.Points.Add(FVector(P->x() * 100, P->z() * 100, P->y() * 100));
+			}
 		}
 	}
 
@@ -715,23 +731,40 @@ FGeometryWorkItem FGeometryDataExtractor::ExtractShellWorkItem(
 	if (ShellRef && ShellRef->profiles())
 	{
 		const auto* Profiles = ShellRef->profiles();
+		const uint32 ProfileCount = Profiles->size();
+
+		if (ProfileCount > MaxProfileCount)
+		{
+			UE_LOG(LogGeometryWorker, Warning, TEXT("ExtractShellWorkItem: Profile count %u exceeds limit, skipping mesh %s"),
+				ProfileCount, *MeshName);
+			return WorkItem;
+		}
 
 		// First, map holes to profiles
 		TMap<int32, TArray<TArray<int32>>> ProfileHolesMap;
 		if (ShellRef->holes())
 		{
 			const auto* Holes = ShellRef->holes();
-			for (flatbuffers::uoffset_t j = 0; j < Holes->size(); j++)
+			const uint32 HoleCount = Holes->size();
+
+			for (flatbuffers::uoffset_t j = 0; j < HoleCount && j < MaxProfileCount; j++)
 			{
 				const auto* Hole = Holes->Get(j);
+				if (!Hole) continue;
+
 				int32 ProfileId = Hole->profile_id();
 
 				TArray<int32> HoleIndices;
 				if (Hole->indices())
 				{
-					for (flatbuffers::uoffset_t k = 0; k < Hole->indices()->size(); k++)
+					const uint32 HoleIndexCount = Hole->indices()->size();
+					if (HoleIndexCount <= MaxIndicesPerProfile)
 					{
-						HoleIndices.Add(Hole->indices()->Get(k));
+						HoleIndices.Reserve(HoleIndexCount);
+						for (flatbuffers::uoffset_t k = 0; k < HoleIndexCount; k++)
+						{
+							HoleIndices.Add(Hole->indices()->Get(k));
+						}
 					}
 				}
 
@@ -739,19 +772,29 @@ FGeometryWorkItem FGeometryDataExtractor::ExtractShellWorkItem(
 			}
 		}
 
-		WorkItem.ProfileIndices.Reserve(Profiles->size());
-		WorkItem.ProfileHoles.SetNum(Profiles->size());
+		WorkItem.ProfileIndices.Reserve(ProfileCount);
+		WorkItem.ProfileHoles.SetNum(ProfileCount);
 
-		for (flatbuffers::uoffset_t i = 0; i < Profiles->size(); i++)
+		for (flatbuffers::uoffset_t i = 0; i < ProfileCount; i++)
 		{
 			const auto* Profile = Profiles->Get(i);
 			TArray<int32> ProfileVertexIndices;
 
 			if (Profile && Profile->indices())
 			{
-				for (flatbuffers::uoffset_t j = 0; j < Profile->indices()->size(); j++)
+				const uint32 IndexCount = Profile->indices()->size();
+				if (IndexCount <= MaxIndicesPerProfile)
 				{
-					ProfileVertexIndices.Add(Profile->indices()->Get(j));
+					ProfileVertexIndices.Reserve(IndexCount);
+					for (flatbuffers::uoffset_t j = 0; j < IndexCount; j++)
+					{
+						ProfileVertexIndices.Add(Profile->indices()->Get(j));
+					}
+				}
+				else
+				{
+					UE_LOG(LogGeometryWorker, Warning, TEXT("ExtractShellWorkItem: Profile %d has %u indices (limit %u), skipping"),
+						i, IndexCount, MaxIndicesPerProfile);
 				}
 			}
 

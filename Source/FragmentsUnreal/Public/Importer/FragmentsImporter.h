@@ -18,6 +18,7 @@ FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
 class UFragmentsAsyncLoader;
 class UFragmentTileManager;
 class FGeometryWorkerPool;
+class AFragment;
 struct FRawGeometryData;
 struct FGeometryWorkItem;
 
@@ -75,6 +76,25 @@ public:
 	{
 		return FragmentModels;
 	}
+
+	// Get a specific fragment model by GUID
+	FORCEINLINE class UFragmentModelWrapper* GetFragmentModel(const FString& ModelGuid) const
+	{
+		if (const auto* Found = FragmentModels.Find(ModelGuid))
+		{
+			return *Found;
+		}
+		return nullptr;
+	}
+
+	// Get owner actor reference
+	FORCEINLINE AActor* GetOwnerRef() const
+	{
+		return OwnerRef;
+	}
+
+	// Spawn a single fragment actor with its geometry (public for TileManager access)
+	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes);
 
 	UPROPERTY()
 	UGeometryDeduplicationManager* DeduplicationManager;
@@ -153,6 +173,7 @@ private:
 		const FString& MeshName,
 		const FString& PackagePath,
 		const FTransform& LocalTransform,
+		AFragment* FragmentActor,
 		AActor* ParentActor,
 		bool bSaveMeshes);
 
@@ -263,7 +284,8 @@ private:
 	TUniquePtr<FGeometryWorkerPool> GeometryWorkerPool;
 
 	/** Whether to use async geometry processing (can be disabled for debugging) */
-	bool bUseAsyncGeometryProcessing = true;
+	// TODO: Re-enable once async path is fully tested. Currently disabled due to FlatBuffer access issues.
+	bool bUseAsyncGeometryProcessing = false;
 
 	/** Frame budget for processing completed geometry (milliseconds) */
 	float GeometryProcessingBudgetMs = 4.0f;
