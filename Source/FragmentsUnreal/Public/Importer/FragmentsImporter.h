@@ -17,6 +17,9 @@ FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
 // Forward Declarations
 class UFragmentsAsyncLoader;
 class UFragmentTileManager;
+class FGeometryWorkerPool;
+struct FRawGeometryData;
+struct FGeometryWorkItem;
 
 // Use FlatBuffers Model type
 using Model = ::Model;
@@ -122,6 +125,40 @@ private:
 	UPROPERTY()
 	UFragmentsAsyncLoader* AsyncLoader;
 
+	// ==========================================
+	// ASYNC GEOMETRY PROCESSING (Phase 1)
+	// ==========================================
+
+	/** Initialize the geometry worker pool */
+	void InitializeWorkerPool();
+
+	/** Shutdown the geometry worker pool */
+	void ShutdownWorkerPool();
+
+	/** Process completed geometry work items within frame budget */
+	void ProcessCompletedGeometry();
+
+	/** Create a UStaticMesh from raw geometry data (game thread only) */
+	UStaticMesh* CreateMeshFromRawData(const FRawGeometryData& GeometryData, UObject* OuterRef);
+
+	/** Add material to mesh from raw data */
+	FName AddMaterialToMeshFromRawData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass);
+
+	/** Submit a Shell for async geometry processing */
+	void SubmitShellForAsyncProcessing(
+		const Shell* ShellRef,
+		const Material* MaterialRef,
+		const FFragmentItem& FragmentItem,
+		int32 SampleIndex,
+		const FString& MeshName,
+		const FString& PackagePath,
+		const FTransform& LocalTransform,
+		AActor* ParentActor,
+		bool bSaveMeshes);
+
+	/** Finalize a spawned fragment with completed mesh data */
+	void FinalizeFragmentWithMesh(const FRawGeometryData& GeometryData, UStaticMesh* Mesh);
+
 	// Chunked Spawning Functions
 	// Build flat queue of all fragments to spawn (recursive)
 	void BuildSpawnQueue(const FFragmentItem& Item, AActor* ParentActor, TArray<FFragmentSpawnTask>& OutQueue);
@@ -217,6 +254,44 @@ private:
 
 	// Fragments spawned thus far
 	int32 FragmentsSpawned = 0;
+
+	// ==========================================
+	// ASYNC GEOMETRY PROCESSING MEMBERS
+	// ==========================================
+
+	/** Geometry worker pool for parallel processing */
+	TUniquePtr<FGeometryWorkerPool> GeometryWorkerPool;
+
+	/** Whether to use async geometry processing (can be disabled for debugging) */
+	bool bUseAsyncGeometryProcessing = true;
+
+	/** Frame budget for processing completed geometry (milliseconds) */
+	float GeometryProcessingBudgetMs = 4.0f;
+
+	/** Map of pending fragments waiting for geometry completion */
+	struct FPendingFragmentData
+	{
+		TWeakObjectPtr<AFragment> FragmentActor;
+		TWeakObjectPtr<AActor> ParentActor;
+		FTransform LocalTransform;
+		int32 SampleIndex = -1;
+		bool bSaveMeshes = false;
+		FString PackagePath;
+		FString MeshName;
+	};
+
+	/** Map WorkItemId -> pending fragment data for async completion */
+	TMap<uint64, FPendingFragmentData> PendingFragmentMap;
+
+	/** Material pool for CRC-based deduplication */
+	UPROPERTY()
+	TMap<uint32, UMaterialInstanceDynamic*> MaterialPool;
+
+	/** Hash material properties for pooling */
+	uint32 HashMaterialProperties(uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass) const;
+
+	/** Get or create pooled material instance */
+	UMaterialInstanceDynamic* GetPooledMaterial(uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass);
 
 public:
 

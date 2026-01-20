@@ -23,6 +23,7 @@
 #include "Importer/FragmentsAsyncLoader.h"
 #include "Spatial/FragmentTileManager.h"
 #include "Utils/FragmentOcclusionClassifier.h"
+#include "Utils/FragmentGeometryWorker.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -1434,6 +1435,9 @@ void UFragmentsImporter::ProcessSpawnChunk()
 
 void UFragmentsImporter::ProcessAllTileManagerChunks()
 {
+	// First, process any completed async geometry work within frame budget
+	ProcessCompletedGeometry();
+
 	// Process spawn chunks for all tile managers (per-sample visibility only)
 	for (auto& Pair : TileManagers)
 	{
@@ -2353,4 +2357,390 @@ void UFragmentsImporter::SavePackagesWithProgress(const TArray<UPackage*>& InPac
 	// Runtime: do not save packages, just log
 	UE_LOG(LogFragments, Log, TEXT("Skipping package saving in runtime environment."));
 #endif
+}
+
+//////////////////////////////////////////////////////////////////////////
+// ASYNC GEOMETRY PROCESSING (Phase 1)
+//////////////////////////////////////////////////////////////////////////
+
+void UFragmentsImporter::InitializeWorkerPool()
+{
+	if (!GeometryWorkerPool.IsValid())
+	{
+		GeometryWorkerPool = MakeUnique<FGeometryWorkerPool>();
+		GeometryWorkerPool->Initialize();
+		UE_LOG(LogFragments, Log, TEXT("Geometry worker pool initialized"));
+	}
+}
+
+void UFragmentsImporter::ShutdownWorkerPool()
+{
+	if (GeometryWorkerPool.IsValid())
+	{
+		GeometryWorkerPool->Shutdown();
+		GeometryWorkerPool.Reset();
+		UE_LOG(LogFragments, Log, TEXT("Geometry worker pool shut down"));
+	}
+}
+
+void UFragmentsImporter::ProcessCompletedGeometry()
+{
+	if (!GeometryWorkerPool.IsValid() || !GeometryWorkerPool->HasCompletedWork())
+	{
+		return;
+	}
+
+	const double StartTime = FPlatformTime::Seconds();
+	const double BudgetSeconds = GeometryProcessingBudgetMs / 1000.0;
+	int32 ProcessedCount = 0;
+
+	FRawGeometryData GeometryData;
+	while (GeometryWorkerPool->DequeueCompletedWork(GeometryData))
+	{
+		if (!GeometryData.bSuccess)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("Async geometry processing failed for mesh %s: %s"),
+				*GeometryData.MeshName, *GeometryData.ErrorMessage);
+
+			// Remove from pending map
+			PendingFragmentMap.Remove(GeometryData.WorkItemId);
+			continue;
+		}
+
+		// Find the pending fragment data
+		FPendingFragmentData* PendingData = PendingFragmentMap.Find(GeometryData.WorkItemId);
+		if (!PendingData)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("No pending fragment found for work item %llu"), GeometryData.WorkItemId);
+			continue;
+		}
+
+		// Create the UStaticMesh from raw data (must be on game thread)
+		UPackage* MeshPackage = CreatePackage(*GeometryData.PackagePath);
+		UStaticMesh* Mesh = CreateMeshFromRawData(GeometryData, MeshPackage);
+
+		if (Mesh)
+		{
+			// Cache the mesh
+			const FString SamplePath = GeometryData.PackagePath + TEXT(".") + GeometryData.MeshName;
+			MeshCache.Add(SamplePath, Mesh);
+
+			// Finalize the fragment with the mesh
+			FinalizeFragmentWithMesh(GeometryData, Mesh);
+
+			// Handle package saving
+			if (PendingData->bSaveMeshes)
+			{
+#if WITH_EDITOR
+				FString PackageFileName = FPackageName::LongPackageNameToFilename(
+					FPackageName::ObjectPathToPackageName(GeometryData.PackagePath),
+					FPackageName::GetAssetPackageExtension());
+
+				if (!FPaths::FileExists(PackageFileName))
+				{
+					MeshPackage->FullyLoad();
+					Mesh->Rename(*GeometryData.MeshName, MeshPackage);
+					Mesh->SetFlags(RF_Public | RF_Standalone);
+					MeshPackage->MarkPackageDirty();
+					FAssetRegistryModule::AssetCreated(Mesh);
+					PackagesToSave.Add(MeshPackage);
+				}
+#endif
+			}
+
+			ProcessedCount++;
+		}
+
+		// Remove from pending map
+		PendingFragmentMap.Remove(GeometryData.WorkItemId);
+
+		// Check frame budget
+		if ((FPlatformTime::Seconds() - StartTime) > BudgetSeconds)
+		{
+			break;
+		}
+	}
+
+	if (ProcessedCount > 0)
+	{
+		UE_LOG(LogFragments, Verbose, TEXT("Processed %d completed geometry items in %.2fms"),
+			ProcessedCount, (FPlatformTime::Seconds() - StartTime) * 1000.0);
+	}
+}
+
+UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& GeometryData, UObject* OuterRef)
+{
+	if (GeometryData.Positions.Num() == 0 || GeometryData.Indices.Num() == 0)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateMeshFromRawData: No geometry data for %s"), *GeometryData.MeshName);
+		return nullptr;
+	}
+
+	// Create StaticMesh object
+	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*GeometryData.MeshName), RF_Public | RF_Standalone);
+	StaticMesh->InitResources();
+	StaticMesh->SetLightingGuid();
+
+	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(OuterRef);
+	FMeshDescription& MeshDescription = StaticMeshDescription->GetMeshDescription();
+	UStaticMesh::FBuildMeshDescriptionsParams MeshParams;
+
+	// Build Settings
+#if WITH_EDITOR
+	{
+		FStaticMeshSourceModel& SrcModel = StaticMesh->AddSourceModel();
+		SrcModel.BuildSettings.bRecomputeNormals = false; // We already computed normals
+		SrcModel.BuildSettings.bRecomputeTangents = true;
+		SrcModel.BuildSettings.bRemoveDegenerates = true;
+		SrcModel.BuildSettings.bUseHighPrecisionTangentBasis = false;
+		SrcModel.BuildSettings.bBuildReversedIndexBuffer = true;
+		SrcModel.BuildSettings.bUseFullPrecisionUVs = false;
+		SrcModel.BuildSettings.bGenerateLightmapUVs = true;
+		SrcModel.BuildSettings.SrcLightmapIndex = 0;
+		SrcModel.BuildSettings.DstLightmapIndex = 1;
+		SrcModel.BuildSettings.MinLightmapResolution = 64;
+	}
+#endif
+
+	MeshParams.bBuildSimpleCollision = true;
+	MeshParams.bCommitMeshDescription = true;
+	MeshParams.bMarkPackageDirty = true;
+	MeshParams.bUseHashAsGuid = false;
+#if !WITH_EDITOR
+	MeshParams.bFastBuild = true;
+#endif
+
+	// Create vertices
+	TArray<FVertexID> Vertices;
+	Vertices.Reserve(GeometryData.Positions.Num());
+
+	for (int32 i = 0; i < GeometryData.Positions.Num(); i++)
+	{
+		const FVertexID VertId = StaticMeshDescription->CreateVertex();
+		StaticMeshDescription->SetVertexPosition(VertId, FVector(GeometryData.Positions[i]));
+		Vertices.Add(VertId);
+	}
+
+	// Add material
+	FName MaterialSlotName = AddMaterialToMeshFromRawData(StaticMesh,
+		GeometryData.R, GeometryData.G, GeometryData.B, GeometryData.A, GeometryData.bIsGlass);
+	const FPolygonGroupID PolygonGroupId = StaticMeshDescription->CreatePolygonGroup();
+	StaticMeshDescription->SetPolygonGroupMaterialSlotName(PolygonGroupId, MaterialSlotName);
+
+	// Create triangles
+	for (int32 i = 0; i < GeometryData.Indices.Num(); i += 3)
+	{
+		uint32 I0 = GeometryData.Indices[i];
+		uint32 I1 = GeometryData.Indices[i + 1];
+		uint32 I2 = GeometryData.Indices[i + 2];
+
+		if (I0 < (uint32)Vertices.Num() && I1 < (uint32)Vertices.Num() && I2 < (uint32)Vertices.Num())
+		{
+			TArray<FVertexInstanceID> TriangleInstance;
+			TriangleInstance.Add(MeshDescription.CreateVertexInstance(Vertices[I0]));
+			TriangleInstance.Add(MeshDescription.CreateVertexInstance(Vertices[I1]));
+			TriangleInstance.Add(MeshDescription.CreateVertexInstance(Vertices[I2]));
+
+			// Set normals on vertex instances
+			if (i / 3 < GeometryData.Normals.Num())
+			{
+				TVertexInstanceAttributesRef<FVector3f> VertexInstanceNormals =
+					MeshDescription.VertexInstanceAttributes().GetAttributesRef<FVector3f>(MeshAttribute::VertexInstance::Normal);
+
+				if (I0 < (uint32)GeometryData.Normals.Num())
+					VertexInstanceNormals[TriangleInstance[0]] = GeometryData.Normals[I0];
+				if (I1 < (uint32)GeometryData.Normals.Num())
+					VertexInstanceNormals[TriangleInstance[1]] = GeometryData.Normals[I1];
+				if (I2 < (uint32)GeometryData.Normals.Num())
+					VertexInstanceNormals[TriangleInstance[2]] = GeometryData.Normals[I2];
+			}
+
+			MeshDescription.CreatePolygon(PolygonGroupId, TriangleInstance);
+		}
+	}
+
+	// Compute tangents (normals already provided)
+	FStaticMeshOperations::ComputeTangentsAndNormals(MeshDescription, EComputeNTBsFlags::Tangents);
+
+	StaticMesh->BuildFromMeshDescriptions(TArray<const FMeshDescription*>{&MeshDescription}, MeshParams);
+
+	return StaticMesh;
+}
+
+FName UFragmentsImporter::AddMaterialToMeshFromRawData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass)
+{
+	if (!CreatedMesh) return FName();
+
+	// Use pooled material
+	UMaterialInstanceDynamic* DynamicMaterial = GetPooledMaterial(R, G, B, A, bIsGlass);
+	if (!DynamicMaterial)
+	{
+		UE_LOG(LogFragments, Error, TEXT("Failed to get pooled material"));
+		return FName();
+	}
+
+	return CreatedMesh->AddMaterial(DynamicMaterial);
+}
+
+uint32 UFragmentsImporter::HashMaterialProperties(uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass) const
+{
+	uint32 Hash = 0;
+	Hash = HashCombine(Hash, GetTypeHash(R));
+	Hash = HashCombine(Hash, GetTypeHash(G));
+	Hash = HashCombine(Hash, GetTypeHash(B));
+	Hash = HashCombine(Hash, GetTypeHash(A));
+	Hash = HashCombine(Hash, GetTypeHash(bIsGlass));
+	return Hash;
+}
+
+UMaterialInstanceDynamic* UFragmentsImporter::GetPooledMaterial(uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass)
+{
+	uint32 Hash = HashMaterialProperties(R, G, B, A, bIsGlass);
+
+	if (UMaterialInstanceDynamic** Found = MaterialPool.Find(Hash))
+	{
+		return *Found;
+	}
+
+	// Create new material instance
+	UMaterialInterface* BaseMat = bIsGlass ? BaseGlassMaterial : BaseMaterial;
+	if (!BaseMat)
+	{
+		// Load materials if not already loaded
+		BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
+		BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
+		BaseMat = bIsGlass ? BaseGlassMaterial : BaseMaterial;
+	}
+
+	if (!BaseMat)
+	{
+		UE_LOG(LogFragments, Error, TEXT("Failed to load base material for pooling"));
+		return nullptr;
+	}
+
+	UMaterialInstanceDynamic* NewMat = UMaterialInstanceDynamic::Create(BaseMat, this);
+	if (!NewMat)
+	{
+		return nullptr;
+	}
+
+	float Rf = R / 255.f;
+	float Gf = G / 255.f;
+	float Bf = B / 255.f;
+	float Af = A / 255.f;
+
+	if (Af < 1.0f)
+	{
+		NewMat->SetScalarParameterValue(TEXT("Opacity"), Af);
+	}
+	NewMat->SetVectorParameterValue(TEXT("BaseColor"), FVector4(Rf, Gf, Bf, Af));
+
+	MaterialPool.Add(Hash, NewMat);
+	return NewMat;
+}
+
+void UFragmentsImporter::SubmitShellForAsyncProcessing(
+	const Shell* ShellRef,
+	const Material* MaterialRef,
+	const FFragmentItem& FragmentItem,
+	int32 SampleIndex,
+	const FString& MeshName,
+	const FString& PackagePath,
+	const FTransform& LocalTransform,
+	AActor* ParentActor,
+	bool bSaveMeshes)
+{
+	if (!GeometryWorkerPool.IsValid())
+	{
+		InitializeWorkerPool();
+	}
+
+	// Generate unique work item ID
+	uint64 WorkItemId = GeometryWorkerPool->GenerateWorkItemId();
+
+	// Extract work item from FlatBuffers (copies data for thread safety)
+	FGeometryWorkItem WorkItem = FGeometryDataExtractor::ExtractShellWorkItem(
+		ShellRef,
+		MaterialRef,
+		FragmentItem,
+		SampleIndex,
+		MeshName,
+		PackagePath,
+		LocalTransform,
+		ParentActor,
+		bSaveMeshes,
+		WorkItemId
+	);
+
+	// Store pending fragment data for later completion
+	FPendingFragmentData PendingData;
+	PendingData.ParentActor = ParentActor;
+	PendingData.LocalTransform = LocalTransform;
+	PendingData.SampleIndex = SampleIndex;
+	PendingData.bSaveMeshes = bSaveMeshes;
+	PendingData.PackagePath = PackagePath;
+	PendingData.MeshName = MeshName;
+	// Note: FragmentActor will be set when we spawn the actor
+
+	PendingFragmentMap.Add(WorkItemId, MoveTemp(PendingData));
+
+	// Submit work to pool
+	GeometryWorkerPool->SubmitWork(MoveTemp(WorkItem));
+}
+
+void UFragmentsImporter::FinalizeFragmentWithMesh(const FRawGeometryData& GeometryData, UStaticMesh* Mesh)
+{
+	FPendingFragmentData* PendingData = PendingFragmentMap.Find(GeometryData.WorkItemId);
+	if (!PendingData)
+	{
+		return;
+	}
+
+	AFragment* FragmentActor = PendingData->FragmentActor.Get();
+	if (!FragmentActor)
+	{
+		// Fragment actor doesn't exist yet or was destroyed
+		// This shouldn't happen in normal flow
+		UE_LOG(LogFragments, Warning, TEXT("FinalizeFragmentWithMesh: Fragment actor not found for mesh %s"), *GeometryData.MeshName);
+		return;
+	}
+
+	// Add the mesh component to the fragment
+	UStaticMeshComponent* MeshComp = NewObject<UStaticMeshComponent>(FragmentActor);
+	MeshComp->SetStaticMesh(Mesh);
+	MeshComp->SetRelativeTransform(PendingData->LocalTransform);
+
+	USceneComponent* RootComp = FragmentActor->GetRootComponent();
+	if (RootComp)
+	{
+		MeshComp->AttachToComponent(RootComp, FAttachmentTransformRules::KeepRelativeTransform);
+	}
+
+	// Disable Lumen/Distance Field features for fast loading
+	MeshComp->bAffectDistanceFieldLighting = false;
+	MeshComp->bAffectDynamicIndirectLighting = false;
+	MeshComp->bAffectIndirectLightingWhileHidden = false;
+
+	MeshComp->RegisterComponent();
+	FragmentActor->AddInstanceComponent(MeshComp);
+
+	// Configure occlusion culling
+	const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
+		GeometryData.Category, GeometryData.A);
+
+	switch (Role)
+	{
+	case EOcclusionRole::Occluder:
+		MeshComp->bUseAsOccluder = true;
+		MeshComp->SetCastShadow(true);
+		break;
+	case EOcclusionRole::Occludee:
+		MeshComp->bUseAsOccluder = false;
+		MeshComp->SetCastShadow(true);
+		break;
+	case EOcclusionRole::NonOccluder:
+		MeshComp->bUseAsOccluder = false;
+		MeshComp->SetCastShadow(false);
+		break;
+	}
 }
