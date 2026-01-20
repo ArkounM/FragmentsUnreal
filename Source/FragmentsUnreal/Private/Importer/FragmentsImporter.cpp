@@ -1573,6 +1573,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 		SrcModel.BuildSettings.SrcLightmapIndex = 0;
 		SrcModel.BuildSettings.DstLightmapIndex = 1;
 		SrcModel.BuildSettings.MinLightmapResolution = 64;
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f; // Disable distance field generation for runtime meshes
 	}
 #endif
 
@@ -1755,6 +1756,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromCircleExtrusion(const Circl
 		SrcModel.BuildSettings.SrcLightmapIndex = 0;
 		SrcModel.BuildSettings.DstLightmapIndex = 1;
 		SrcModel.BuildSettings.MinLightmapResolution = 64;
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f; // Disable distance field generation for runtime meshes
 	}
 #endif
 
@@ -2557,6 +2559,7 @@ UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& G
 		SrcModel.BuildSettings.SrcLightmapIndex = 0;
 		SrcModel.BuildSettings.DstLightmapIndex = 1;
 		SrcModel.BuildSettings.MinLightmapResolution = 64;
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f; // Disable distance field generation for runtime meshes
 	}
 #endif
 
@@ -2862,6 +2865,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromPreExtractedShell(
 		SrcModel.BuildSettings.SrcLightmapIndex = 0;
 		SrcModel.BuildSettings.DstLightmapIndex = 1;
 		SrcModel.BuildSettings.MinLightmapResolution = 64;
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f; // Disable distance field generation for runtime meshes
 	}
 #endif
 
