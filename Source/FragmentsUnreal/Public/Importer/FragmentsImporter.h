@@ -99,6 +99,19 @@ public:
 	UPROPERTY()
 	UGeometryDeduplicationManager* DeduplicationManager;
 
+	// ==========================================
+	// EAGER GEOMETRY EXTRACTION (Public for AsyncLoader access)
+	// ==========================================
+
+	/**
+	 * Pre-extract all geometry data from FlatBuffers at load time.
+	 * Populates FFragmentSample::ExtractedGeometry for all samples in the hierarchy.
+	 * This eliminates FlatBuffer dependencies during the spawn phase.
+	 *
+	 * @param RootItem The root fragment item to process (recursively processes children)
+	 * @param MeshesRef The FlatBuffers meshes reference
+	 */
+	void PreExtractAllGeometry(FFragmentItem& RootItem, const Meshes* MeshesRef);
 
 protected:
 	// Call when Async Loading Completes
@@ -212,6 +225,31 @@ private:
 		TArray<FVector2D>& OutUVs
 	);
 
+	/**
+	 * Extract geometry data for a single sample from FlatBuffers.
+	 * Populates the ExtractedGeometry field with validated, copied data.
+	 *
+	 * @param Sample The sample to extract geometry for (modified in place)
+	 * @param MeshesRef The FlatBuffers meshes reference
+	 * @param ItemLocalId The local ID of the containing fragment (for logging)
+	 * @return true if geometry was extracted successfully, false otherwise
+	 */
+	bool ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId);
+
+	/**
+	 * Create a static mesh from pre-extracted shell geometry.
+	 * This uses data from FPreExtractedGeometry and never accesses FlatBuffers.
+	 *
+	 * @param Geometry The pre-extracted geometry data
+	 * @param AssetName Name for the created mesh asset
+	 * @param OuterRef Package/outer for the mesh
+	 * @return Created UStaticMesh or nullptr on failure
+	 */
+	UStaticMesh* CreateStaticMeshFromPreExtractedShell(
+		const FPreExtractedGeometry& Geometry,
+		const FString& AssetName,
+		UObject* OuterRef);
+
 private:
 
 	UPROPERTY()
@@ -284,7 +322,8 @@ private:
 	TUniquePtr<FGeometryWorkerPool> GeometryWorkerPool;
 
 	/** Whether to use async geometry processing (can be disabled for debugging) */
-	// TODO: Re-enable once async path is fully tested. Currently disabled due to FlatBuffer access issues.
+	// DISABLED: TileManager path has invalid FlatBuffer data when accessing Shell profiles
+	// The sync path works correctly. Need to investigate why TileManager's MeshesRef differs.
 	bool bUseAsyncGeometryProcessing = false;
 
 	/** Frame budget for processing completed geometry (milliseconds) */

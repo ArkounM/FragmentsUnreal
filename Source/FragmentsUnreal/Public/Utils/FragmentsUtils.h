@@ -103,6 +103,50 @@ struct FTriangulationResult
 	TArray<int32> TriangleIndices;
 };
 
+/**
+ * Pre-extracted geometry data for a fragment sample.
+ * Contains all geometry data extracted from FlatBuffers at load time,
+ * eliminating the need for FlatBuffer access during spawn phase.
+ * This solves the crash issue where FlatBuffer pointers become invalid
+ * when accessed via the async/TileManager path.
+ *
+ * Note: This is a plain C++ struct (not USTRUCT) because Unreal's reflection
+ * system doesn't support nested TArrays. This is runtime-only data that
+ * doesn't need serialization.
+ */
+struct FPreExtractedGeometry
+{
+	// Vertex data (already converted to Unreal coordinates: Z-up, cm units)
+	TArray<FVector> Vertices;
+
+	// Profile indices - each profile's vertex indices into the Vertices array
+	TArray<TArray<int32>> ProfileIndices;
+
+	// Holes per profile - ProfileHoles[i] contains holes for profile i
+	TArray<TArray<TArray<int32>>> ProfileHoles;
+
+	// Local transform for this sample
+	FTransform LocalTransform;
+
+	// Material data
+	uint8 R = 255;
+	uint8 G = 255;
+	uint8 B = 255;
+	uint8 A = 255;
+	bool bIsGlass = false;
+
+	// Geometry type
+	bool bIsShell = true;  // true = Shell, false = CircleExtrusion
+
+	// Validation flag - if false, geometry should be skipped during spawn
+	bool bIsValid = false;
+
+	// Representation ID (for debugging/logging)
+	int32 RepresentationId = -1;
+
+	FPreExtractedGeometry() = default;
+};
+
 USTRUCT(BlueprintType)
 struct FFragmentLookup
 {
@@ -119,6 +163,7 @@ struct FFragmentSample
 {
 	GENERATED_BODY()
 
+	// Original indices (kept for debugging and backward compatibility)
 	UPROPERTY()
 	int32 SampleIndex = -1;
 	UPROPERTY()
@@ -127,6 +172,11 @@ struct FFragmentSample
 	int32 RepresentationIndex = -1;
 	UPROPERTY()
 	int32 MaterialIndex = -1;
+
+	// Pre-extracted geometry data (populated at load time)
+	// This eliminates FlatBuffer access during spawn phase
+	// Note: Not UPROPERTY because FPreExtractedGeometry contains nested TArrays
+	FPreExtractedGeometry ExtractedGeometry;
 };
 
 

@@ -401,6 +401,11 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 			}
 
 		}
+
+		// Pre-extract all geometry data from FlatBuffers at load time
+		// This eliminates FlatBuffer access during spawn phase and prevents crashes
+		// when FlatBuffer pointers become invalid in the async/TileManager path
+		PreExtractAllGeometry(Wrapper->GetModelItemRef(), _meshes);
 	}
 	ModelFragmentsMap.Add(ModelGuidStr, FFragmentLookup());
 
@@ -1182,6 +1187,15 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 		for (int32 i = 0; i < Samples.Num(); i++)
 		{
 			const FFragmentSample& Sample = Samples[i];
+			const FPreExtractedGeometry& ExtractedGeom = Sample.ExtractedGeometry;
+
+			// Skip samples with invalid pre-extracted geometry
+			if (!ExtractedGeom.bIsValid)
+			{
+				UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Skipping sample %d with invalid geometry (LocalId: %d)"),
+					i, FragmentModel->GetLocalId());
+				continue;
+			}
 
 			FString MeshName = FString::Printf(TEXT("%d_%d"), FragmentModel->GetLocalId(), i);
 			FString PackagePath = TEXT("/Game/Buildings") / FragmentModel->GetModelGuid() / MeshName;
@@ -1190,11 +1204,8 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 			FString UniquePackageName = FPackageName::ObjectPathToPackageName(PackagePath);
 			FString PackageFileName = FPackageName::LongPackageNameToFilename(UniquePackageName, FPackageName::GetAssetPackageExtension());
 
-			const Material* material = MeshesRef->materials()->Get(Sample.MaterialIndex);
-			const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
-			const Transform* local_transform = MeshesRef->local_transforms()->Get(Sample.LocalTransformIndex);
-
-			FTransform LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
+			// Use pre-extracted local transform instead of FlatBuffer access
+			FTransform LocalTransform = ExtractedGeom.LocalTransform;
 
 			UStaticMesh* Mesh = nullptr;
 
@@ -1212,128 +1223,58 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					Mesh = FindObject<UStaticMesh>(ExistingPackage, *MeshName);
 				}
 			}
-			// Create new mesh using async or sync path
+			// Create new mesh from pre-extracted geometry (NO FLATBUFFER ACCESS)
 			else
 			{
-				// ASYNC PATH: Submit Shell geometry to worker threads
-				// (CircleExtrusion still uses sync path - async not implemented)
-				if (bUseAsyncGeometryProcessing &&
-					representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+				UPackage* MeshPackage = CreatePackage(*PackagePath);
+
+				if (ExtractedGeom.bIsShell)
 				{
-					const auto* shell = MeshesRef->shells()->Get(representation->id());
-					SubmitShellForAsyncProcessing(
-						shell,
-						material,
-						Item,
-						i,  // SampleIndex
-						MeshName,
-						PackagePath,
-						LocalTransform,
-						FragmentModel,
-						ParentActor,
-						bSaveMeshes
-					);
-					// Skip to next sample - mesh will be attached asynchronously
-					// via ProcessCompletedGeometry() -> FinalizeFragmentWithMesh()
-					continue;
-				}
-
-				// SYNC PATH: Extract geometry and use deduplication
-				TArray<FVector> Vertices;
-				TArray<int32> Triangles;
-				TArray<FVector> Normals;
-				TArray<FVector2D> UVs;
-
-				if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
-				{
-					const auto* shell = MeshesRef->shells()->Get(representation->id());
-					ExtractShellGeometry(shell, Vertices, Triangles, Normals, UVs);
-				}
-				else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
-				{
-					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-					ExtractCircleExtrusionGeometry(circleExtrusion, Vertices, Triangles, Normals, UVs);
-				}
-
-				if (Vertices.Num() > 0 && Triangles.Num() > 0)
-				{
-					// Use deduplication manager
-					UPackage* MeshPackage = CreatePackage(*PackagePath);
-
-					FGeometryTemplate* Template = DeduplicationManager->GetOrCreateTemplate(
-						Vertices,
-						Triangles,
-						Normals,
-						UVs,
-						Sample.MaterialIndex,
-						*MeshName,
-						MeshPackage
-					);
-
-					if (Template)
-					{
-						// Check if this is a newly created template (ReferenceCount will be 0)
-						bool bIsNewTemplate = (Template->ReferenceCount == 0);
-
-						// Add this instance to the template
-						DeduplicationManager->AddInstance(
-							Template->GeometryHash,
-							LocalTransform,
-							FragmentModel->GetLocalId(),
-							Sample.MaterialIndex
-						);
-
-						Mesh = Template->SharedMesh;
-
-						// Apply material to newly created mesh
-						if (bIsNewTemplate && Mesh)
-						{
-							AddMaterialToMesh(Mesh, material);
-						}
-
-						// Only save the package if this is a newly created mesh
-						if (bIsNewTemplate && Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
-						{
-#if WITH_EDITOR
-							MeshPackage->FullyLoad();
-							Mesh->Rename(*MeshName, MeshPackage);
-							Mesh->SetFlags(RF_Public | RF_Standalone);
-							MeshPackage->MarkPackageDirty();
-							FAssetRegistryModule::AssetCreated(Mesh);
-							PackagesToSave.Add(MeshPackage);
-#endif
-						}
-
-						UE_LOG(LogTemp, Verbose, TEXT("Using deduplicated mesh (hash: %llu, instances: %d, new: %d)"),
-							Template->GeometryHash, Template->ReferenceCount, bIsNewTemplate ? 1 : 0);
-					}
+					// Shell geometry: use pre-extracted data directly
+					Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
 				}
 				else
 				{
-					// Fallback to old method if extraction failed
-					UPackage* MeshPackage = CreatePackage(*PackagePath);
-					if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+					// CircleExtrusion: still use FlatBuffer path (not pre-extracted)
+					// This is acceptable because CircleExtrusion works correctly with FlatBuffer access
+					if (MeshesRef && MeshesRef->representations() && MeshesRef->circle_extrusions())
 					{
-						const auto* shell = MeshesRef->shells()->Get(representation->id());
-						Mesh = CreateStaticMeshFromShell(shell, material, *MeshName, MeshPackage);
-					}
-					else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
-					{
-						const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-						Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
-					}
+						const uint32 RepCount = MeshesRef->representations()->size();
+						if (static_cast<uint32>(Sample.RepresentationIndex) < RepCount)
+						{
+							const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
+							if (representation && representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
+							{
+								const uint32 ExtrusionId = representation->id();
+								if (ExtrusionId < MeshesRef->circle_extrusions()->size())
+								{
+									const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(ExtrusionId);
 
-					if (Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
-					{
-#if WITH_EDITOR
-						MeshPackage->FullyLoad();
-						Mesh->Rename(*MeshName, MeshPackage);
-						Mesh->SetFlags(RF_Public | RF_Standalone);
-						MeshPackage->MarkPackageDirty();
-						FAssetRegistryModule::AssetCreated(Mesh);
-						PackagesToSave.Add(MeshPackage);
-#endif
+									// Get material from FlatBuffer for CircleExtrusion (still needed)
+									const Material* material = nullptr;
+									if (MeshesRef->materials() && static_cast<uint32>(Sample.MaterialIndex) < MeshesRef->materials()->size())
+									{
+										material = MeshesRef->materials()->Get(Sample.MaterialIndex);
+									}
+
+									Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+								}
+							}
+						}
 					}
+				}
+
+				// Save mesh if needed
+				if (Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
+				{
+#if WITH_EDITOR
+					MeshPackage->FullyLoad();
+					Mesh->Rename(*MeshName, MeshPackage);
+					Mesh->SetFlags(RF_Public | RF_Standalone);
+					MeshPackage->MarkPackageDirty();
+					FAssetRegistryModule::AssetCreated(Mesh);
+					PackagesToSave.Add(MeshPackage);
+#endif
 				}
 
 				if (Mesh)
@@ -1360,9 +1301,9 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 				FragmentModel->AddInstanceComponent(MeshComp);
 
 				// Configure occlusion culling based on fragment classification
-				const uint8 MaterialAlpha = material ? material->a() : 255;
+				// Use pre-extracted material alpha instead of FlatBuffer access
 				const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
-					Item.Category, MaterialAlpha);
+					Item.Category, ExtractedGeom.A);
 
 				switch (Role)
 				{
@@ -2456,8 +2397,23 @@ void UFragmentsImporter::ProcessCompletedGeometry()
 			continue;
 		}
 
+		// Validate package path
+		if (GeometryData.PackagePath.IsEmpty())
+		{
+			UE_LOG(LogFragments, Error, TEXT("ProcessCompletedGeometry: Empty package path for mesh %s"), *GeometryData.MeshName);
+			PendingFragmentMap.Remove(GeometryData.WorkItemId);
+			continue;
+		}
+
 		// Create the UStaticMesh from raw data (must be on game thread)
 		UPackage* MeshPackage = CreatePackage(*GeometryData.PackagePath);
+		if (!MeshPackage)
+		{
+			UE_LOG(LogFragments, Error, TEXT("ProcessCompletedGeometry: Failed to create package %s"), *GeometryData.PackagePath);
+			PendingFragmentMap.Remove(GeometryData.WorkItemId);
+			continue;
+		}
+
 		UStaticMesh* Mesh = CreateMeshFromRawData(GeometryData, MeshPackage);
 
 		if (Mesh)
@@ -2511,18 +2467,43 @@ void UFragmentsImporter::ProcessCompletedGeometry()
 
 UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& GeometryData, UObject* OuterRef)
 {
+	// Must be called from game thread
+	check(IsInGameThread());
+
 	if (GeometryData.Positions.Num() == 0 || GeometryData.Indices.Num() == 0)
 	{
 		UE_LOG(LogFragments, Warning, TEXT("CreateMeshFromRawData: No geometry data for %s"), *GeometryData.MeshName);
 		return nullptr;
 	}
 
+	if (!OuterRef)
+	{
+		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromRawData: OuterRef is null for %s"), *GeometryData.MeshName);
+		return nullptr;
+	}
+
+	// Log geometry stats for debugging
+	UE_LOG(LogFragments, Verbose, TEXT("CreateMeshFromRawData: %s - %d verts, %d indices"),
+		*GeometryData.MeshName, GeometryData.Positions.Num(), GeometryData.Indices.Num());
+
 	// Create StaticMesh object
 	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*GeometryData.MeshName), RF_Public | RF_Standalone);
+	if (!StaticMesh)
+	{
+		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromRawData: Failed to create StaticMesh for %s"), *GeometryData.MeshName);
+		return nullptr;
+	}
+
 	StaticMesh->InitResources();
 	StaticMesh->SetLightingGuid();
 
-	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(OuterRef);
+	// Use GetTransientPackage() for mesh description to avoid package-related crashes
+	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(GetTransientPackage());
+	if (!StaticMeshDescription)
+	{
+		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromRawData: Failed to create StaticMeshDescription for %s"), *GeometryData.MeshName);
+		return nullptr;
+	}
 	FMeshDescription& MeshDescription = StaticMeshDescription->GetMeshDescription();
 	UStaticMesh::FBuildMeshDescriptionsParams MeshParams;
 
@@ -2796,4 +2777,553 @@ void UFragmentsImporter::FinalizeFragmentWithMesh(const FRawGeometryData& Geomet
 		MeshComp->SetCastShadow(false);
 		break;
 	}
+}
+
+//////////////////////////////////////////////////////////////////////////
+// EAGER GEOMETRY EXTRACTION
+// Extracts all geometry data from FlatBuffers at load time to eliminate
+// FlatBuffer access during spawn phase. This prevents crashes when
+// FlatBuffer pointers become invalid in the async/TileManager path.
+//////////////////////////////////////////////////////////////////////////
+
+UStaticMesh* UFragmentsImporter::CreateStaticMeshFromPreExtractedShell(
+	const FPreExtractedGeometry& Geometry,
+	const FString& AssetName,
+	UObject* OuterRef)
+{
+	if (!Geometry.bIsValid || !Geometry.bIsShell)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateStaticMeshFromPreExtractedShell: Invalid geometry for %s"), *AssetName);
+		return nullptr;
+	}
+
+	if (Geometry.Vertices.Num() == 0)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateStaticMeshFromPreExtractedShell: No vertices for %s"), *AssetName);
+		return nullptr;
+	}
+
+	// Create StaticMesh object
+	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*AssetName), RF_Public | RF_Standalone);
+	StaticMesh->InitResources();
+	StaticMesh->SetLightingGuid();
+
+	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(OuterRef);
+	FMeshDescription& MeshDescription = StaticMeshDescription->GetMeshDescription();
+	UStaticMesh::FBuildMeshDescriptionsParams MeshParams;
+
+	// Build Settings
+#if WITH_EDITOR
+	{
+		FStaticMeshSourceModel& SrcModel = StaticMesh->AddSourceModel();
+		SrcModel.BuildSettings.bRecomputeNormals = true;
+		SrcModel.BuildSettings.bRecomputeTangents = true;
+		SrcModel.BuildSettings.bRemoveDegenerates = true;
+		SrcModel.BuildSettings.bUseHighPrecisionTangentBasis = false;
+		SrcModel.BuildSettings.bBuildReversedIndexBuffer = true;
+		SrcModel.BuildSettings.bUseFullPrecisionUVs = false;
+		SrcModel.BuildSettings.bGenerateLightmapUVs = true;
+		SrcModel.BuildSettings.SrcLightmapIndex = 0;
+		SrcModel.BuildSettings.DstLightmapIndex = 1;
+		SrcModel.BuildSettings.MinLightmapResolution = 64;
+	}
+#endif
+
+	MeshParams.bBuildSimpleCollision = true;
+	MeshParams.bCommitMeshDescription = true;
+	MeshParams.bMarkPackageDirty = true;
+	MeshParams.bUseHashAsGuid = false;
+#if !WITH_EDITOR
+	MeshParams.bFastBuild = true;
+#endif
+
+	// Create vertices from pre-extracted data
+	TArray<FVertexID> Vertices;
+	Vertices.Reserve(Geometry.Vertices.Num());
+
+	for (int32 i = 0; i < Geometry.Vertices.Num(); i++)
+	{
+		const FVertexID VertId = StaticMeshDescription->CreateVertex();
+		StaticMeshDescription->SetVertexPosition(VertId, Geometry.Vertices[i]);
+		Vertices.Add(VertId);
+	}
+
+	// Add material using pre-extracted color data
+	FName MaterialSlotName = AddMaterialToMeshFromRawData(
+		StaticMesh,
+		Geometry.R, Geometry.G, Geometry.B, Geometry.A,
+		Geometry.bIsGlass);
+	const FPolygonGroupID PolygonGroupId = StaticMeshDescription->CreatePolygonGroup();
+	StaticMeshDescription->SetPolygonGroupMaterialSlotName(PolygonGroupId, MaterialSlotName);
+
+	// Build hole map
+	TMap<int32, TArray<TArray<int32>>> ProfileHolesMap;
+	for (int32 ProfileIdx = 0; ProfileIdx < Geometry.ProfileHoles.Num(); ProfileIdx++)
+	{
+		if (Geometry.ProfileHoles[ProfileIdx].Num() > 0)
+		{
+			ProfileHolesMap.Add(ProfileIdx, Geometry.ProfileHoles[ProfileIdx]);
+		}
+	}
+
+	// Process profiles
+	bool bHasValidPolygons = false;
+	for (int32 ProfileIdx = 0; ProfileIdx < Geometry.ProfileIndices.Num(); ProfileIdx++)
+	{
+		const TArray<int32>& ProfileVertexIndices = Geometry.ProfileIndices[ProfileIdx];
+
+		if (ProfileVertexIndices.Num() < 3)
+		{
+			continue;
+		}
+
+		bool bHasHoles = ProfileHolesMap.Contains(ProfileIdx);
+
+		if (!bHasHoles)
+		{
+			// Simple polygon - direct creation
+			TArray<FVertexInstanceID> TriangleInstance;
+			TriangleInstance.Reserve(ProfileVertexIndices.Num());
+
+			for (int32 Idx : ProfileVertexIndices)
+			{
+				if (Vertices.IsValidIndex(Idx))
+				{
+					TriangleInstance.Add(MeshDescription.CreateVertexInstance(Vertices[Idx]));
+				}
+			}
+
+			if (TriangleInstance.Num() >= 3)
+			{
+				MeshDescription.CreatePolygon(PolygonGroupId, TriangleInstance, {});
+				bHasValidPolygons = true;
+			}
+		}
+		else
+		{
+			// Polygon with holes - tessellate
+			TArray<FVector> OutVertices;
+			TArray<int32> OutIndices;
+
+			if (TriangulatePolygonWithHoles(
+				Geometry.Vertices,
+				ProfileVertexIndices,
+				ProfileHolesMap[ProfileIdx],
+				OutVertices,
+				OutIndices))
+			{
+				// Create new vertices for tessellated geometry
+				TMap<int32, FVertexID> TempVertexMap;
+				for (int32 j = 0; j < OutVertices.Num(); j++)
+				{
+					FVertexID VId = StaticMeshDescription->CreateVertex();
+					StaticMeshDescription->SetVertexPosition(VId, OutVertices[j]);
+					TempVertexMap.Add(j, VId);
+				}
+
+				// Create triangles
+				for (int32 j = 0; j < OutIndices.Num(); j += 3)
+				{
+					if (j + 2 < OutIndices.Num())
+					{
+						TArray<FVertexInstanceID> Triangle;
+						Triangle.Add(MeshDescription.CreateVertexInstance(TempVertexMap[OutIndices[j]]));
+						Triangle.Add(MeshDescription.CreateVertexInstance(TempVertexMap[OutIndices[j + 1]]));
+						Triangle.Add(MeshDescription.CreateVertexInstance(TempVertexMap[OutIndices[j + 2]]));
+
+						MeshDescription.CreatePolygon(PolygonGroupId, Triangle);
+						bHasValidPolygons = true;
+					}
+				}
+			}
+			else
+			{
+				UE_LOG(LogFragments, Warning, TEXT("Tessellation failed for profile %d in mesh %s"), ProfileIdx, *AssetName);
+			}
+		}
+	}
+
+	if (!bHasValidPolygons)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateStaticMeshFromPreExtractedShell: No valid polygons for %s"), *AssetName);
+		return nullptr;
+	}
+
+	FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MeshDescription);
+	FStaticMeshOperations::ComputeTangentsAndNormals(MeshDescription, EComputeNTBsFlags::Normals | EComputeNTBsFlags::Tangents);
+
+	StaticMesh->BuildFromMeshDescriptions(TArray<const FMeshDescription*>{&MeshDescription}, MeshParams);
+
+	return StaticMesh;
+}
+
+void UFragmentsImporter::PreExtractAllGeometry(FFragmentItem& RootItem, const Meshes* MeshesRef)
+{
+	if (!MeshesRef)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("PreExtractAllGeometry: MeshesRef is null, skipping extraction"));
+		return;
+	}
+
+	// Statistics for logging
+	int32 TotalSamples = 0;
+	int32 SuccessfulExtractions = 0;
+	int32 FailedExtractions = 0;
+
+	// Use a stack-based approach to avoid deep recursion
+	TArray<FFragmentItem*> ItemStack;
+	ItemStack.Add(&RootItem);
+
+	while (ItemStack.Num() > 0)
+	{
+		FFragmentItem* CurrentItem = ItemStack.Pop();
+		if (!CurrentItem)
+		{
+			continue;
+		}
+
+		// Process all samples in this item
+		for (FFragmentSample& Sample : CurrentItem->Samples)
+		{
+			TotalSamples++;
+
+			if (ExtractSampleGeometry(Sample, MeshesRef, CurrentItem->LocalId))
+			{
+				SuccessfulExtractions++;
+			}
+			else
+			{
+				FailedExtractions++;
+			}
+		}
+
+		// Add children to the stack for processing
+		for (FFragmentItem* Child : CurrentItem->FragmentChildren)
+		{
+			if (Child)
+			{
+				ItemStack.Add(Child);
+			}
+		}
+	}
+
+	// Calculate approximate memory usage for extracted geometry
+	int64 TotalVertexBytes = 0;
+	int64 TotalProfileBytes = 0;
+	int64 TotalHoleBytes = 0;
+
+	// Re-traverse to calculate memory
+	ItemStack.Add(&RootItem);
+	while (ItemStack.Num() > 0)
+	{
+		FFragmentItem* CurrentItem = ItemStack.Pop();
+		if (!CurrentItem) continue;
+
+		for (const FFragmentSample& Sample : CurrentItem->Samples)
+		{
+			const FPreExtractedGeometry& Geom = Sample.ExtractedGeometry;
+			if (Geom.bIsValid && Geom.bIsShell)
+			{
+				// Vertices: TArray overhead (24 bytes) + sizeof(FVector) * count
+				TotalVertexBytes += 24 + (sizeof(FVector) * Geom.Vertices.Num());
+
+				// Profile indices: TArray overhead + nested array overhead + actual indices
+				TotalProfileBytes += 24;  // Outer array
+				for (const TArray<int32>& Profile : Geom.ProfileIndices)
+				{
+					TotalProfileBytes += 24 + (sizeof(int32) * Profile.Num());
+				}
+
+				// Holes: triple-nested arrays
+				TotalHoleBytes += 24;  // Outer array
+				for (const TArray<TArray<int32>>& HolesForProfile : Geom.ProfileHoles)
+				{
+					TotalHoleBytes += 24;
+					for (const TArray<int32>& Hole : HolesForProfile)
+					{
+						TotalHoleBytes += 24 + (sizeof(int32) * Hole.Num());
+					}
+				}
+			}
+		}
+
+		for (FFragmentItem* Child : CurrentItem->FragmentChildren)
+		{
+			if (Child) ItemStack.Add(Child);
+		}
+	}
+
+	int64 TotalBytes = TotalVertexBytes + TotalProfileBytes + TotalHoleBytes;
+	float TotalMB = TotalBytes / (1024.0f * 1024.0f);
+
+	UE_LOG(LogFragments, Log, TEXT("=== GEOMETRY PRE-EXTRACTION COMPLETE ==="));
+	UE_LOG(LogFragments, Log, TEXT("Total samples: %d"), TotalSamples);
+	UE_LOG(LogFragments, Log, TEXT("Successful extractions: %d"), SuccessfulExtractions);
+	UE_LOG(LogFragments, Log, TEXT("Failed extractions: %d"), FailedExtractions);
+	UE_LOG(LogFragments, Log, TEXT("=== GEOMETRY MEMORY USAGE ==="));
+	UE_LOG(LogFragments, Log, TEXT("Vertex data: %.2f MB"), TotalVertexBytes / (1024.0f * 1024.0f));
+	UE_LOG(LogFragments, Log, TEXT("Profile data: %.2f MB"), TotalProfileBytes / (1024.0f * 1024.0f));
+	UE_LOG(LogFragments, Log, TEXT("Hole data: %.2f MB"), TotalHoleBytes / (1024.0f * 1024.0f));
+	UE_LOG(LogFragments, Log, TEXT("Total pre-extracted geometry: %.2f MB"), TotalMB);
+
+	if (FailedExtractions > 0)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("Some geometry extractions failed. These fragments will be skipped during spawn."));
+	}
+}
+
+bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId)
+{
+	// Reset the extracted geometry to ensure clean state
+	Sample.ExtractedGeometry = FPreExtractedGeometry();
+
+	// Validate indices are valid
+	if (Sample.RepresentationIndex < 0 || Sample.MaterialIndex < 0 || Sample.LocalTransformIndex < 0)
+	{
+		UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: Invalid indices for item %d, sample %d"),
+			ItemLocalId, Sample.SampleIndex);
+		return false;
+	}
+
+	// Validate FlatBuffer arrays exist
+	if (!MeshesRef->representations() || !MeshesRef->materials() || !MeshesRef->local_transforms())
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Missing FlatBuffer arrays for item %d"), ItemLocalId);
+		return false;
+	}
+
+	// Bounds check representation index
+	const uint32 RepCount = MeshesRef->representations()->size();
+	if (static_cast<uint32>(Sample.RepresentationIndex) >= RepCount)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: RepresentationIndex %d >= count %u for item %d"),
+			Sample.RepresentationIndex, RepCount, ItemLocalId);
+		return false;
+	}
+
+	// Get representation
+	const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
+	if (!representation)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Representation is null for item %d"), ItemLocalId);
+		return false;
+	}
+
+	// Get material
+	const uint32 MatCount = MeshesRef->materials()->size();
+	if (static_cast<uint32>(Sample.MaterialIndex) >= MatCount)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: MaterialIndex %d >= count %u for item %d"),
+			Sample.MaterialIndex, MatCount, ItemLocalId);
+		return false;
+	}
+	const Material* material = MeshesRef->materials()->Get(Sample.MaterialIndex);
+
+	// Get local transform
+	const uint32 TransformCount = MeshesRef->local_transforms()->size();
+	if (static_cast<uint32>(Sample.LocalTransformIndex) >= TransformCount)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: LocalTransformIndex %d >= count %u for item %d"),
+			Sample.LocalTransformIndex, TransformCount, ItemLocalId);
+		return false;
+	}
+	const Transform* local_transform = MeshesRef->local_transforms()->Get(Sample.LocalTransformIndex);
+
+	// Extract material data
+	if (material)
+	{
+		Sample.ExtractedGeometry.R = material->r();
+		Sample.ExtractedGeometry.G = material->g();
+		Sample.ExtractedGeometry.B = material->b();
+		Sample.ExtractedGeometry.A = material->a();
+		Sample.ExtractedGeometry.bIsGlass = material->a() < 255;
+	}
+
+	// Extract local transform
+	if (local_transform)
+	{
+		Sample.ExtractedGeometry.LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
+	}
+
+	// Store representation ID for debugging
+	Sample.ExtractedGeometry.RepresentationId = representation->id();
+
+	// Handle Shell geometry
+	if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+	{
+		Sample.ExtractedGeometry.bIsShell = true;
+
+		if (!MeshesRef->shells())
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: shells() is null for item %d"), ItemLocalId);
+			return false;
+		}
+
+		const uint32 ShellId = representation->id();
+		const uint32 ShellCount = MeshesRef->shells()->size();
+
+		if (ShellId >= ShellCount)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell id %u >= count %u for item %d"),
+				ShellId, ShellCount, ItemLocalId);
+			return false;
+		}
+
+		const Shell* shell = MeshesRef->shells()->Get(ShellId);
+		if (!shell)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u is null for item %d"), ShellId, ItemLocalId);
+			return false;
+		}
+
+		// Validate and extract points
+		if (!shell->points() || shell->points()->size() == 0)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u has no points for item %d"), ShellId, ItemLocalId);
+			return false;
+		}
+
+		const auto* Points = shell->points();
+		const uint32 PointCount = Points->size();
+
+		// Sanity check - prevent extremely large allocations
+		constexpr uint32 MaxPointCount = 1000000;
+		if (PointCount > MaxPointCount)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Point count %u exceeds limit for item %d"), PointCount, ItemLocalId);
+			return false;
+		}
+
+		Sample.ExtractedGeometry.Vertices.Reserve(PointCount);
+		for (flatbuffers::uoffset_t i = 0; i < PointCount; i++)
+		{
+			const auto* P = Points->Get(i);
+			if (P)
+			{
+				// Convert to Unreal coordinates: Z-up, cm units
+				Sample.ExtractedGeometry.Vertices.Add(FVector(P->x() * 100.0f, P->z() * 100.0f, P->y() * 100.0f));
+			}
+		}
+
+		// Validate and extract profiles
+		const auto* Profiles = shell->profiles();
+		if (!Profiles)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u has no profiles for item %d"), ShellId, ItemLocalId);
+			return false;
+		}
+
+		const uint32 ProfileCount = Profiles->size();
+		constexpr uint32 MaxProfileCount = 100000;
+		if (ProfileCount > MaxProfileCount)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Profile count %u exceeds limit for item %d"), ProfileCount, ItemLocalId);
+			return false;
+		}
+
+		// Build hole map first
+		TMap<int32, TArray<TArray<int32>>> ProfileHolesMap;
+		if (shell->holes())
+		{
+			const auto* Holes = shell->holes();
+			const uint32 HoleCount = Holes->size();
+
+			for (flatbuffers::uoffset_t j = 0; j < HoleCount && j < MaxProfileCount; j++)
+			{
+				const auto* Hole = Holes->Get(j);
+				if (!Hole) continue;
+
+				int32 ProfileId = Hole->profile_id();
+
+				TArray<int32> HoleIndices;
+				if (Hole->indices())
+				{
+					const uint32 HoleIndexCount = Hole->indices()->size();
+					constexpr uint32 MaxIndicesPerProfile = 100000;
+					if (HoleIndexCount <= MaxIndicesPerProfile)
+					{
+						HoleIndices.Reserve(HoleIndexCount);
+						for (flatbuffers::uoffset_t k = 0; k < HoleIndexCount; k++)
+						{
+							HoleIndices.Add(Hole->indices()->Get(k));
+						}
+					}
+				}
+
+				ProfileHolesMap.FindOrAdd(ProfileId).Add(MoveTemp(HoleIndices));
+			}
+		}
+
+		// Extract profile indices
+		Sample.ExtractedGeometry.ProfileIndices.Reserve(ProfileCount);
+		Sample.ExtractedGeometry.ProfileHoles.SetNum(ProfileCount);
+
+		bool bHasValidProfile = false;
+		for (flatbuffers::uoffset_t i = 0; i < ProfileCount; i++)
+		{
+			const auto* Profile = Profiles->Get(i);
+			TArray<int32> ProfileVertexIndices;
+
+			if (Profile && Profile->indices())
+			{
+				const auto* Indices = Profile->indices();
+				const uint32 IndexCount = Indices->size();
+
+				// Skip profiles with fewer than 3 indices (not a valid polygon)
+				if (IndexCount >= 3)
+				{
+					constexpr uint32 MaxIndicesPerProfile = 100000;
+					if (IndexCount <= MaxIndicesPerProfile)
+					{
+						ProfileVertexIndices.Reserve(IndexCount);
+						for (flatbuffers::uoffset_t j = 0; j < IndexCount; j++)
+						{
+							ProfileVertexIndices.Add(Indices->Get(j));
+						}
+						bHasValidProfile = true;
+					}
+					else
+					{
+						UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: Profile %d has %u indices (limit %u), skipping"),
+							i, IndexCount, MaxIndicesPerProfile);
+					}
+				}
+			}
+
+			Sample.ExtractedGeometry.ProfileIndices.Add(MoveTemp(ProfileVertexIndices));
+
+			// Copy holes for this profile
+			if (TArray<TArray<int32>>* HolesForProfile = ProfileHolesMap.Find(i))
+			{
+				Sample.ExtractedGeometry.ProfileHoles[i] = *HolesForProfile;
+			}
+		}
+
+		if (!bHasValidProfile)
+		{
+			UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: No valid profiles for Shell %u, item %d"), ShellId, ItemLocalId);
+			return false;
+		}
+
+		// Mark as valid
+		Sample.ExtractedGeometry.bIsValid = true;
+		return true;
+	}
+	// Handle CircleExtrusion geometry
+	else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
+	{
+		Sample.ExtractedGeometry.bIsShell = false;
+
+		// For CircleExtrusion, we mark as valid but don't pre-extract the complex geometry
+		// The spawn phase will still use the FlatBuffer path for CircleExtrusion
+		// This is acceptable because CircleExtrusion uses a different (working) code path
+		// TODO: Implement full CircleExtrusion extraction if needed
+		Sample.ExtractedGeometry.bIsValid = true;
+		return true;
+	}
+
+	// Unknown representation class
+	UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Unknown representation class %d for item %d"),
+		static_cast<int32>(representation->representation_class()), ItemLocalId);
+	return false;
 }

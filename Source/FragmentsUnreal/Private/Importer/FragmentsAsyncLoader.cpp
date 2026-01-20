@@ -309,6 +309,14 @@ void UFragmentsAsyncLoader::CheckTaskCompletion()
 					UE_LOG(LogTemp, Warning, TEXT("Model has no meshes or local_ids"));
 				}
 
+				// Pre-extract all geometry data from FlatBuffers at load time
+				// This eliminates FlatBuffer access during spawn phase and prevents crashes
+				// when FlatBuffer pointers become invalid in the async/TileManager path
+				if (_meshes && Importer)
+				{
+					Importer->PreExtractAllGeometry(Wrapper->GetModelItemRef(), _meshes);
+				}
+
 				// Store wrapper in importer's FragmentModels map
 				if (Importer)
 				{

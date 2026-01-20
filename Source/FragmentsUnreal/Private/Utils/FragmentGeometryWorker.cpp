@@ -142,15 +142,28 @@ FRawGeometryData FFragmentGeometryWorker::ProcessWorkItem(const FGeometryWorkIte
 FRawGeometryData FFragmentGeometryWorker::ProcessShell(const FGeometryWorkItem& WorkItem)
 {
 	FRawGeometryData Result;
+
+	// Validate WorkItem has minimum required data
+	if (WorkItem.WorkItemId == 0)
+	{
+		UE_LOG(LogGeometryWorker, Error, TEXT("ProcessShell: Invalid WorkItemId (0)"));
+		Result.bSuccess = false;
+		Result.ErrorMessage = TEXT("Invalid WorkItemId");
+		return Result;
+	}
+
 	Result.WorkItemId = WorkItem.WorkItemId;
 	Result.LocalId = WorkItem.LocalId;
 	Result.SampleIndex = WorkItem.SampleIndex;
+
+	// Copy strings directly - they should be valid if WorkItem was properly constructed
 	Result.ModelGuid = WorkItem.ModelGuid;
 	Result.MeshName = WorkItem.MeshName;
 	Result.PackagePath = WorkItem.PackagePath;
+	Result.Category = WorkItem.Category;
+
 	Result.LocalTransform = WorkItem.LocalTransform;
 	Result.GlobalTransform = WorkItem.GlobalTransform;
-	Result.Category = WorkItem.Category;
 	Result.ParentLocalId = WorkItem.ParentLocalId;
 	Result.R = WorkItem.R;
 	Result.G = WorkItem.G;
@@ -669,7 +682,7 @@ FGeometryWorkItem FGeometryDataExtractor::ExtractShellWorkItem(
 	WorkItem.WorkItemId = WorkItemId;
 	WorkItem.Type = FGeometryWorkItem::EWorkType::Shell;
 
-	// Copy identification data
+	// Copy identification data (all data needed for processing - no FFragmentItem copy)
 	WorkItem.LocalId = FragmentItem.LocalId;
 	WorkItem.SampleIndex = SampleIndex;
 	WorkItem.ModelGuid = FragmentItem.ModelGuid;
@@ -680,11 +693,6 @@ FGeometryWorkItem FGeometryDataExtractor::ExtractShellWorkItem(
 	WorkItem.Category = FragmentItem.Category;
 	WorkItem.ParentActor = ParentActor;
 	WorkItem.bSaveMeshes = bSaveMeshes;
-
-	// Copy fragment item for spawning later
-	WorkItem.FragmentItemCopy = FragmentItem;
-	// Clear children to avoid deep copy issues
-	WorkItem.FragmentItemCopy.FragmentChildren.Empty();
 
 	// Extract material data
 	if (MaterialRef)

@@ -96,8 +96,8 @@ struct FGeometryWorkItem
 	// Parent actor for spawning (weak reference, only valid on game thread)
 	TWeakObjectPtr<AActor> ParentActor;
 
-	// Fragment item data for spawning
-	FFragmentItem FragmentItemCopy;
+	// Note: We don't copy FFragmentItem as it contains raw pointers (FragmentChildren)
+	// that are not safe to copy across threads. All necessary data is extracted above.
 	bool bSaveMeshes = false;
 
 	FGeometryWorkItem() = default;
