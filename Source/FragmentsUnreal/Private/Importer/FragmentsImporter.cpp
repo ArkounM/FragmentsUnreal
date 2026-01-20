@@ -1230,149 +1230,29 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 				if (ExtractedGeom.bIsShell)
 				{
-					// Shell geometry: Use DeduplicationManager for mesh reuse
-					// First, tessellate pre-extracted geometry into raw vertex/triangle arrays
-					TArray<FVector> Vertices;
-					TArray<int32> Triangles;
-					TArray<FVector> Normals;
-					TArray<FVector2D> UVs;
+					// Use RepresentationId-based caching (more reliable than geometry hashing)
+					// All instances with the same RepresentationId share identical geometry
+					const int32 RepresentationId = Sample.RepresentationIndex;
 
-					// Build hole map for tessellation
-					TMap<int32, TArray<TArray<int32>>> ProfileHolesMap;
-					for (int32 ProfileIdx = 0; ProfileIdx < ExtractedGeom.ProfileHoles.Num(); ProfileIdx++)
+					if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepresentationId))
 					{
-						if (ExtractedGeom.ProfileHoles[ProfileIdx].Num() > 0)
-						{
-							ProfileHolesMap.Add(ProfileIdx, ExtractedGeom.ProfileHoles[ProfileIdx]);
-						}
+						// Reuse existing mesh for this representation
+						Mesh = *CachedMesh;
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Reusing cached mesh for RepId %d (LocalId: %d)"),
+							RepresentationId, FragmentModel->GetLocalId());
 					}
-
-					// Tessellate each profile into triangles
-					for (int32 ProfileIdx = 0; ProfileIdx < ExtractedGeom.ProfileIndices.Num(); ProfileIdx++)
+					else
 					{
-						const TArray<int32>& ProfileVertexIndices = ExtractedGeom.ProfileIndices[ProfileIdx];
+						// Create new mesh using the working pre-extracted shell function
+						Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
 
-						if (ProfileVertexIndices.Num() < 3)
+						if (Mesh)
 						{
-							continue;
-						}
+							// Cache by RepresentationId for future instances
+							RepresentationMeshCache.Add(RepresentationId, Mesh);
 
-						bool bHasHoles = ProfileHolesMap.Contains(ProfileIdx);
-
-						if (!bHasHoles)
-						{
-							// Simple polygon - fan triangulation
-							int32 BaseIndex = Vertices.Num();
-							for (int32 Idx : ProfileVertexIndices)
-							{
-								if (Idx >= 0 && Idx < ExtractedGeom.Vertices.Num())
-								{
-									Vertices.Add(ExtractedGeom.Vertices[Idx]);
-								}
-							}
-
-							// Create triangle fan
-							for (int32 j = 1; j < ProfileVertexIndices.Num() - 1; j++)
-							{
-								Triangles.Add(BaseIndex);
-								Triangles.Add(BaseIndex + j);
-								Triangles.Add(BaseIndex + j + 1);
-							}
-						}
-						else
-						{
-							// Polygon with holes - use tessellation
-							TArray<FVector> OutVerts;
-							TArray<int32> OutIndices;
-
-							if (TriangulatePolygonWithHoles(
-								ExtractedGeom.Vertices,
-								ProfileVertexIndices,
-								ProfileHolesMap[ProfileIdx],
-								OutVerts,
-								OutIndices))
-							{
-								int32 BaseIndex = Vertices.Num();
-								Vertices.Append(OutVerts);
-
-								for (int32 Idx : OutIndices)
-								{
-									Triangles.Add(BaseIndex + Idx);
-								}
-							}
-						}
-					}
-
-					// Calculate normals and UVs
-					if (Vertices.Num() > 0 && Triangles.Num() > 0)
-					{
-						Normals.SetNum(Vertices.Num());
-						for (int32 j = 0; j < Triangles.Num(); j += 3)
-						{
-							if (j + 2 < Triangles.Num())
-							{
-								int32 Idx0 = Triangles[j];
-								int32 Idx1 = Triangles[j + 1];
-								int32 Idx2 = Triangles[j + 2];
-
-								if (Idx0 < Vertices.Num() && Idx1 < Vertices.Num() && Idx2 < Vertices.Num())
-								{
-									FVector V0 = Vertices[Idx0];
-									FVector V1 = Vertices[Idx1];
-									FVector V2 = Vertices[Idx2];
-
-									FVector Normal = FVector::CrossProduct(V1 - V0, V2 - V0).GetSafeNormal();
-
-									Normals[Idx0] = Normal;
-									Normals[Idx1] = Normal;
-									Normals[Idx2] = Normal;
-								}
-							}
-						}
-
-						// Simple planar UV projection
-						UVs.SetNum(Vertices.Num());
-						for (int32 j = 0; j < Vertices.Num(); j++)
-						{
-							UVs[j] = FVector2D(Vertices[j].X * 0.01f, Vertices[j].Y * 0.01f);
-						}
-
-						// Use DeduplicationManager for mesh reuse
-						FGeometryTemplate* Template = DeduplicationManager->GetOrCreateTemplate(
-							Vertices,
-							Triangles,
-							Normals,
-							UVs,
-							Sample.MaterialIndex,
-							MeshName,
-							MeshPackage
-						);
-
-						if (Template)
-						{
-							bool bIsNewTemplate = (Template->ReferenceCount == 0);
-
-							// Add this instance to the template
-							DeduplicationManager->AddInstance(
-								Template->GeometryHash,
-								LocalTransform,
-								FragmentModel->GetLocalId(),
-								Sample.MaterialIndex
-							);
-
-							Mesh = Template->SharedMesh;
-
-							// Apply material to newly created mesh using pre-extracted color data
-							if (bIsNewTemplate && Mesh)
-							{
-								AddMaterialToMeshFromRawData(
-									Mesh,
-									ExtractedGeom.R, ExtractedGeom.G, ExtractedGeom.B, ExtractedGeom.A,
-									ExtractedGeom.bIsGlass);
-							}
-
-							// Only save the package if this is a newly created mesh
-							if (bIsNewTemplate && Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
+							// Save mesh if needed
+							if (!FPaths::FileExists(PackageFileName) && bSaveMeshes)
 							{
 #if WITH_EDITOR
 								MeshPackage->FullyLoad();
@@ -1384,8 +1264,8 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 #endif
 							}
 
-							UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Using deduplicated mesh (hash: %llu, instances: %d, new: %d)"),
-								Template->GeometryHash, Template->ReferenceCount, bIsNewTemplate ? 1 : 0);
+							UE_LOG(LogFragments, Log, TEXT("SpawnSingleFragment: Created and cached mesh for RepId %d (LocalId: %d)"),
+								RepresentationId, FragmentModel->GetLocalId());
 						}
 					}
 				}

@@ -274,6 +274,12 @@ private:
 	UPROPERTY()
 	TMap<FString, UStaticMesh*> MeshCache;
 
+	// Representation-based mesh cache (Key = RepresentationId)
+	// More reliable than geometry hashing since all instances of the same
+	// RepresentationId share identical geometry in FlatBuffers format
+	UPROPERTY()
+	TMap<int32, UStaticMesh*> RepresentationMeshCache;
+
 	UPROPERTY()
 	TArray<UPackage*> PackagesToSave;
 
