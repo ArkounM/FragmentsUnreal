@@ -1806,45 +1806,22 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromCircleExtrusion(const Circl
 
 FName UFragmentsImporter::AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial)
 {
-	if (!RefMaterial || !CreatedMesh)return FName();
+	if (!RefMaterial || !CreatedMesh) return FName();
 
-	bool HasTransparency = false;
-	float R = RefMaterial->r() / 255.f;
-	float G = RefMaterial->g() / 255.f;
-	float B = RefMaterial->b() / 255.f;
-	float A = RefMaterial->a() / 255.f;
+	// Extract material properties
+	uint8 R = RefMaterial->r();
+	uint8 G = RefMaterial->g();
+	uint8 B = RefMaterial->b();
+	uint8 A = RefMaterial->a();
+	bool bIsGlass = A < 255; // Glass is determined by transparency
 
-	UMaterialInterface* Material = nullptr;
-	if (A < 1)
-	{
-		///Script/Engine.Material'/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial'
-		Material = BaseGlassMaterial;
-		HasTransparency = true;
-	}
-	else
-	{
-		Material = BaseMaterial;
-	}
-	if (!Material)
-	{
-		UE_LOG(LogFragments, Error, TEXT("Unable to load Base Material"));
-		return FName();
-	}
-
-	UMaterialInstanceDynamic* DynamicMaterial = UMaterialInstanceDynamic::Create(Material, CreatedMesh);
+	// Use pooled material for CRC-based deduplication
+	UMaterialInstanceDynamic* DynamicMaterial = GetPooledMaterial(R, G, B, A, bIsGlass);
 	if (!DynamicMaterial)
 	{
-		UE_LOG(LogFragments, Error, TEXT("Failed to create dynamic material."));
+		UE_LOG(LogFragments, Error, TEXT("Failed to get pooled material"));
 		return FName();
 	}
-
-	if (HasTransparency)
-	{
-		DynamicMaterial->SetScalarParameterValue(TEXT("Opacity"), A);
-	}
-
-	DynamicMaterial->SetVectorParameterValue(TEXT("BaseColor"), FVector4(R, G, B, A));
-
 
 	// Add Material
 	return CreatedMesh->AddMaterial(DynamicMaterial);
