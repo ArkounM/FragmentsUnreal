@@ -68,9 +68,6 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 	// Pre-compute quality-adjusted threshold
 	const float MinScreen = MinScreenSize * GraphicsQuality;
 
-	int32 FrustumCulled = 0;
-	int32 ScreenSizeCulled = 0;
-
 	// === MAIN VISIBILITY LOOP ===
 	// This is the core per-sample evaluation that tests EACH fragment individually
 	for (int32 i = StartIndex; i < EndIndex; ++i)
@@ -94,10 +91,8 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		}
 
 		// === FRUSTUM TEST (per-fragment, not per-tile!) ===
-		const bool bInFrustum = IsInFrustum(Sample.WorldBounds);
-		if (!bInFrustum)
+		if (!IsInFrustum(Sample.WorldBounds))
 		{
-			FrustumCulled++;
 			continue;
 		}
 
@@ -108,15 +103,6 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		// === SCREEN SIZE CULLING ===
 		if (ScreenSize < MinScreen)
 		{
-			ScreenSizeCulled++;
-
-			// Debug log for screen size culled (sample first few)
-			if (ScreenSizeCulled <= 5)
-			{
-				UE_LOG(LogPerSampleVisibility, Log,
-				       TEXT("Screen size culled: LocalId=%d, ScreenSize=%.2f < MinScreen=%.2f, Distance=%.1fcm"),
-				       Sample.LocalId, ScreenSize, MinScreen, Distance);
-			}
 			continue;
 		}
 
@@ -136,12 +122,6 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 	// Update last camera state
 	LastCameraPosition = CameraPos;
 	LastCameraRotation = CameraRot;
-
-	// Debug logging - per-frame visibility stats
-	UE_LOG(LogPerSampleVisibility, Log,
-	       TEXT("Visibility: %d visible / %d total | Culled: %d frustum, %d screensize | Camera: %s"),
-	       VisibleSamples.Num(), EndIndex - StartIndex,
-	       FrustumCulled, ScreenSizeCulled, *CameraPos.ToString());
 }
 
 bool UPerSampleVisibilityController::NeedsUpdate(const FVector& NewPosition, const FRotator& NewRotation) const
