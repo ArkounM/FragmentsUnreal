@@ -24,7 +24,7 @@
 #include "Spatial/FragmentTileManager.h"
 #include "Utils/FragmentOcclusionClassifier.h"
 #include "Utils/FragmentGeometryWorker.h"
-#include "Components/InstancedStaticMeshComponent.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -1260,7 +1260,7 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 			// QUEUE instance for batch addition (no ISMC created yet!)
 			// Proxies will be created in FinalizeAllISMCs()
-			QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material);
+			QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material, ExtractedGeom.A);
 		}
 
 		// Store null in actor lookup map to indicate this fragment exists but is instanced
@@ -1361,7 +1361,7 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					if (Material)
 					{
 						FTransform SampleWorldTransform = ExtractedGeom.LocalTransform * Item.GlobalTransform;
-						QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material);
+						QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material, ExtractedGeom.A);
 						continue;  // Skip standard component creation for this sample
 					}
 					// Fall through to standard component creation if material is null
@@ -3613,7 +3613,7 @@ bool UFragmentsImporter::ShouldUseInstancing(int32 RepresentationId, uint32 Mate
 	return false;
 }
 
-UInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
+UHierarchicalInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
 	int32 RepresentationId, uint32 MaterialHash,
 	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material)
 {
@@ -3625,13 +3625,13 @@ UInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
 
 	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
 
-	// Check if ISMC already exists for this combination
+	// Check if HISMC already exists for this combination
 	if (FInstancedMeshGroup* Existing = InstancedMeshGroups.Find(ComboKey))
 	{
 		return Existing->ISMC;
 	}
 
-	// Create host actor if needed (single actor holds all ISMCs for organization)
+	// Create host actor if needed (single actor holds all HISMCs for organization)
 	if (!ISMCHostActor && OwnerRef)
 	{
 		FActorSpawnParameters SpawnParams;
@@ -3642,9 +3642,9 @@ UInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
 		if (ISMCHostActor)
 		{
 #if WITH_EDITOR
-			ISMCHostActor->SetActorLabel(TEXT("FragmentISMCHost"));
+			ISMCHostActor->SetActorLabel(TEXT("FragmentHISMCHost"));
 #endif
-			UE_LOG(LogFragments, Log, TEXT("Created ISMC host actor"));
+			UE_LOG(LogFragments, Log, TEXT("Created HISMC host actor"));
 		}
 	}
 
@@ -3654,11 +3654,11 @@ UInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
 		return nullptr;
 	}
 
-	// Create new ISMC
-	UInstancedStaticMeshComponent* ISMC = NewObject<UInstancedStaticMeshComponent>(ISMCHostActor);
+	// Create new HISMC for per-cluster culling
+	UHierarchicalInstancedStaticMeshComponent* ISMC = NewObject<UHierarchicalInstancedStaticMeshComponent>(ISMCHostActor);
 	if (!ISMC)
 	{
-		UE_LOG(LogFragments, Error, TEXT("GetOrCreateISMC: Failed to create ISMC for RepId=%d"), RepresentationId);
+		UE_LOG(LogFragments, Error, TEXT("GetOrCreateISMC: Failed to create HISMC for RepId=%d"), RepresentationId);
 		return nullptr;
 	}
 
@@ -3702,13 +3702,13 @@ UInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
 	Group.InstanceCount = 0;
 	InstancedMeshGroups.Add(ComboKey, Group);
 
-	UE_LOG(LogFragments, Log, TEXT("Created ISMC for RepId=%d, MatHash=%u"), RepresentationId, MaterialHash);
+	UE_LOG(LogFragments, Log, TEXT("Created HISMC for RepId=%d, MatHash=%u"), RepresentationId, MaterialHash);
 	return ISMC;
 }
 
 void UFragmentsImporter::QueueInstanceForBatchAdd(int32 RepresentationId, uint32 MaterialHash,
 	const FTransform& WorldTransform, const FFragmentItem& Item,
-	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material)
+	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material, uint8 MaterialAlpha)
 {
 	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
 
@@ -3718,12 +3718,21 @@ void UFragmentsImporter::QueueInstanceForBatchAdd(int32 RepresentationId, uint32
 	{
 		// ISMC already exists - add directly to it instead of queuing
 		// This handles the TileManager streaming case where ISMC was finalized earlier
-		AddInstanceToExistingISMC(RepresentationId, MaterialHash, WorldTransform, Item, Mesh, Material);
+		AddInstanceToExistingISMC(RepresentationId, MaterialHash, WorldTransform, Item, Mesh, Material, MaterialAlpha);
 		return;
 	}
 
 	// Get or create group (but DON'T create ISMC yet - that happens in FinalizeAllISMCs or incrementally)
 	FInstancedMeshGroup& Group = InstancedMeshGroups.FindOrAdd(ComboKey);
+
+	// Store classification data from first instance (all instances in a group share the same classification)
+	const bool bIsNewGroup = Group.PendingInstances.Num() == 0;
+	if (bIsNewGroup)
+	{
+		Group.FirstCategory = Item.Category;
+		Group.FirstMaterialAlpha = MaterialAlpha;
+	}
+
 	Group.RepresentationId = RepresentationId;
 	Group.MaterialHash = MaterialHash;
 	Group.CachedMesh = Mesh;
@@ -3833,25 +3842,53 @@ void UFragmentsImporter::FinalizeAllISMCs()
 			continue;
 		}
 
-		// Create ISMC (NOT registered yet - we'll register after adding all instances)
-		UInstancedStaticMeshComponent* ISMC = NewObject<UInstancedStaticMeshComponent>(ISMCHostActor);
+		// Create HISMC (NOT registered yet - we'll register after adding all instances)
+		// HISMC provides per-cluster culling for better performance
+		UHierarchicalInstancedStaticMeshComponent* ISMC = NewObject<UHierarchicalInstancedStaticMeshComponent>(ISMCHostActor);
 		if (!ISMC)
 		{
-			UE_LOG(LogFragments, Error, TEXT("FinalizeAllISMCs: Failed to create ISMC for RepId=%d"), Group.RepresentationId);
+			UE_LOG(LogFragments, Error, TEXT("FinalizeAllISMCs: Failed to create HISMC for RepId=%d"), Group.RepresentationId);
 			continue;
 		}
 
 		ISMC->SetStaticMesh(Group.CachedMesh);
 		ISMC->SetMobility(EComponentMobility::Static);
 
-		// Disable expensive features
+		// Disable expensive Lumen/Distance Field features
 		ISMC->bAffectDistanceFieldLighting = false;
 		ISMC->bAffectDynamicIndirectLighting = false;
 		ISMC->bAffectIndirectLightingWhileHidden = false;
-		ISMC->SetCastShadow(false);
-		ISMC->bCastDynamicShadow = false;
-		ISMC->bCastStaticShadow = false;
-		ISMC->bUseAsOccluder = false;
+
+		// Configure occlusion culling based on fragment classification
+		const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
+			Group.FirstCategory, Group.FirstMaterialAlpha);
+
+		switch (Role)
+		{
+		case EOcclusionRole::Occluder:
+			// Large structural elements that block visibility
+			ISMC->bUseAsOccluder = true;
+			ISMC->SetCastShadow(true);
+			ISMC->bCastDynamicShadow = true;
+			ISMC->bCastStaticShadow = true;
+			break;
+
+		case EOcclusionRole::Occludee:
+			// Objects that can be hidden by occluders
+			ISMC->bUseAsOccluder = false;
+			ISMC->SetCastShadow(true);
+			ISMC->bCastDynamicShadow = true;
+			ISMC->bCastStaticShadow = true;
+			break;
+
+		case EOcclusionRole::NonOccluder:
+			// Transparent/glass elements
+			ISMC->bUseAsOccluder = false;
+			ISMC->SetCastShadow(false);
+			ISMC->bCastDynamicShadow = false;
+			ISMC->bCastStaticShadow = false;
+			break;
+		}
 
 		// Custom data for picking
 		ISMC->NumCustomDataFloats = 1;
@@ -3966,25 +4003,53 @@ int32 UFragmentsImporter::FinalizeISMCGroup(int64 ComboKey, FInstancedMeshGroup&
 		return -1;
 	}
 
-	// Create ISMC (NOT registered yet - we'll register after adding all instances)
-	UInstancedStaticMeshComponent* ISMC = NewObject<UInstancedStaticMeshComponent>(ISMCHostActor);
+	// Create HISMC (NOT registered yet - we'll register after adding all instances)
+	// HISMC provides per-cluster culling for better performance
+	UHierarchicalInstancedStaticMeshComponent* ISMC = NewObject<UHierarchicalInstancedStaticMeshComponent>(ISMCHostActor);
 	if (!ISMC)
 	{
-		UE_LOG(LogFragments, Error, TEXT("FinalizeISMCGroup: Failed to create ISMC for RepId=%d"), Group.RepresentationId);
+		UE_LOG(LogFragments, Error, TEXT("FinalizeISMCGroup: Failed to create HISMC for RepId=%d"), Group.RepresentationId);
 		return -1;
 	}
 
 	ISMC->SetStaticMesh(Group.CachedMesh);
 	ISMC->SetMobility(EComponentMobility::Static);
 
-	// Disable expensive features
+	// Disable expensive Lumen/Distance Field features
 	ISMC->bAffectDistanceFieldLighting = false;
 	ISMC->bAffectDynamicIndirectLighting = false;
 	ISMC->bAffectIndirectLightingWhileHidden = false;
-	ISMC->SetCastShadow(false);
-	ISMC->bCastDynamicShadow = false;
-	ISMC->bCastStaticShadow = false;
-	ISMC->bUseAsOccluder = false;
+
+	// Configure occlusion culling based on fragment classification
+	const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
+		Group.FirstCategory, Group.FirstMaterialAlpha);
+
+	switch (Role)
+	{
+	case EOcclusionRole::Occluder:
+		// Large structural elements that block visibility
+		ISMC->bUseAsOccluder = true;
+		ISMC->SetCastShadow(true);
+		ISMC->bCastDynamicShadow = true;
+		ISMC->bCastStaticShadow = true;
+		break;
+
+	case EOcclusionRole::Occludee:
+		// Objects that can be hidden by occluders
+		ISMC->bUseAsOccluder = false;
+		ISMC->SetCastShadow(true);
+		ISMC->bCastDynamicShadow = true;
+		ISMC->bCastStaticShadow = true;
+		break;
+
+	case EOcclusionRole::NonOccluder:
+		// Transparent/glass elements
+		ISMC->bUseAsOccluder = false;
+		ISMC->SetCastShadow(false);
+		ISMC->bCastDynamicShadow = false;
+		ISMC->bCastStaticShadow = false;
+		break;
+	}
 
 	// Custom data for picking
 	ISMC->NumCustomDataFloats = 1;
@@ -4063,7 +4128,7 @@ int32 UFragmentsImporter::FinalizeISMCGroup(int64 ComboKey, FInstancedMeshGroup&
 
 bool UFragmentsImporter::AddInstanceToExistingISMC(int32 RepresentationId, uint32 MaterialHash,
 	const FTransform& WorldTransform, const FFragmentItem& Item,
-	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material)
+	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material, uint8 MaterialAlpha)
 {
 	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
 
@@ -4071,18 +4136,18 @@ bool UFragmentsImporter::AddInstanceToExistingISMC(int32 RepresentationId, uint3
 	if (!Group || !Group->ISMC)
 	{
 		// ISMC not yet created - queue for batch addition instead
-		QueueInstanceForBatchAdd(RepresentationId, MaterialHash, WorldTransform, Item, Mesh, Material);
+		QueueInstanceForBatchAdd(RepresentationId, MaterialHash, WorldTransform, Item, Mesh, Material, MaterialAlpha);
 		return false;
 	}
 
-	UInstancedStaticMeshComponent* ISMC = Group->ISMC;
+	UHierarchicalInstancedStaticMeshComponent* ISMC = Group->ISMC;
 	if (!ISMC || !IsValid(ISMC))
 	{
-		UE_LOG(LogFragments, Warning, TEXT("AddInstanceToExistingISMC: ISMC invalid for RepId=%d"), RepresentationId);
+		UE_LOG(LogFragments, Warning, TEXT("AddInstanceToExistingISMC: HISMC invalid for RepId=%d"), RepresentationId);
 		return false;
 	}
 
-	// Add single instance to existing ISMC
+	// Add single instance to existing HISMC
 	// Note: This is less efficient than batch add, but necessary for streaming
 	int32 NewIndex = ISMC->AddInstance(WorldTransform, /*bWorldSpace=*/true);
 	if (NewIndex == INDEX_NONE)

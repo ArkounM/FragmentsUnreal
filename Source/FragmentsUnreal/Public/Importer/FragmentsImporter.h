@@ -19,6 +19,7 @@ FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
 class UFragmentsAsyncLoader;
 class UFragmentTileManager;
 class AFragment;
+class UHierarchicalInstancedStaticMeshComponent;
 struct FRawGeometryData;
 struct FGeometryWorkItem;
 
@@ -77,24 +78,26 @@ public:
 	bool ShouldUseInstancing(int32 RepresentationId, uint32 MaterialHash) const;
 
 	/**
-	 * Get or create an ISMC for a representation+material combination.
+	 * Get or create an HISMC for a representation+material combination.
+	 * Uses Hierarchical ISM for per-cluster culling performance.
 	 * @param RepresentationId The FlatBuffers representation ID (unique geometry)
 	 * @param MaterialHash Hash of material properties
-	 * @param Mesh The static mesh to use for this ISMC
+	 * @param Mesh The static mesh to use for this HISMC
 	 * @param Material The material instance to apply
-	 * @return The ISMC (existing or newly created), or nullptr on failure
+	 * @return The HISMC (existing or newly created), or nullptr on failure
 	 */
-	UInstancedStaticMeshComponent* GetOrCreateISMC(int32 RepresentationId, uint32 MaterialHash,
+	UHierarchicalInstancedStaticMeshComponent* GetOrCreateISMC(int32 RepresentationId, uint32 MaterialHash,
 		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material);
 
 	/**
 	 * Queue an instance to be batch-added later (during spawn phase).
 	 * Instances are collected in PendingInstances arrays and batch-added
 	 * when FinalizeAllISMCs() is called after spawning completes.
+	 * @param MaterialAlpha Alpha value from the material (0-255) for occlusion classification
 	 */
 	void QueueInstanceForBatchAdd(int32 RepresentationId, uint32 MaterialHash,
 		const FTransform& WorldTransform, const FFragmentItem& Item,
-		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material);
+		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material, uint8 MaterialAlpha);
 
 	/**
 	 * Finalize all ISMCs by batch-adding all pending instances.
@@ -121,11 +124,12 @@ public:
 	 * @param Item Fragment item data for proxy creation
 	 * @param Mesh The static mesh (must match existing ISMC mesh)
 	 * @param Material The material instance
+	 * @param MaterialAlpha Alpha value from the material (0-255) for occlusion classification
 	 * @return true if instance was added successfully
 	 */
 	bool AddInstanceToExistingISMC(int32 RepresentationId, uint32 MaterialHash,
 		const FTransform& WorldTransform, const FFragmentItem& Item,
-		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material);
+		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material, uint8 MaterialAlpha);
 	FString LoadFragment(const FString& FragPath);
 	void ProcessLoadedFragment(const FString& ModelGuid, AActor* InOwnerRef, bool bInSaveMesh);
 	TArray<int32> GetElementsByCategory(const FString& InCategory, const FString& ModelGuid);

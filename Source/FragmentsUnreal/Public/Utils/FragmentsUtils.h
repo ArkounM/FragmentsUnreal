@@ -266,16 +266,16 @@ class AFragment;
 /**
  * Lightweight proxy for instanced BIM elements.
  * ~200 bytes vs ~5KB for AFragment actor.
- * Used for fragments rendered via UInstancedStaticMeshComponent.
+ * Used for fragments rendered via UHierarchicalInstancedStaticMeshComponent.
  */
 USTRUCT(BlueprintType)
 struct FFragmentProxy
 {
 	GENERATED_BODY()
 
-	/** Weak reference to the ISMC containing this instance */
+	/** Weak reference to the HISMC containing this instance */
 	UPROPERTY()
-	TWeakObjectPtr<class UInstancedStaticMeshComponent> ISMC;
+	TWeakObjectPtr<class UHierarchicalInstancedStaticMeshComponent> ISMC;
 
 	/** Index of this instance within the ISMC */
 	UPROPERTY()
@@ -337,17 +337,18 @@ struct FPendingInstanceData
 };
 
 /**
- * ISMC group for a RepresentationId + Material combination.
- * Each unique geometry+material pair gets one ISMC containing all instances.
+ * HISMC group for a RepresentationId + Material combination.
+ * Each unique geometry+material pair gets one HISMC containing all instances.
+ * Uses Hierarchical ISM for per-cluster culling performance.
  */
 USTRUCT()
 struct FInstancedMeshGroup
 {
 	GENERATED_BODY()
 
-	/** The InstancedStaticMeshComponent for this group */
+	/** The HierarchicalInstancedStaticMeshComponent for this group */
 	UPROPERTY()
-	class UInstancedStaticMeshComponent* ISMC = nullptr;
+	class UHierarchicalInstancedStaticMeshComponent* ISMC = nullptr;
 
 	/** RepresentationId from FlatBuffers (unique geometry ID) */
 	UPROPERTY()
@@ -377,6 +378,12 @@ struct FInstancedMeshGroup
 	/** Cached material for batch creation */
 	UPROPERTY()
 	class UMaterialInstanceDynamic* CachedMaterial = nullptr;
+
+	/** Category from the first instance (for occlusion classification) */
+	FString FirstCategory;
+
+	/** Material alpha from the first instance (for occlusion classification, 0-255) */
+	uint8 FirstMaterialAlpha = 255;
 
 	FInstancedMeshGroup() = default;
 };
