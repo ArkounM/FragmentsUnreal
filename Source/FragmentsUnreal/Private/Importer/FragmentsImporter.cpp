@@ -93,6 +93,12 @@ UFragmentsImporter::UFragmentsImporter()
 	DeduplicationManager = CreateDefaultSubobject<UGeometryDeduplicationManager>(TEXT("DeduplicationManager"));
 }
 
+UFragmentsImporter::~UFragmentsImporter()
+{
+	// Destructor must be defined in .cpp where FGeometryWorkerPool is fully defined
+	// This allows TUniquePtr<FGeometryWorkerPool> to properly call the destructor
+}
+
 FString UFragmentsImporter::Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes)
 {
 	SetOwnerRef(OwnerA);
@@ -1244,6 +1250,11 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 			UMaterialInstanceDynamic* Material = GetPooledMaterial(ExtractedGeom.R, ExtractedGeom.G,
 				ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
 
+			if (!Material)
+			{
+				continue;
+			}
+
 			// Compute world transform: LocalTransform * GlobalTransform
 			FTransform SampleWorldTransform = ExtractedGeom.LocalTransform * Item.GlobalTransform;
 
@@ -1347,13 +1358,14 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					UMaterialInstanceDynamic* Material = GetPooledMaterial(ExtractedGeom.R, ExtractedGeom.G,
 						ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
 
-					FTransform SampleWorldTransform = ExtractedGeom.LocalTransform * Item.GlobalTransform;
-
-					// QUEUE for batch addition (ISMCs created in FinalizeAllISMCs)
-					QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material);
+					if (Material)
+					{
+						FTransform SampleWorldTransform = ExtractedGeom.LocalTransform * Item.GlobalTransform;
+						QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material);
+						continue;  // Skip standard component creation for this sample
+					}
+					// Fall through to standard component creation if material is null
 				}
-
-				continue;  // Skip standard component creation for this sample
 			}
 
 			// ==========================================
@@ -3651,10 +3663,6 @@ UInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
 	}
 
 	ISMC->SetStaticMesh(Mesh);
-	if (Material)
-	{
-		ISMC->SetMaterial(0, Material);
-	}
 	ISMC->SetMobility(EComponentMobility::Static);
 
 	// Disable Lumen/Distance Field to avoid "Preparing mesh distance fields" delays
@@ -3679,6 +3687,12 @@ UInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
 		FAttachmentTransformRules::KeepRelativeTransform);
 	ISMC->RegisterComponent();
 	ISMCHostActor->AddInstanceComponent(ISMC);
+
+	// IMPORTANT: Set material AFTER registration - material overrides don't persist on unregistered components
+	if (Material)
+	{
+		ISMC->SetMaterial(0, Material);
+	}
 
 	// Create and store the group
 	FInstancedMeshGroup Group;
@@ -3769,11 +3783,8 @@ void UFragmentsImporter::FinalizeAllISMCs()
 {
 	if (InstancedMeshGroups.Num() == 0)
 	{
-		UE_LOG(LogFragments, Log, TEXT("FinalizeAllISMCs: No ISMC groups to finalize"));
 		return;
 	}
-
-	UE_LOG(LogFragments, Log, TEXT("=== FINALIZING ISMCs: %d groups ==="), InstancedMeshGroups.Num());
 
 	// Create host actor if needed
 	if (!ISMCHostActor && OwnerRef)
@@ -3831,10 +3842,6 @@ void UFragmentsImporter::FinalizeAllISMCs()
 		}
 
 		ISMC->SetStaticMesh(Group.CachedMesh);
-		if (Group.CachedMaterial)
-		{
-			ISMC->SetMaterial(0, Group.CachedMaterial);
-		}
 		ISMC->SetMobility(EComponentMobility::Static);
 
 		// Disable expensive features
@@ -3868,6 +3875,12 @@ void UFragmentsImporter::FinalizeAllISMCs()
 		// NOW register the component (after all instances are added)
 		ISMC->RegisterComponent();
 		ISMCHostActor->AddInstanceComponent(ISMC);
+
+		// Set material AFTER registration - material overrides don't persist on unregistered components
+		if (Group.CachedMaterial)
+		{
+			ISMC->SetMaterial(0, Group.CachedMaterial);
+		}
 
 		// Set custom data and build lookup maps (after registration, with dirty marking disabled)
 		for (int32 i = 0; i < Group.PendingInstances.Num(); i++)
@@ -3962,10 +3975,6 @@ int32 UFragmentsImporter::FinalizeISMCGroup(int64 ComboKey, FInstancedMeshGroup&
 	}
 
 	ISMC->SetStaticMesh(Group.CachedMesh);
-	if (Group.CachedMaterial)
-	{
-		ISMC->SetMaterial(0, Group.CachedMaterial);
-	}
 	ISMC->SetMobility(EComponentMobility::Static);
 
 	// Disable expensive features
@@ -3998,6 +4007,12 @@ int32 UFragmentsImporter::FinalizeISMCGroup(int64 ComboKey, FInstancedMeshGroup&
 	// NOW register the component (after all instances are added)
 	ISMC->RegisterComponent();
 	ISMCHostActor->AddInstanceComponent(ISMC);
+
+	// Set material AFTER registration - material overrides don't persist on unregistered components
+	if (Group.CachedMaterial)
+	{
+		ISMC->SetMaterial(0, Group.CachedMaterial);
+	}
 
 	// Set custom data and build lookup maps
 	for (int32 i = 0; i < Group.PendingInstances.Num(); i++)

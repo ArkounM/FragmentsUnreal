@@ -9,6 +9,7 @@
 #include "Importer/DeferredPackageSaveManager.h"
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
 #include "Optimization/GeometryDeduplicationManager.h"
+#include "Utils/FragmentGeometryWorker.h" // Required for TUniquePtr<FGeometryWorkerPool>
 #include "FragmentsImporter.generated.h"
 
 
@@ -17,7 +18,6 @@ FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
 // Forward Declarations
 class UFragmentsAsyncLoader;
 class UFragmentTileManager;
-class FGeometryWorkerPool;
 class AFragment;
 struct FRawGeometryData;
 struct FGeometryWorkItem;
@@ -47,6 +47,7 @@ public:
 	void ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete);
 
 	UFragmentsImporter();
+	~UFragmentsImporter();
 
 	FString Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes = true);
 	void SetOwnerRef(AActor* NewOwnerRef) { OwnerRef = NewOwnerRef; }
