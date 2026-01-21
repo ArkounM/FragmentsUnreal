@@ -326,3 +326,83 @@ int32 UFragmentsUtils::GetIndexForLocalId(const Model* InModelRef, int32 LocalId
 	}
 	return INDEX_NONE;
 }
+
+// ==========================================
+// FFindResult Implementation (GPU Instancing Phase 4)
+// ==========================================
+
+int32 FFindResult::GetLocalId() const
+{
+	if (bIsInstanced)
+	{
+		return Proxy.LocalId;
+	}
+	else if (Fragment)
+	{
+		return Fragment->GetLocalId();
+	}
+	return INDEX_NONE;
+}
+
+FString FFindResult::GetCategory() const
+{
+	if (bIsInstanced)
+	{
+		return Proxy.Category;
+	}
+	else if (Fragment)
+	{
+		return Fragment->GetCategory();
+	}
+	return FString();
+}
+
+FTransform FFindResult::GetWorldTransform() const
+{
+	if (bIsInstanced)
+	{
+		return Proxy.WorldTransform;
+	}
+	else if (Fragment)
+	{
+		return Fragment->GetActorTransform();
+	}
+	return FTransform::Identity;
+}
+
+FFindResult FFindResult::NotFound()
+{
+	FFindResult Result;
+	Result.bFound = false;
+	Result.bIsInstanced = false;
+	Result.Fragment = nullptr;
+	return Result;
+}
+
+FFindResult FFindResult::FromActor(AFragment* Actor)
+{
+	FFindResult Result;
+	if (Actor)
+	{
+		Result.bFound = true;
+		Result.bIsInstanced = false;
+		Result.Fragment = Actor;
+	}
+	else
+	{
+		Result.bFound = false;
+		Result.bIsInstanced = false;
+		Result.Fragment = nullptr;
+	}
+	return Result;
+}
+
+FFindResult FFindResult::FromProxy(const FFragmentProxy& InProxy)
+{
+	FFindResult Result;
+	Result.bFound = true;
+	Result.bIsInstanced = true;
+	Result.Fragment = nullptr;
+	Result.Proxy = InProxy;
+	return Result;
+}

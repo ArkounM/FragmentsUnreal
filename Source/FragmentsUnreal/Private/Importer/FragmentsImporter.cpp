@@ -24,6 +24,7 @@
 #include "Spatial/FragmentTileManager.h"
 #include "Utils/FragmentOcclusionClassifier.h"
 #include "Utils/FragmentGeometryWorker.h"
+#include "Components/InstancedStaticMeshComponent.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -1150,11 +1151,126 @@ void UFragmentsImporter::BuildSpawnQueue(const FFragmentItem& Item, AActor* Pare
 	// We'll handle parent-child relationships during spawning
 }
 
-AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes)
+AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced)
 {
+	// Initialize output parameter
+	if (bOutWasInstanced)
+	{
+		*bOutWasInstanced = false;
+	}
+
 	if (!ParentActor) return nullptr;
 
-	// Create AFragment actor
+	const TArray<FFragmentSample>& Samples = Item.Samples;
+
+	// ==========================================
+	// GPU INSTANCING: Check if ALL samples should be instanced
+	// If so, we can skip actor creation entirely and just use a proxy
+	// ==========================================
+	bool bAllSamplesInstanced = bEnableGPUInstancing && (Samples.Num() > 0);
+	int32 ValidSampleCount = 0;
+
+	if (bEnableGPUInstancing)
+	{
+		for (const FFragmentSample& Sample : Samples)
+		{
+			if (!Sample.ExtractedGeometry.bIsValid) continue;
+			ValidSampleCount++;
+
+			// Only Shell geometry supports instancing currently
+			if (!Sample.ExtractedGeometry.bIsShell)
+			{
+				bAllSamplesInstanced = false;
+				break;
+			}
+
+			const int32 RepId = Sample.RepresentationIndex;
+			const FPreExtractedGeometry& Geom = Sample.ExtractedGeometry;
+			const uint32 MatHash = HashMaterialProperties(Geom.R, Geom.G, Geom.B, Geom.A, Geom.bIsGlass);
+
+			if (!ShouldUseInstancing(RepId, MatHash))
+			{
+				bAllSamplesInstanced = false;
+				break;
+			}
+		}
+
+		// If no valid samples, don't treat as all-instanced
+		if (ValidSampleCount == 0)
+		{
+			bAllSamplesInstanced = false;
+		}
+	}
+
+	// ==========================================
+	// FULLY INSTANCED PATH: Queue for batch addition (no ISMC created yet)
+	// Actual ISMC creation happens in FinalizeAllISMCs() after spawning completes
+	// ==========================================
+	if (bAllSamplesInstanced)
+	{
+		for (int32 i = 0; i < Samples.Num(); i++)
+		{
+			const FFragmentSample& Sample = Samples[i];
+			const FPreExtractedGeometry& ExtractedGeom = Sample.ExtractedGeometry;
+
+			if (!ExtractedGeom.bIsValid) continue;
+
+			const int32 RepId = Sample.RepresentationIndex;
+			const uint32 MatHash = HashMaterialProperties(ExtractedGeom.R, ExtractedGeom.G,
+				ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+
+			// Get or create mesh from representation cache
+			UStaticMesh* Mesh = nullptr;
+			if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepId))
+			{
+				Mesh = *CachedMesh;
+			}
+			else
+			{
+				// Create new mesh
+				FString MeshName = FString::Printf(TEXT("Rep_%d"), RepId);
+				UPackage* MeshPackage = CreatePackage(*FString::Printf(TEXT("/Game/Buildings/Instanced/%s"), *MeshName));
+				Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
+				if (Mesh)
+				{
+					RepresentationMeshCache.Add(RepId, Mesh);
+					UE_LOG(LogFragments, Verbose, TEXT("GPU Instancing: Created mesh for RepId %d"), RepId);
+				}
+			}
+
+			if (!Mesh) continue;
+
+			// Get pooled material
+			UMaterialInstanceDynamic* Material = GetPooledMaterial(ExtractedGeom.R, ExtractedGeom.G,
+				ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+
+			// Compute world transform: LocalTransform * GlobalTransform
+			FTransform SampleWorldTransform = ExtractedGeom.LocalTransform * Item.GlobalTransform;
+
+			// QUEUE instance for batch addition (no ISMC created yet!)
+			// Proxies will be created in FinalizeAllISMCs()
+			QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material);
+		}
+
+		// Store null in actor lookup map to indicate this fragment exists but is instanced
+		if (ModelFragmentsMap.Contains(Item.ModelGuid))
+		{
+			ModelFragmentsMap[Item.ModelGuid].Fragments.Add(Item.LocalId, nullptr);
+		}
+
+		// Set output flag to indicate fragment was GPU instanced (no actor, but handled)
+		if (bOutWasInstanced)
+		{
+			*bOutWasInstanced = true;
+		}
+
+		// Return nullptr since no actor was created
+		return nullptr;
+	}
+
+	// ==========================================
+	// STANDARD PATH: Create AFragment actor
+	// ==========================================
 	AFragment* FragmentModel = OwnerRef->GetWorld()->SpawnActor<AFragment>(
 		AFragment::StaticClass(), Item.GlobalTransform);
 
@@ -1180,13 +1296,13 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 #endif
 
 	// Create Meshes If Sample Exists
-	const TArray<FFragmentSample>& Samples = FragmentModel->GetSamples();
+	const TArray<FFragmentSample>& ActorSamples = FragmentModel->GetSamples();
 
-	if (Samples.Num() > 0)
+	if (ActorSamples.Num() > 0)
 	{
-		for (int32 i = 0; i < Samples.Num(); i++)
+		for (int32 i = 0; i < ActorSamples.Num(); i++)
 		{
-			const FFragmentSample& Sample = Samples[i];
+			const FFragmentSample& Sample = ActorSamples[i];
 			const FPreExtractedGeometry& ExtractedGeom = Sample.ExtractedGeometry;
 
 			// Skip samples with invalid pre-extracted geometry
@@ -1197,6 +1313,52 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 				continue;
 			}
 
+			const int32 RepId = Sample.RepresentationIndex;
+			const uint32 MatHash = HashMaterialProperties(ExtractedGeom.R, ExtractedGeom.G,
+				ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+
+			// ==========================================
+			// PER-SAMPLE INSTANCING CHECK (for mixed fragments)
+			// Queue for batch addition instead of immediate ISMC creation
+			// ==========================================
+			if (bEnableGPUInstancing && ExtractedGeom.bIsShell && ShouldUseInstancing(RepId, MatHash))
+			{
+				// This sample goes to an ISMC instead of a component
+
+				// Get or create mesh
+				UStaticMesh* Mesh = nullptr;
+				if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepId))
+				{
+					Mesh = *CachedMesh;
+				}
+				else
+				{
+					FString MeshName = FString::Printf(TEXT("Rep_%d"), RepId);
+					UPackage* MeshPackage = CreatePackage(*FString::Printf(TEXT("/Game/Buildings/Instanced/%s"), *MeshName));
+					Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
+					if (Mesh)
+					{
+						RepresentationMeshCache.Add(RepId, Mesh);
+					}
+				}
+
+				if (Mesh)
+				{
+					UMaterialInstanceDynamic* Material = GetPooledMaterial(ExtractedGeom.R, ExtractedGeom.G,
+						ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+
+					FTransform SampleWorldTransform = ExtractedGeom.LocalTransform * Item.GlobalTransform;
+
+					// QUEUE for batch addition (ISMCs created in FinalizeAllISMCs)
+					QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material);
+				}
+
+				continue;  // Skip standard component creation for this sample
+			}
+
+			// ==========================================
+			// STANDARD COMPONENT CREATION PATH
+			// ==========================================
 			FString MeshName = FString::Printf(TEXT("%d_%d"), FragmentModel->GetLocalId(), i);
 			FString PackagePath = TEXT("/Game/Buildings") / FragmentModel->GetModelGuid() / MeshName;
 			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
@@ -1399,6 +1561,11 @@ void UFragmentsImporter::ProcessSpawnChunk()
 		// Spawning and async processing complete
 		UE_LOG(LogFragments, Log, TEXT("Chunked spawning complete! Total fragments: %d"), FragmentsSpawned);
 
+		// FINALIZE ALL ISMCs - batch-add all queued instances
+		// This is the key performance optimization: all instances are added at once
+		// instead of one-at-a-time which causes UE5 GPU buffer rebuilds
+		FinalizeAllISMCs();
+
 		// Clear timer
 		if (UWorld* World = GetWorld())
 		{
@@ -1427,7 +1594,8 @@ void UFragmentsImporter::ProcessSpawnChunk()
 		PendingSpawnQueue.RemoveAt(0);
 
 		// Spawn this fragment
-		AFragment* SpawnedActor = SpawnSingleFragment(Task.FragmentItem, Task.ParentActor, CurrentMeshesRef, bCurrentSaveMeshes);
+		bool bWasInstanced = false;
+		AFragment* SpawnedActor = SpawnSingleFragment(Task.FragmentItem, Task.ParentActor, CurrentMeshesRef, bCurrentSaveMeshes, &bWasInstanced);
 
 		if (SpawnedActor)
 		{
@@ -1435,6 +1603,16 @@ void UFragmentsImporter::ProcessSpawnChunk()
 			for (FFragmentItem* Child : Task.FragmentItem.FragmentChildren)
 			{
 				PendingSpawnQueue.Add(FFragmentSpawnTask(*Child, SpawnedActor));
+				TotalFragmentsToSpawn++;
+			}
+		}
+		else if (bWasInstanced && Task.FragmentItem.FragmentChildren.Num() > 0)
+		{
+			// Fragment was GPU instanced but has children - add them with original parent
+			// (This is rare for BIM models since instanced elements are usually leaf nodes)
+			for (FFragmentItem* Child : Task.FragmentItem.FragmentChildren)
+			{
+				PendingSpawnQueue.Add(FFragmentSpawnTask(*Child, Task.ParentActor));
 				TotalFragmentsToSpawn++;
 			}
 		}
@@ -3087,6 +3265,65 @@ void UFragmentsImporter::PreExtractAllGeometry(FFragmentItem& RootItem, const Me
 	{
 		UE_LOG(LogFragments, Warning, TEXT("Some geometry extractions failed. These fragments will be skipped during spawn."));
 	}
+
+	// ==========================================
+	// GPU INSTANCING: Count instances per RepresentationId + Material combination
+	// This runs AFTER geometry extraction so we have access to pre-extracted material data
+	// ==========================================
+	RepresentationMaterialInstanceCount.Empty();
+	{
+		TArray<FFragmentItem*> CountStack;
+		CountStack.Add(&RootItem);
+
+		while (CountStack.Num() > 0)
+		{
+			FFragmentItem* CurrentItem = CountStack.Pop();
+			if (!CurrentItem) continue;
+
+			for (const FFragmentSample& Sample : CurrentItem->Samples)
+			{
+				// Only count samples with valid pre-extracted geometry
+				if (Sample.RepresentationIndex >= 0 && Sample.ExtractedGeometry.bIsValid)
+				{
+					// Compute material hash from pre-extracted geometry data
+					const FPreExtractedGeometry& Geom = Sample.ExtractedGeometry;
+					uint32 MatHash = HashMaterialProperties(Geom.R, Geom.G, Geom.B, Geom.A, Geom.bIsGlass);
+					int64 ComboKey = ((int64)Sample.RepresentationIndex) | ((int64)MatHash << 32);
+
+					int32& Count = RepresentationMaterialInstanceCount.FindOrAdd(ComboKey);
+					Count++;
+				}
+			}
+
+			// Add children to count stack
+			for (FFragmentItem* Child : CurrentItem->FragmentChildren)
+			{
+				if (Child) CountStack.Add(Child);
+			}
+		}
+	}
+
+	// Log instancing analysis
+	int32 InstanceableCount = 0;
+	int32 UniqueInstanceableGroups = 0;
+	for (const auto& Pair : RepresentationMaterialInstanceCount)
+	{
+		if (Pair.Value >= InstancingThreshold)
+		{
+			InstanceableCount += Pair.Value;
+			UniqueInstanceableGroups++;
+		}
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("=== GPU INSTANCING ANALYSIS ==="));
+	UE_LOG(LogFragments, Log, TEXT("Instancing threshold: %d instances"), InstancingThreshold);
+	UE_LOG(LogFragments, Log, TEXT("Total unique RepId+Material combinations: %d"), RepresentationMaterialInstanceCount.Num());
+	UE_LOG(LogFragments, Log, TEXT("Groups meeting threshold: %d"), UniqueInstanceableGroups);
+	UE_LOG(LogFragments, Log, TEXT("Fragments eligible for instancing: %d"), InstanceableCount);
+	UE_LOG(LogFragments, Log, TEXT("Estimated draw call reduction: %d -> %d (%.1f%%)"),
+		SuccessfulExtractions,
+		SuccessfulExtractions - InstanceableCount + UniqueInstanceableGroups,
+		InstanceableCount > 0 ? ((float)(InstanceableCount - UniqueInstanceableGroups) / SuccessfulExtractions * 100.0f) : 0.0f);
 }
 
 bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId)
@@ -3343,4 +3580,547 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Unknown representation class %d for item %d"),
 		static_cast<int32>(representation->representation_class()), ItemLocalId);
 	return false;
+}
+
+// ==========================================
+// GPU INSTANCING METHODS (Phase 4)
+// ==========================================
+
+bool UFragmentsImporter::ShouldUseInstancing(int32 RepresentationId, uint32 MaterialHash) const
+{
+	if (!bEnableGPUInstancing)
+	{
+		return false;
+	}
+
+	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
+	if (const int32* Count = RepresentationMaterialInstanceCount.Find(ComboKey))
+	{
+		return *Count >= InstancingThreshold;
+	}
+	return false;
+}
+
+UInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
+	int32 RepresentationId, uint32 MaterialHash,
+	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material)
+{
+	if (!Mesh)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("GetOrCreateISMC: Mesh is null for RepId=%d"), RepresentationId);
+		return nullptr;
+	}
+
+	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
+
+	// Check if ISMC already exists for this combination
+	if (FInstancedMeshGroup* Existing = InstancedMeshGroups.Find(ComboKey))
+	{
+		return Existing->ISMC;
+	}
+
+	// Create host actor if needed (single actor holds all ISMCs for organization)
+	if (!ISMCHostActor && OwnerRef)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = OwnerRef;
+		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
+			FTransform::Identity, SpawnParams);
+
+		if (ISMCHostActor)
+		{
+#if WITH_EDITOR
+			ISMCHostActor->SetActorLabel(TEXT("FragmentISMCHost"));
+#endif
+			UE_LOG(LogFragments, Log, TEXT("Created ISMC host actor"));
+		}
+	}
+
+	if (!ISMCHostActor)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("GetOrCreateISMC: Failed to create host actor"));
+		return nullptr;
+	}
+
+	// Create new ISMC
+	UInstancedStaticMeshComponent* ISMC = NewObject<UInstancedStaticMeshComponent>(ISMCHostActor);
+	if (!ISMC)
+	{
+		UE_LOG(LogFragments, Error, TEXT("GetOrCreateISMC: Failed to create ISMC for RepId=%d"), RepresentationId);
+		return nullptr;
+	}
+
+	ISMC->SetStaticMesh(Mesh);
+	if (Material)
+	{
+		ISMC->SetMaterial(0, Material);
+	}
+	ISMC->SetMobility(EComponentMobility::Static);
+
+	// Disable Lumen/Distance Field to avoid "Preparing mesh distance fields" delays
+	ISMC->bAffectDistanceFieldLighting = false;
+	ISMC->bAffectDynamicIndirectLighting = false;
+	ISMC->bAffectIndirectLightingWhileHidden = false;
+
+	// CRITICAL: Disable shadow casting - this was causing 280ms+ Shadow Depths overhead!
+	// Instanced furniture/repeated elements typically don't need per-instance shadows
+	ISMC->SetCastShadow(false);
+	ISMC->bCastDynamicShadow = false;
+	ISMC->bCastStaticShadow = false;
+
+	// Store LocalId in custom data for picking support
+	ISMC->NumCustomDataFloats = 1;
+
+	// Default: most instanced elements are furniture, not occluders
+	ISMC->bUseAsOccluder = false;
+
+	// Attach and register
+	ISMC->AttachToComponent(ISMCHostActor->GetRootComponent(),
+		FAttachmentTransformRules::KeepRelativeTransform);
+	ISMC->RegisterComponent();
+	ISMCHostActor->AddInstanceComponent(ISMC);
+
+	// Create and store the group
+	FInstancedMeshGroup Group;
+	Group.ISMC = ISMC;
+	Group.RepresentationId = RepresentationId;
+	Group.MaterialHash = MaterialHash;
+	Group.InstanceCount = 0;
+	InstancedMeshGroups.Add(ComboKey, Group);
+
+	UE_LOG(LogFragments, Log, TEXT("Created ISMC for RepId=%d, MatHash=%u"), RepresentationId, MaterialHash);
+	return ISMC;
+}
+
+void UFragmentsImporter::QueueInstanceForBatchAdd(int32 RepresentationId, uint32 MaterialHash,
+	const FTransform& WorldTransform, const FFragmentItem& Item,
+	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material)
+{
+	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
+
+	// Check if ISMC already exists (from previous incremental finalization)
+	FInstancedMeshGroup* ExistingGroup = InstancedMeshGroups.Find(ComboKey);
+	if (ExistingGroup && ExistingGroup->ISMC != nullptr)
+	{
+		// ISMC already exists - add directly to it instead of queuing
+		// This handles the TileManager streaming case where ISMC was finalized earlier
+		AddInstanceToExistingISMC(RepresentationId, MaterialHash, WorldTransform, Item, Mesh, Material);
+		return;
+	}
+
+	// Get or create group (but DON'T create ISMC yet - that happens in FinalizeAllISMCs or incrementally)
+	FInstancedMeshGroup& Group = InstancedMeshGroups.FindOrAdd(ComboKey);
+	Group.RepresentationId = RepresentationId;
+	Group.MaterialHash = MaterialHash;
+	Group.CachedMesh = Mesh;
+	Group.CachedMaterial = Material;
+
+	// Queue the instance data for batch addition later
+	Group.PendingInstances.Emplace(WorldTransform, Item.LocalId, Item.Guid, Item.Category, Item.ModelGuid, Item.Attributes);
+	TotalPendingInstances++;
+
+	// ==========================================
+	// INCREMENTAL FINALIZATION: Prevent OOM on large models
+	// ==========================================
+
+	// Check 1: If this group has too many pending instances, finalize it now
+	if (IncrementalFinalizationThreshold > 0 &&
+		Group.PendingInstances.Num() >= IncrementalFinalizationThreshold)
+	{
+		UE_LOG(LogFragments, Log, TEXT("Incremental finalization triggered: RepId=%d has %d pending instances (threshold=%d)"),
+			RepresentationId, Group.PendingInstances.Num(), IncrementalFinalizationThreshold);
+		FinalizeISMCGroup(ComboKey, Group);
+		return;
+	}
+
+	// Check 2: If total pending instances exceed the global limit, finalize largest groups
+	if (MaxPendingInstancesTotal > 0 && TotalPendingInstances >= MaxPendingInstancesTotal)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("Global pending limit reached: %d instances (limit=%d) - finalizing groups"),
+			TotalPendingInstances, MaxPendingInstancesTotal);
+
+		// Find and finalize groups with the most pending instances until under limit
+		while (TotalPendingInstances >= MaxPendingInstancesTotal * 0.8) // Target 80% to give headroom
+		{
+			int64 LargestKey = 0;
+			int32 LargestCount = 0;
+
+			for (auto& Pair : InstancedMeshGroups)
+			{
+				if (Pair.Value.ISMC == nullptr && Pair.Value.PendingInstances.Num() > LargestCount)
+				{
+					LargestKey = Pair.Key;
+					LargestCount = Pair.Value.PendingInstances.Num();
+				}
+			}
+
+			if (LargestCount == 0)
+			{
+				break; // No more groups to finalize
+			}
+
+			FInstancedMeshGroup& LargestGroup = InstancedMeshGroups[LargestKey];
+			FinalizeISMCGroup(LargestKey, LargestGroup);
+		}
+	}
+}
+
+void UFragmentsImporter::FinalizeAllISMCs()
+{
+	if (InstancedMeshGroups.Num() == 0)
+	{
+		UE_LOG(LogFragments, Log, TEXT("FinalizeAllISMCs: No ISMC groups to finalize"));
+		return;
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("=== FINALIZING ISMCs: %d groups ==="), InstancedMeshGroups.Num());
+
+	// Create host actor if needed
+	if (!ISMCHostActor && OwnerRef)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = OwnerRef;
+		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
+			FTransform::Identity, SpawnParams);
+		if (ISMCHostActor)
+		{
+#if WITH_EDITOR
+			ISMCHostActor->SetActorLabel(TEXT("FragmentISMCHost"));
+#endif
+		}
+	}
+
+	if (!ISMCHostActor)
+	{
+		UE_LOG(LogFragments, Error, TEXT("FinalizeAllISMCs: Failed to create host actor"));
+		return;
+	}
+
+	int32 TotalInstancesAdded = 0;
+	int32 TotalISMCsCreated = 0;
+
+	for (auto& Pair : InstancedMeshGroups)
+	{
+		FInstancedMeshGroup& Group = Pair.Value;
+
+		// Skip already-finalized groups (from incremental finalization)
+		if (Group.ISMC != nullptr)
+		{
+			UE_LOG(LogFragments, Verbose, TEXT("FinalizeAllISMCs: Skipping already-finalized group RepId=%d (%d instances)"),
+				Group.RepresentationId, Group.InstanceCount);
+			continue;
+		}
+
+		if (Group.PendingInstances.Num() == 0)
+		{
+			continue;
+		}
+
+		if (!Group.CachedMesh)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("FinalizeAllISMCs: No cached mesh for RepId=%d"), Group.RepresentationId);
+			continue;
+		}
+
+		// Create ISMC (NOT registered yet - we'll register after adding all instances)
+		UInstancedStaticMeshComponent* ISMC = NewObject<UInstancedStaticMeshComponent>(ISMCHostActor);
+		if (!ISMC)
+		{
+			UE_LOG(LogFragments, Error, TEXT("FinalizeAllISMCs: Failed to create ISMC for RepId=%d"), Group.RepresentationId);
+			continue;
+		}
+
+		ISMC->SetStaticMesh(Group.CachedMesh);
+		if (Group.CachedMaterial)
+		{
+			ISMC->SetMaterial(0, Group.CachedMaterial);
+		}
+		ISMC->SetMobility(EComponentMobility::Static);
+
+		// Disable expensive features
+		ISMC->bAffectDistanceFieldLighting = false;
+		ISMC->bAffectDynamicIndirectLighting = false;
+		ISMC->bAffectIndirectLightingWhileHidden = false;
+		ISMC->SetCastShadow(false);
+		ISMC->bCastDynamicShadow = false;
+		ISMC->bCastStaticShadow = false;
+		ISMC->bUseAsOccluder = false;
+
+		// Custom data for picking
+		ISMC->NumCustomDataFloats = 1;
+
+		// Attach to host (still not registered)
+		ISMC->AttachToComponent(ISMCHostActor->GetRootComponent(),
+			FAttachmentTransformRules::KeepRelativeTransform);
+
+		// Build transform array for batch add
+		TArray<FTransform> Transforms;
+		Transforms.Reserve(Group.PendingInstances.Num());
+		for (const FPendingInstanceData& Pending : Group.PendingInstances)
+		{
+			Transforms.Add(Pending.WorldTransform);
+		}
+
+		// BATCH ADD ALL INSTANCES AT ONCE (this is the key optimization!)
+		// This avoids the UE5 per-instance GPU buffer rebuild issue
+		TArray<int32> NewIndices = ISMC->AddInstances(Transforms, /*bShouldReturnIndices=*/true, /*bWorldSpace=*/true);
+
+		// NOW register the component (after all instances are added)
+		ISMC->RegisterComponent();
+		ISMCHostActor->AddInstanceComponent(ISMC);
+
+		// Set custom data and build lookup maps (after registration, with dirty marking disabled)
+		for (int32 i = 0; i < Group.PendingInstances.Num(); i++)
+		{
+			const FPendingInstanceData& Pending = Group.PendingInstances[i];
+			int32 InstanceIndex = (i < NewIndices.Num()) ? NewIndices[i] : i;
+
+			// Store LocalId in custom data
+			ISMC->SetCustomDataValue(InstanceIndex, 0, static_cast<float>(Pending.LocalId), /*bMarkRenderStateDirty=*/false);
+
+			// Update lookup maps
+			Group.InstanceToLocalId.Add(InstanceIndex, Pending.LocalId);
+			Group.LocalIdToInstance.Add(Pending.LocalId, InstanceIndex);
+
+			// Create proxy for this instance
+			FFragmentProxy Proxy;
+			Proxy.ISMC = ISMC;
+			Proxy.InstanceIndex = InstanceIndex;
+			Proxy.LocalId = Pending.LocalId;
+			Proxy.GlobalId = Pending.GlobalId;
+			Proxy.Category = Pending.Category;
+			Proxy.ModelGuid = Pending.ModelGuid;
+			Proxy.Attributes = Pending.Attributes;
+			Proxy.WorldTransform = Pending.WorldTransform;
+			LocalIdToProxyMap.Add(Pending.LocalId, Proxy);
+		}
+
+		// Mark render state dirty once for all custom data
+		ISMC->MarkRenderStateDirty();
+
+		Group.ISMC = ISMC;
+		Group.InstanceCount = Group.PendingInstances.Num();
+
+		TotalInstancesAdded += Group.PendingInstances.Num();
+		TotalISMCsCreated++;
+
+		// Clear pending instances to free memory
+		Group.PendingInstances.Empty();
+
+		UE_LOG(LogFragments, Log, TEXT("Created ISMC for RepId=%d with %d instances"),
+			Group.RepresentationId, Group.InstanceCount);
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("=== ISMC FINALIZATION COMPLETE: %d ISMCs, %d total instances ==="),
+		TotalISMCsCreated, TotalInstancesAdded);
+
+	// Reset pending counter
+	TotalPendingInstances = 0;
+}
+
+int32 UFragmentsImporter::FinalizeISMCGroup(int64 ComboKey, FInstancedMeshGroup& Group)
+{
+	// Skip if already finalized or no pending instances
+	if (Group.ISMC != nullptr || Group.PendingInstances.Num() == 0)
+	{
+		return 0;
+	}
+
+	// Ensure host actor exists
+	if (!ISMCHostActor && OwnerRef)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = OwnerRef;
+		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
+			FTransform::Identity, SpawnParams);
+		if (ISMCHostActor)
+		{
+#if WITH_EDITOR
+			ISMCHostActor->SetActorLabel(TEXT("FragmentISMCHost"));
+#endif
+		}
+	}
+
+	if (!ISMCHostActor)
+	{
+		UE_LOG(LogFragments, Error, TEXT("FinalizeISMCGroup: Failed to create host actor"));
+		return -1;
+	}
+
+	if (!Group.CachedMesh)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("FinalizeISMCGroup: No cached mesh for RepId=%d"), Group.RepresentationId);
+		return -1;
+	}
+
+	// Create ISMC (NOT registered yet - we'll register after adding all instances)
+	UInstancedStaticMeshComponent* ISMC = NewObject<UInstancedStaticMeshComponent>(ISMCHostActor);
+	if (!ISMC)
+	{
+		UE_LOG(LogFragments, Error, TEXT("FinalizeISMCGroup: Failed to create ISMC for RepId=%d"), Group.RepresentationId);
+		return -1;
+	}
+
+	ISMC->SetStaticMesh(Group.CachedMesh);
+	if (Group.CachedMaterial)
+	{
+		ISMC->SetMaterial(0, Group.CachedMaterial);
+	}
+	ISMC->SetMobility(EComponentMobility::Static);
+
+	// Disable expensive features
+	ISMC->bAffectDistanceFieldLighting = false;
+	ISMC->bAffectDynamicIndirectLighting = false;
+	ISMC->bAffectIndirectLightingWhileHidden = false;
+	ISMC->SetCastShadow(false);
+	ISMC->bCastDynamicShadow = false;
+	ISMC->bCastStaticShadow = false;
+	ISMC->bUseAsOccluder = false;
+
+	// Custom data for picking
+	ISMC->NumCustomDataFloats = 1;
+
+	// Attach to host (still not registered)
+	ISMC->AttachToComponent(ISMCHostActor->GetRootComponent(),
+		FAttachmentTransformRules::KeepRelativeTransform);
+
+	// Build transform array for batch add
+	TArray<FTransform> Transforms;
+	Transforms.Reserve(Group.PendingInstances.Num());
+	for (const FPendingInstanceData& Pending : Group.PendingInstances)
+	{
+		Transforms.Add(Pending.WorldTransform);
+	}
+
+	// BATCH ADD ALL INSTANCES AT ONCE
+	TArray<int32> NewIndices = ISMC->AddInstances(Transforms, /*bShouldReturnIndices=*/true, /*bWorldSpace=*/true);
+
+	// NOW register the component (after all instances are added)
+	ISMC->RegisterComponent();
+	ISMCHostActor->AddInstanceComponent(ISMC);
+
+	// Set custom data and build lookup maps
+	for (int32 i = 0; i < Group.PendingInstances.Num(); i++)
+	{
+		const FPendingInstanceData& Pending = Group.PendingInstances[i];
+		int32 InstanceIndex = (i < NewIndices.Num()) ? NewIndices[i] : i;
+
+		// Store LocalId in custom data
+		ISMC->SetCustomDataValue(InstanceIndex, 0, static_cast<float>(Pending.LocalId), /*bMarkRenderStateDirty=*/false);
+
+		// Update lookup maps
+		Group.InstanceToLocalId.Add(InstanceIndex, Pending.LocalId);
+		Group.LocalIdToInstance.Add(Pending.LocalId, InstanceIndex);
+
+		// Create proxy for this instance
+		FFragmentProxy Proxy;
+		Proxy.ISMC = ISMC;
+		Proxy.InstanceIndex = InstanceIndex;
+		Proxy.LocalId = Pending.LocalId;
+		Proxy.GlobalId = Pending.GlobalId;
+		Proxy.Category = Pending.Category;
+		Proxy.ModelGuid = Pending.ModelGuid;
+		Proxy.Attributes = Pending.Attributes;
+		Proxy.WorldTransform = Pending.WorldTransform;
+		LocalIdToProxyMap.Add(Pending.LocalId, Proxy);
+	}
+
+	// Mark render state dirty once for all custom data
+	ISMC->MarkRenderStateDirty();
+
+	Group.ISMC = ISMC;
+	int32 InstancesAdded = Group.PendingInstances.Num();
+	Group.InstanceCount = InstancesAdded;
+
+	// Update pending counter
+	TotalPendingInstances -= InstancesAdded;
+	TotalPendingInstances = FMath::Max(0, TotalPendingInstances);
+
+	// Clear pending instances to free memory
+	Group.PendingInstances.Empty();
+	Group.PendingInstances.Shrink();  // Release allocated memory
+
+	UE_LOG(LogFragments, Log, TEXT("FinalizeISMCGroup: Created ISMC for RepId=%d with %d instances (incremental)"),
+		Group.RepresentationId, InstancesAdded);
+
+	return InstancesAdded;
+}
+
+bool UFragmentsImporter::AddInstanceToExistingISMC(int32 RepresentationId, uint32 MaterialHash,
+	const FTransform& WorldTransform, const FFragmentItem& Item,
+	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material)
+{
+	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
+
+	FInstancedMeshGroup* Group = InstancedMeshGroups.Find(ComboKey);
+	if (!Group || !Group->ISMC)
+	{
+		// ISMC not yet created - queue for batch addition instead
+		QueueInstanceForBatchAdd(RepresentationId, MaterialHash, WorldTransform, Item, Mesh, Material);
+		return false;
+	}
+
+	UInstancedStaticMeshComponent* ISMC = Group->ISMC;
+	if (!ISMC || !IsValid(ISMC))
+	{
+		UE_LOG(LogFragments, Warning, TEXT("AddInstanceToExistingISMC: ISMC invalid for RepId=%d"), RepresentationId);
+		return false;
+	}
+
+	// Add single instance to existing ISMC
+	// Note: This is less efficient than batch add, but necessary for streaming
+	int32 NewIndex = ISMC->AddInstance(WorldTransform, /*bWorldSpace=*/true);
+	if (NewIndex == INDEX_NONE)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("AddInstanceToExistingISMC: Failed to add instance for RepId=%d"), RepresentationId);
+		return false;
+	}
+
+	// Set custom data
+	ISMC->SetCustomDataValue(NewIndex, 0, static_cast<float>(Item.LocalId), /*bMarkRenderStateDirty=*/true);
+
+	// Update lookup maps
+	Group->InstanceToLocalId.Add(NewIndex, Item.LocalId);
+	Group->LocalIdToInstance.Add(Item.LocalId, NewIndex);
+	Group->InstanceCount++;
+
+	// Create proxy
+	FFragmentProxy Proxy;
+	Proxy.ISMC = ISMC;
+	Proxy.InstanceIndex = NewIndex;
+	Proxy.LocalId = Item.LocalId;
+	Proxy.GlobalId = Item.Guid;
+	Proxy.Category = Item.Category;
+	Proxy.ModelGuid = Item.ModelGuid;
+	Proxy.Attributes = Item.Attributes;
+	Proxy.WorldTransform = WorldTransform;
+	LocalIdToProxyMap.Add(Item.LocalId, Proxy);
+
+	return true;
+}
+
+FFindResult UFragmentsImporter::FindFragmentByLocalIdUnified(int32 LocalId, const FString& ModelGuid)
+{
+	// Check proxy map first (instanced fragments)
+	if (FFragmentProxy* Proxy = LocalIdToProxyMap.Find(LocalId))
+	{
+		if (Proxy->ModelGuid == ModelGuid)
+		{
+			return FFindResult::FromProxy(*Proxy);
+		}
+	}
+
+	// Check actor map (non-instanced fragments)
+	if (FFragmentLookup* Lookup = ModelFragmentsMap.Find(ModelGuid))
+	{
+		if (AFragment** Actor = Lookup->Fragments.Find(LocalId))
+		{
+			if (*Actor)
+			{
+				return FFindResult::FromActor(*Actor);
+			}
+		}
+	}
+
+	return FFindResult::NotFound();
 }

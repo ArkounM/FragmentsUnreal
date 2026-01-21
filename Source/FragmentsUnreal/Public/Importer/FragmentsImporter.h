@@ -55,6 +55,76 @@ public:
 	TArray<FItemAttribute> GetItemPropertySets(AFragment* InFragment);
 	AFragment* GetItemByLocalId(int32 LocalId, const FString& ModelGuid);
 	FFragmentItem* GetFragmentItemByLocalId(int32 LocalId, const FString& InModelGuid);
+
+	// ==========================================
+	// GPU INSTANCING API (Phase 4)
+	// ==========================================
+
+	/**
+	 * Unified lookup by LocalId - works for both actors and instanced proxies.
+	 * @param LocalId The BIM element's local ID
+	 * @param ModelGuid The model GUID
+	 * @return FFindResult containing either an actor or proxy data
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Fragments")
+	FFindResult FindFragmentByLocalIdUnified(int32 LocalId, const FString& ModelGuid);
+
+	/**
+	 * Check if a representation+material combination should use GPU instancing.
+	 * @return true if instance count >= InstancingThreshold
+	 */
+	bool ShouldUseInstancing(int32 RepresentationId, uint32 MaterialHash) const;
+
+	/**
+	 * Get or create an ISMC for a representation+material combination.
+	 * @param RepresentationId The FlatBuffers representation ID (unique geometry)
+	 * @param MaterialHash Hash of material properties
+	 * @param Mesh The static mesh to use for this ISMC
+	 * @param Material The material instance to apply
+	 * @return The ISMC (existing or newly created), or nullptr on failure
+	 */
+	UInstancedStaticMeshComponent* GetOrCreateISMC(int32 RepresentationId, uint32 MaterialHash,
+		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material);
+
+	/**
+	 * Queue an instance to be batch-added later (during spawn phase).
+	 * Instances are collected in PendingInstances arrays and batch-added
+	 * when FinalizeAllISMCs() is called after spawning completes.
+	 */
+	void QueueInstanceForBatchAdd(int32 RepresentationId, uint32 MaterialHash,
+		const FTransform& WorldTransform, const FFragmentItem& Item,
+		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material);
+
+	/**
+	 * Finalize all ISMCs by batch-adding all pending instances.
+	 * Called once after all fragment spawning is complete.
+	 * This avoids the UE5 performance issue of per-instance GPU buffer rebuilds.
+	 */
+	void FinalizeAllISMCs();
+
+	/**
+	 * Finalize a single ISMC group by batch-adding its pending instances.
+	 * Used for incremental finalization when pending count exceeds threshold.
+	 * @param ComboKey The RepresentationId + MaterialHash key
+	 * @param Group The ISMC group to finalize
+	 * @return Number of instances added, or -1 on failure
+	 */
+	int32 FinalizeISMCGroup(int64 ComboKey, FInstancedMeshGroup& Group);
+
+	/**
+	 * Add a single instance to an existing (already finalized) ISMC.
+	 * Used by TileManager streaming path for incremental instance addition.
+	 * @param RepresentationId The geometry representation ID
+	 * @param MaterialHash Hash of material properties
+	 * @param WorldTransform Transform for the new instance
+	 * @param Item Fragment item data for proxy creation
+	 * @param Mesh The static mesh (must match existing ISMC mesh)
+	 * @param Material The material instance
+	 * @return true if instance was added successfully
+	 */
+	bool AddInstanceToExistingISMC(int32 RepresentationId, uint32 MaterialHash,
+		const FTransform& WorldTransform, const FFragmentItem& Item,
+		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material);
 	FString LoadFragment(const FString& FragPath);
 	void ProcessLoadedFragment(const FString& ModelGuid, AActor* InOwnerRef, bool bInSaveMesh);
 	TArray<int32> GetElementsByCategory(const FString& InCategory, const FString& ModelGuid);
@@ -94,7 +164,8 @@ public:
 	}
 
 	// Spawn a single fragment actor with its geometry (public for TileManager access)
-	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes);
+	// @param bOutWasInstanced Optional output - set to true if fragment was handled via GPU instancing (no actor created)
+	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced = nullptr);
 
 	UPROPERTY()
 	UGeometryDeduplicationManager* DeduplicationManager;
@@ -359,6 +430,47 @@ private:
 
 	/** Get or create pooled material instance */
 	UMaterialInstanceDynamic* GetPooledMaterial(uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass);
+
+	// ==========================================
+	// GPU INSTANCING MEMBERS (Phase 4)
+	// ==========================================
+
+	/** Instancing threshold - use ISMC if >= this many instances share the same representation+material */
+	int32 InstancingThreshold = 10;
+
+	/** Enable/disable GPU instancing (can be toggled for debugging) */
+	bool bEnableGPUInstancing = true;
+
+	/** Threshold for incremental ISMC finalization. When pending instances exceed this,
+	 *  finalize the group immediately to prevent OOM. Set to 0 to disable incremental finalization. */
+	int32 IncrementalFinalizationThreshold = 500;
+
+	/** Maximum pending instances across all groups before forced finalization.
+	 *  This is a memory safety limit to prevent OOM on large models. */
+	int32 MaxPendingInstancesTotal = 50000;
+
+	/** Current total pending instances across all groups (for memory tracking) */
+	int32 TotalPendingInstances = 0;
+
+	/** Count of instances per RepresentationId + MaterialHash combination.
+	 *  Key = (int64)RepresentationId | ((int64)MaterialHash << 32)
+	 *  Built during PreExtractAllGeometry, used during spawn to decide instancing. */
+	TMap<int64, int32> RepresentationMaterialInstanceCount;
+
+	/** ISMC groups keyed by RepresentationId + MaterialHash.
+	 *  Each group contains one ISMC with all instances sharing that geometry+material. */
+	UPROPERTY()
+	TMap<int64, FInstancedMeshGroup> InstancedMeshGroups;
+
+	/** Proxy map for instanced fragments (LocalId -> proxy data).
+	 *  Used for lookups on fragments that don't have AFragment actors. */
+	UPROPERTY()
+	TMap<int32, FFragmentProxy> LocalIdToProxyMap;
+
+	/** Host actor for ISMC components.
+	 *  All ISMCs are attached to this single actor for organization. */
+	UPROPERTY()
+	AActor* ISMCHostActor = nullptr;
 
 public:
 

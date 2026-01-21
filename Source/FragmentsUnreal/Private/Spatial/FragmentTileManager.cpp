@@ -255,6 +255,15 @@ void UFragmentTileManager::ProcessSpawnChunk()
 	// Update occlusion tracking based on render results
 	UpdateOcclusionTracking();
 
+	// Finalize any pending ISMCs periodically during streaming
+	// This is called when spawning happened this frame to ensure ISMCs are created
+	// even if individual group thresholds aren't reached. The function is fast
+	// since it skips already-finalized groups.
+	if (Importer && SpawnedThisFrame > 0)
+	{
+		Importer->FinalizeAllISMCs();
+	}
+
 	// Update loading stage
 	if (FragmentsSpawned < TotalFragmentsToSpawn)
 	{
@@ -381,11 +390,13 @@ bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
 		}
 	}
 
-	// Spawn fragment
-	AFragment* SpawnedActor = Importer->SpawnSingleFragment(*FragmentItem, ParentActor, MeshesRef, false);
+	// Spawn fragment - pass bWasInstanced to track GPU instanced fragments
+	bool bWasInstanced = false;
+	AFragment* SpawnedActor = Importer->SpawnSingleFragment(*FragmentItem, ParentActor, MeshesRef, false, &bWasInstanced);
 
 	if (SpawnedActor)
 	{
+		// Standard actor-based fragment
 		SpawnedFragments.Add(LocalId);
 		SpawnedFragmentActors.Add(LocalId, SpawnedActor);
 
@@ -398,6 +409,17 @@ bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
 
 		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Spawned fragment LocalId %d (%lld KB)"),
 		       LocalId, FragmentMemory / 1024);
+		return true;
+	}
+	else if (bWasInstanced)
+	{
+		// Fragment was GPU instanced - track it as spawned (no actor, just ISMC instance)
+		// CRITICAL: Must track to prevent re-spawning every frame (memory leak!)
+		SpawnedFragments.Add(LocalId);
+		// Don't add to SpawnedFragmentActors since there's no actor
+		// Memory is tracked by the ISMC, not per-fragment
+
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Spawned GPU-instanced fragment LocalId %d (no actor)"), LocalId);
 		return true;
 	}
 
