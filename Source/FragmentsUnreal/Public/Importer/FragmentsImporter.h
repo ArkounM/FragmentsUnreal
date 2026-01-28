@@ -6,6 +6,7 @@
 #include "UObject/NoExportTypes.h"
 #include "Index/index_generated.h"
 #include "Utils/FragmentsUtils.h"
+#include "Utils/FrameBudgetCoordinator.h"
 #include "Importer/DeferredPackageSaveManager.h"
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
 #include "Optimization/GeometryDeduplicationManager.h"
@@ -170,7 +171,9 @@ public:
 
 	// Spawn a single fragment actor with its geometry (public for TileManager access)
 	// @param bOutWasInstanced Optional output - set to true if fragment was handled via GPU instancing (no actor created)
-	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced = nullptr);
+	// @param RemainingBudgetMs Optional budget - if provided and exceeded, spawning stops early. Pass nullptr for unlimited.
+	// @param OutSamplesProcessed Optional output - number of samples actually processed (for partial spawn tracking)
+	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced = nullptr, float* RemainingBudgetMs = nullptr, int32* OutSamplesProcessed = nullptr);
 
 	UPROPERTY()
 	UGeometryDeduplicationManager* DeduplicationManager;
@@ -244,8 +247,12 @@ private:
 	/** Shutdown the geometry worker pool */
 	void ShutdownWorkerPool();
 
-	/** Process completed geometry work items within frame budget */
-	void ProcessCompletedGeometry();
+	/**
+	 * Process completed geometry work items within frame budget.
+	 * @param BudgetMs Budget in milliseconds (-1.0 to use default GeometryProcessingBudgetMs)
+	 * @return Actual time spent processing in milliseconds
+	 */
+	float ProcessCompletedGeometry(float BudgetMs = -1.0f);
 
 	/** Create a UStaticMesh from raw geometry data (game thread only) */
 	UStaticMesh* CreateMeshFromRawData(const FRawGeometryData& GeometryData, UObject* OuterRef);
@@ -408,8 +415,52 @@ private:
 	// The sync path works correctly. Need to investigate why TileManager's MeshesRef differs.
 	bool bUseAsyncGeometryProcessing = false;
 
-	/** Frame budget for processing completed geometry (milliseconds) */
+	/** Frame budget for processing completed geometry (milliseconds) - legacy fallback */
 	float GeometryProcessingBudgetMs = 4.0f;
+
+	// ==========================================
+	// FRAME BUDGET COORDINATION
+	// ==========================================
+
+	/** Frame budget coordinator for unified time budgeting across geometry and spawning */
+	FFrameBudgetCoordinator FrameBudgetCoordinator;
+
+	/** Total frame budget in milliseconds across all processing (geometry + spawning) */
+	UPROPERTY(EditAnywhere, Category = "Fragments|Performance", meta = (ClampMin = "1.0", ClampMax = "16.0"))
+	float TotalFrameBudgetMs = 4.0f;
+
+	/** Ratio of total budget allocated to geometry processing (0.0 to 1.0) */
+	UPROPERTY(EditAnywhere, Category = "Fragments|Performance", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float GeometryBudgetRatio = 0.5f;
+
+	/** Minimum budget threshold - skip phase if allocation would be below this (ms) */
+	UPROPERTY(EditAnywhere, Category = "Fragments|Performance", meta = (ClampMin = "0.1", ClampMax = "2.0"))
+	float MinimumBudgetThresholdMs = 0.5f;
+
+	/** Enable adaptive budget adjustment based on actual frame times */
+	UPROPERTY(EditAnywhere, Category = "Fragments|Performance")
+	bool bEnableAdaptiveBudget = true;
+
+	/** Maximum number of NEW mesh creations per frame (cache hits are unlimited).
+	 *  Lower values = smoother frame rate during initial load, but slower overall.
+	 *  Set to 0 for unlimited. */
+	UPROPERTY(EditAnywhere, Category = "Fragments|Performance", meta = (ClampMin = "0", ClampMax = "100"))
+	int32 MaxNewMeshCreationsPerFrame = 1;
+
+	/** Counter for new mesh creations this frame (reset in ProcessAllTileManagerChunks) */
+	int32 NewMeshCreationsThisFrame = 0;
+
+	/** Check if we can create another new mesh this frame */
+	FORCEINLINE bool CanCreateNewMesh() const
+	{
+		return (MaxNewMeshCreationsPerFrame == 0) || (NewMeshCreationsThisFrame < MaxNewMeshCreationsPerFrame);
+	}
+
+	/** Increment the new mesh creation counter */
+	FORCEINLINE void OnNewMeshCreated()
+	{
+		NewMeshCreationsThisFrame++;
+	}
 
 	/** Map of pending fragments waiting for geometry completion */
 	struct FPendingFragmentData

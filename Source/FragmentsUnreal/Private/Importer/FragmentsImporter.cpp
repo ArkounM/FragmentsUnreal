@@ -1157,12 +1157,20 @@ void UFragmentsImporter::BuildSpawnQueue(const FFragmentItem& Item, AActor* Pare
 	// We'll handle parent-child relationships during spawning
 }
 
-AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced)
+AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced, float* RemainingBudgetMs, int32* OutSamplesProcessed)
 {
-	// Initialize output parameter
+	// Track start time for budget checking
+	const double SpawnStartTime = FPlatformTime::Seconds();
+	int32 SamplesProcessed = 0;
+
+	// Initialize output parameters
 	if (bOutWasInstanced)
 	{
 		*bOutWasInstanced = false;
+	}
+	if (OutSamplesProcessed)
+	{
+		*OutSamplesProcessed = 0;
 	}
 
 	if (!ParentActor) return nullptr;
@@ -1231,17 +1239,24 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 			{
 				Mesh = *CachedMesh;
 			}
-			else
+			else if (CanCreateNewMesh())
 			{
-				// Create new mesh
+				// Create new mesh (only if we haven't exceeded the per-frame limit)
 				FString MeshName = FString::Printf(TEXT("Rep_%d"), RepId);
 				UPackage* MeshPackage = CreatePackage(*FString::Printf(TEXT("/Game/Buildings/Instanced/%s"), *MeshName));
 				Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
 				if (Mesh)
 				{
+					OnNewMeshCreated();
 					RepresentationMeshCache.Add(RepId, Mesh);
-					UE_LOG(LogFragments, Verbose, TEXT("GPU Instancing: Created mesh for RepId %d"), RepId);
+					UE_LOG(LogFragments, Verbose, TEXT("GPU Instancing: Created mesh for RepId %d [%d/%d this frame]"),
+						RepId, NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
 				}
+			}
+			else
+			{
+				// Skip this sample - mesh creation limit reached
+				continue;
 			}
 
 			if (!Mesh) continue;
@@ -1342,16 +1357,18 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 				{
 					Mesh = *CachedMesh;
 				}
-				else
+				else if (CanCreateNewMesh())
 				{
 					FString MeshName = FString::Printf(TEXT("Rep_%d"), RepId);
 					UPackage* MeshPackage = CreatePackage(*FString::Printf(TEXT("/Game/Buildings/Instanced/%s"), *MeshName));
 					Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
 					if (Mesh)
 					{
+						OnNewMeshCreated();
 						RepresentationMeshCache.Add(RepId, Mesh);
 					}
 				}
+				// If mesh creation limit reached, Mesh stays nullptr and we fall through
 
 				if (Mesh)
 				{
@@ -1410,18 +1427,22 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 					if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepresentationId))
 					{
-						// Reuse existing mesh for this representation
+						// Reuse existing mesh for this representation (cache hit - no limit)
 						Mesh = *CachedMesh;
 						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Reusing cached mesh for RepId %d (LocalId: %d)"),
 							RepresentationId, FragmentModel->GetLocalId());
 					}
-					else
+					else if (CanCreateNewMesh())
 					{
 						// Create new mesh using the working pre-extracted shell function
+						// (only if we haven't exceeded the per-frame mesh creation limit)
 						Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
 
 						if (Mesh)
 						{
+							// Track that we created a new mesh this frame
+							OnNewMeshCreated();
+
 							// Cache by RepresentationId for future instances
 							RepresentationMeshCache.Add(RepresentationId, Mesh);
 
@@ -1438,15 +1459,32 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 #endif
 							}
 
-							UE_LOG(LogFragments, Log, TEXT("SpawnSingleFragment: Created and cached mesh for RepId %d (LocalId: %d)"),
-								RepresentationId, FragmentModel->GetLocalId());
+							UE_LOG(LogFragments, Log, TEXT("SpawnSingleFragment: Created and cached mesh for RepId %d (LocalId: %d) [%d/%d this frame]"),
+								RepresentationId, FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
 						}
+					}
+					else
+					{
+						// Mesh creation limit reached - skip this sample for now
+						// It will be created on a future frame when this fragment is visible again
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Deferred mesh creation for RepId %d (LocalId: %d) - limit reached [%d/%d]"),
+							RepresentationId, FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
+						continue;  // Skip to next sample
 					}
 				}
 				else
 				{
 					// CircleExtrusion: still use FlatBuffer path (not pre-extracted)
 					// This is acceptable because CircleExtrusion works correctly with FlatBuffer access
+
+					// Check mesh creation limit first
+					if (!CanCreateNewMesh())
+					{
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Deferred CircleExtrusion mesh creation (LocalId: %d) - limit reached [%d/%d]"),
+							FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
+						continue;  // Skip to next sample
+					}
+
 					if (MeshesRef && MeshesRef->representations() && MeshesRef->circle_extrusions())
 					{
 						const uint32 RepCount = MeshesRef->representations()->size();
@@ -1468,6 +1506,11 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 									}
 
 									Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+
+									if (Mesh)
+									{
+										OnNewMeshCreated();
+									}
 								}
 							}
 						}
@@ -1509,6 +1552,16 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 				MeshComp->RegisterComponent();
 				FragmentModel->AddInstanceComponent(MeshComp);
+
+				// IMPORTANT: Apply material AFTER registration - material overrides don't persist on unregistered components
+				// This applies the correct material for this sample, which may differ from the mesh's embedded material
+				// (e.g., when the mesh is cached by RepresentationId but different samples have different materials)
+				UMaterialInstanceDynamic* Material = GetPooledMaterial(ExtractedGeom.R, ExtractedGeom.G,
+					ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+				if (Material)
+				{
+					MeshComp->SetMaterial(0, Material);
+				}
 
 				// Configure occlusion culling based on fragment classification
 				// Use pre-extracted material alpha instead of FlatBuffer access
@@ -1552,6 +1605,9 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 void UFragmentsImporter::ProcessSpawnChunk()
 {
+	// Reset per-frame mesh creation counter (for non-TileManager path)
+	NewMeshCreationsThisFrame = 0;
+
 	// Process any completed async geometry work within frame budget
 	ProcessCompletedGeometry();
 
@@ -1641,21 +1697,58 @@ void UFragmentsImporter::ProcessSpawnChunk()
 
 void UFragmentsImporter::ProcessAllTileManagerChunks()
 {
-	// First, process any completed async geometry work within frame budget
-	ProcessCompletedGeometry();
+	// Reset per-frame mesh creation counter
+	NewMeshCreationsThisFrame = 0;
 
-	// Process spawn chunks for all tile managers (per-sample visibility only)
+	// Sync coordinator settings from UPROPERTY values
+	FrameBudgetCoordinator.TotalFrameBudgetMs = TotalFrameBudgetMs;
+	FrameBudgetCoordinator.GeometryBudgetRatio = GeometryBudgetRatio;
+	FrameBudgetCoordinator.MinimumBudgetThresholdMs = MinimumBudgetThresholdMs;
+	FrameBudgetCoordinator.bEnableAdaptiveBudget = bEnableAdaptiveBudget;
+
+	// Begin coordinated frame budget
+	FrameBudgetCoordinator.BeginFrame();
+
+	// Phase 1: Geometry processing (gets GeometryBudgetRatio of total budget)
+	FBudgetAllocationResult GeoBudget = FrameBudgetCoordinator.AllocateGeometryBudget();
+	if (GeoBudget.bHasBudget)
+	{
+		ProcessCompletedGeometry(GeoBudget.BudgetMs);
+	}
+
+	// Phase 2: Spawning (remaining budget split among TileManagers)
+	const int32 TMCount = TileManagers.Num();
+	int32 TMIndex = 0;
+
 	for (auto& Pair : TileManagers)
 	{
+		// Check if budget exhausted before processing each TileManager
+		if (FrameBudgetCoordinator.IsBudgetExhausted())
+		{
+			UE_LOG(LogFragments, Verbose, TEXT("Frame budget exhausted at TileManager %d/%d"), TMIndex, TMCount);
+			break;
+		}
+
 		UFragmentTileManager* TileManager = Pair.Value;
 		if (!TileManager)
 		{
+			TMIndex++;
 			continue;
 		}
 
-		// Per-sample mode: process spawning based on dynamic tiles
-		TileManager->ProcessSpawnChunk();
+		// Allocate proportional spawn budget for this TileManager
+		FBudgetAllocationResult SpawnBudget = FrameBudgetCoordinator.AllocateSpawnBudget(TMCount, TMIndex);
+		if (SpawnBudget.bHasBudget)
+		{
+			// Per-sample mode: process spawning with coordinated budget
+			TileManager->ProcessSpawnChunkWithBudget(SpawnBudget.BudgetMs);
+		}
+
+		TMIndex++;
 	}
+
+	// End frame (logs statistics periodically)
+	FrameBudgetCoordinator.EndFrame();
 
 	// Check if all tile managers are idle
 	bool bAnyLoading = false;
@@ -2570,15 +2663,18 @@ void UFragmentsImporter::ShutdownWorkerPool()
 	}
 }
 
-void UFragmentsImporter::ProcessCompletedGeometry()
+float UFragmentsImporter::ProcessCompletedGeometry(float BudgetMs)
 {
+	const double StartTime = FPlatformTime::Seconds();
+
 	if (!GeometryWorkerPool.IsValid() || !GeometryWorkerPool->HasCompletedWork())
 	{
-		return;
+		return 0.0f;
 	}
 
-	const double StartTime = FPlatformTime::Seconds();
-	const double BudgetSeconds = GeometryProcessingBudgetMs / 1000.0;
+	// Use provided budget or fall back to legacy member variable
+	const float EffectiveBudgetMs = (BudgetMs > 0.0f) ? BudgetMs : GeometryProcessingBudgetMs;
+	const double BudgetSeconds = EffectiveBudgetMs / 1000.0;
 	int32 ProcessedCount = 0;
 
 	FRawGeometryData GeometryData;
@@ -2663,11 +2759,15 @@ void UFragmentsImporter::ProcessCompletedGeometry()
 		}
 	}
 
+	const float ActualTimeMs = static_cast<float>((FPlatformTime::Seconds() - StartTime) * 1000.0);
+
 	if (ProcessedCount > 0)
 	{
-		UE_LOG(LogFragments, Verbose, TEXT("Processed %d completed geometry items in %.2fms"),
-			ProcessedCount, (FPlatformTime::Seconds() - StartTime) * 1000.0);
+		UE_LOG(LogFragments, Verbose, TEXT("Processed %d completed geometry items in %.2fms (budget: %.2fms)"),
+			ProcessedCount, ActualTimeMs, EffectiveBudgetMs);
 	}
+
+	return ActualTimeMs;
 }
 
 UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& GeometryData, UObject* OuterRef)

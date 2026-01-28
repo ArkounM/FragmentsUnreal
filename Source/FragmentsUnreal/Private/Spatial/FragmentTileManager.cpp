@@ -171,9 +171,17 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 
 void UFragmentTileManager::ProcessSpawnChunk()
 {
+	// Delegate to budget-aware version with default budget
+	ProcessSpawnChunkWithBudget(MaxSpawnTimeMs);
+}
+
+float UFragmentTileManager::ProcessSpawnChunkWithBudget(float BudgetMs)
+{
+	const double StartTime = FPlatformTime::Seconds();
+
 	if (!TileGenerator || !Importer)
 	{
-		return;
+		return 0.0f;
 	}
 
 	// Get fragments to spawn - filter out those already spawned or in hidden cache
@@ -200,7 +208,7 @@ void UFragmentTileManager::ProcessSpawnChunk()
 		{
 			LoadingStage = TEXT("Idle");
 		}
-		return;
+		return 0.0f;
 	}
 
 	// Sort by priority: non-deferred first, then by distance (closest first)
@@ -228,9 +236,8 @@ void UFragmentTileManager::ProcessSpawnChunk()
 		return PriorityA < PriorityB;
 	});
 
-	// Time-based spawning within frame budget
-	const double StartTime = FPlatformTime::Seconds();
-	const double MaxSpawnTimeSec = MaxSpawnTimeMs / 1000.0;
+	// Time-based spawning within frame budget (use provided budget)
+	const double MaxSpawnTimeSec = BudgetMs / 1000.0;
 	int32 SpawnedThisFrame = 0;
 
 	for (int32 LocalId : ActuallyNeedSpawn)
@@ -240,8 +247,8 @@ void UFragmentTileManager::ProcessSpawnChunk()
 		if (ElapsedTime >= MaxSpawnTimeSec && SpawnedThisFrame > 0)
 		{
 			UE_LOG(LogFragmentTileManager, VeryVerbose,
-			       TEXT("Spawn budget exhausted: %.2fms, %d spawned"),
-			       ElapsedTime * 1000.0, SpawnedThisFrame);
+			       TEXT("Spawn budget exhausted: %.2fms (budget: %.2fms), %d spawned"),
+			       ElapsedTime * 1000.0, BudgetMs, SpawnedThisFrame);
 			break;
 		}
 
@@ -275,6 +282,9 @@ void UFragmentTileManager::ProcessSpawnChunk()
 	}
 
 	UpdateSpawnProgress();
+
+	// Return actual time spent
+	return static_cast<float>((FPlatformTime::Seconds() - StartTime) * 1000.0);
 }
 
 void UFragmentTileManager::InitializePerSampleVisibility(UFragmentRegistry* InRegistry)

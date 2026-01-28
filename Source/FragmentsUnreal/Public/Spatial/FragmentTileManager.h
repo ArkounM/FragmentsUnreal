@@ -56,6 +56,14 @@ public:
 	void ProcessSpawnChunk();
 
 	/**
+	 * Process spawning/unloading with explicit time budget (coordinated mode).
+	 * Used by FrameBudgetCoordinator for unified frame budgeting.
+	 * @param BudgetMs Time budget in milliseconds for this chunk
+	 * @return Actual time spent processing in milliseconds
+	 */
+	float ProcessSpawnChunkWithBudget(float BudgetMs);
+
+	/**
 	 * Get current spawn progress (0.0 to 1.0)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
