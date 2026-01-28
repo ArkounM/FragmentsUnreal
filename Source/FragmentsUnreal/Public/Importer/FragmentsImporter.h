@@ -9,7 +9,7 @@
 #include "Importer/DeferredPackageSaveManager.h"
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
 #include "Optimization/GeometryDeduplicationManager.h"
-#include "Utils/FragmentGeometryWorker.h" // Required for TUniquePtr<FGeometryWorkerPool>
+#include "Utils/TessellationTask.h" // FAsyncTask-based tessellation
 #include "FragmentsImporter.generated.h"
 
 
@@ -20,8 +20,6 @@ class UFragmentsAsyncLoader;
 class UFragmentTileManager;
 class AFragment;
 class UHierarchicalInstancedStaticMeshComponent;
-struct FRawGeometryData;
-struct FGeometryWorkItem;
 
 // Use FlatBuffers Model type
 using Model = ::Model;
@@ -235,39 +233,39 @@ private:
 	UFragmentsAsyncLoader* AsyncLoader;
 
 	// ==========================================
-	// ASYNC GEOMETRY PROCESSING (Phase 1)
+	// ASYNC GEOMETRY PROCESSING (FAsyncTask-based)
 	// ==========================================
 
-	/** Initialize the geometry worker pool */
-	void InitializeWorkerPool();
-
-	/** Shutdown the geometry worker pool */
-	void ShutdownWorkerPool();
-
-	/** Process completed geometry work items within frame budget */
-	void ProcessCompletedGeometry();
-
-	/** Create a UStaticMesh from raw geometry data (game thread only) */
-	UStaticMesh* CreateMeshFromRawData(const FRawGeometryData& GeometryData, UObject* OuterRef);
-
-	/** Add material to mesh from raw data */
-	FName AddMaterialToMeshFromRawData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass);
-
-	/** Submit a Shell for async geometry processing */
-	void SubmitShellForAsyncProcessing(
-		const Shell* ShellRef,
-		const Material* MaterialRef,
+	/** Submit a tessellation task to the thread pool.
+	 *  Creates an FAsyncTask<FTessellationTask> and starts it on a background thread.
+	 *  @return TaskId for tracking the task
+	 */
+	uint64 SubmitTessellationTask(
+		const FPreExtractedGeometry& Geometry,
 		const FFragmentItem& FragmentItem,
 		int32 SampleIndex,
 		const FString& MeshName,
 		const FString& PackagePath,
-		const FTransform& LocalTransform,
 		AFragment* FragmentActor,
 		AActor* ParentActor,
 		bool bSaveMeshes);
 
-	/** Finalize a spawned fragment with completed mesh data */
-	void FinalizeFragmentWithMesh(const FRawGeometryData& GeometryData, UStaticMesh* Mesh);
+	/** Process completed tessellation tasks within frame budget.
+	 *  Called by ProcessSpawnChunk() timer to check for finished tasks.
+	 */
+	void ProcessCompletedTessellation();
+
+	/** Clean up any pending tessellation tasks (called on shutdown) */
+	void CleanupPendingTessellationTasks();
+
+	/** Create a UStaticMesh from tessellation result (game thread only) */
+	UStaticMesh* CreateMeshFromTessellationResult(const FTessellationTaskData& TaskData, UObject* OuterRef);
+
+	/** Add material to mesh from tessellation data */
+	FName AddMaterialToMeshFromTessellationData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass);
+
+	/** Finalize a spawned fragment with completed tessellation data */
+	void FinalizeFragmentWithTessellationResult(uint64 TaskId, UStaticMesh* Mesh, const FTessellationTaskData& TaskData);
 
 	// Chunked Spawning Functions
 	// Build flat queue of all fragments to spawn (recursive)
@@ -397,33 +395,40 @@ private:
 	int32 FragmentsSpawned = 0;
 
 	// ==========================================
-	// ASYNC GEOMETRY PROCESSING MEMBERS
+	// ASYNC GEOMETRY PROCESSING MEMBERS (FAsyncTask-based)
 	// ==========================================
 
-	/** Geometry worker pool for parallel processing */
-	TUniquePtr<FGeometryWorkerPool> GeometryWorkerPool;
+	/** Pending tessellation tasks (TaskId -> Task pointer).
+	 *  Tasks are created via SubmitTessellationTask() and checked via ProcessCompletedTessellation().
+	 *  Using FAsyncTask instead of MPSC queue to avoid Unreal's thread-local allocator issues. */
+	TMap<uint64, FAsyncTask<FTessellationTask>*> PendingTessellationTasks;
 
-	/** Whether to use async geometry processing (can be disabled for debugging) */
-	// DISABLED: TileManager path has invalid FlatBuffer data when accessing Shell profiles
-	// The sync path works correctly. Need to investigate why TileManager's MeshesRef differs.
-	bool bUseAsyncGeometryProcessing = false;
+	/** Counter for generating unique task IDs */
+	uint64 NextTessellationTaskId = 1;
 
-	/** Frame budget for processing completed geometry (milliseconds) */
+	/** Whether to use async geometry processing for Shell tessellation.
+	 *  When enabled, Shell geometry is processed on thread pool using FAsyncTask.
+	 *  This moves expensive libtess2 tessellation off the game thread for better frame rates.
+	 *  Set to false to fall back to synchronous processing (useful for debugging). */
+	bool bUseAsyncGeometryProcessing = true;
+
+	/** Frame budget for processing completed tessellation (milliseconds) */
 	float GeometryProcessingBudgetMs = 4.0f;
 
-	/** Map of pending fragments waiting for geometry completion */
+	/** Map of pending fragments waiting for tessellation completion */
 	struct FPendingFragmentData
 	{
 		TWeakObjectPtr<AFragment> FragmentActor;
 		TWeakObjectPtr<AActor> ParentActor;
 		FTransform LocalTransform;
 		int32 SampleIndex = -1;
+		int32 RepresentationId = -1;  // For RepresentationMeshCache on async completion
 		bool bSaveMeshes = false;
 		FString PackagePath;
 		FString MeshName;
 	};
 
-	/** Map WorkItemId -> pending fragment data for async completion */
+	/** Map TaskId -> pending fragment data for async completion */
 	TMap<uint64, FPendingFragmentData> PendingFragmentMap;
 
 	/** Material pool for CRC-based deduplication */

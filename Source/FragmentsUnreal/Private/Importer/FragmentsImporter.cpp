@@ -23,7 +23,7 @@
 #include "Importer/FragmentsAsyncLoader.h"
 #include "Spatial/FragmentTileManager.h"
 #include "Utils/FragmentOcclusionClassifier.h"
-#include "Utils/FragmentGeometryWorker.h"
+#include "Utils/TessellationTask.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 
 
@@ -95,8 +95,8 @@ UFragmentsImporter::UFragmentsImporter()
 
 UFragmentsImporter::~UFragmentsImporter()
 {
-	// Destructor must be defined in .cpp where FGeometryWorkerPool is fully defined
-	// This allows TUniquePtr<FGeometryWorkerPool> to properly call the destructor
+	// Clean up any pending tessellation tasks
+	CleanupPendingTessellationTasks();
 }
 
 FString UFragmentsImporter::Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes)
@@ -1415,9 +1415,32 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Reusing cached mesh for RepId %d (LocalId: %d)"),
 							RepresentationId, FragmentModel->GetLocalId());
 					}
+					else if (bUseAsyncGeometryProcessing)
+					{
+						// ==========================================
+						// ASYNC GEOMETRY PROCESSING PATH (FAsyncTask-based)
+						// Submit to thread pool for background tessellation
+						// Mesh component will be created in FinalizeFragmentWithTessellationResult()
+						// ==========================================
+						SubmitTessellationTask(
+							ExtractedGeom,
+							Item,
+							i,  // SampleIndex
+							MeshName,
+							PackagePath,
+							FragmentModel,
+							ParentActor,
+							bSaveMeshes);
+
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Submitted tessellation task for RepId %d (LocalId: %d)"),
+							RepresentationId, FragmentModel->GetLocalId());
+
+						// Skip mesh component creation - will be done when async completes
+						continue;
+					}
 					else
 					{
-						// Create new mesh using the working pre-extracted shell function
+						// SYNC PATH: Create new mesh using the working pre-extracted shell function
 						Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
 
 						if (Mesh)
@@ -1552,12 +1575,11 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 void UFragmentsImporter::ProcessSpawnChunk()
 {
-	// Process any completed async geometry work within frame budget
-	ProcessCompletedGeometry();
+	// Process any completed async tessellation tasks within frame budget
+	ProcessCompletedTessellation();
 
 	// Check if we still have pending async work
-	const bool bHasPendingAsyncWork = GeometryWorkerPool.IsValid() &&
-		(GeometryWorkerPool->GetPendingWorkCount() > 0 || PendingFragmentMap.Num() > 0);
+	const bool bHasPendingAsyncWork = PendingTessellationTasks.Num() > 0 || PendingFragmentMap.Num() > 0;
 
 	if (PendingSpawnQueue.Num() == 0)
 	{
@@ -1641,8 +1663,8 @@ void UFragmentsImporter::ProcessSpawnChunk()
 
 void UFragmentsImporter::ProcessAllTileManagerChunks()
 {
-	// First, process any completed async geometry work within frame budget
-	ProcessCompletedGeometry();
+	// First, process any completed async tessellation tasks within frame budget
+	ProcessCompletedTessellation();
 
 	// Process spawn chunks for all tile managers (per-sample visibility only)
 	for (auto& Pair : TileManagers)
@@ -2545,34 +2567,30 @@ void UFragmentsImporter::SavePackagesWithProgress(const TArray<UPackage*>& InPac
 }
 
 //////////////////////////////////////////////////////////////////////////
-// ASYNC GEOMETRY PROCESSING (Phase 1)
+// ASYNC GEOMETRY PROCESSING (FAsyncTask-based)
 //////////////////////////////////////////////////////////////////////////
 
-void UFragmentsImporter::InitializeWorkerPool()
+void UFragmentsImporter::CleanupPendingTessellationTasks()
 {
-	if (!GeometryWorkerPool.IsValid())
+	for (auto& Pair : PendingTessellationTasks)
 	{
-		GeometryWorkerPool = MakeUnique<FGeometryWorkerPool>();
-		GeometryWorkerPool->Initialize();
-		UE_LOG(LogFragments, Log, TEXT("=== ASYNC GEOMETRY PROCESSING ENABLED ==="));
-		UE_LOG(LogFragments, Log, TEXT("Geometry worker pool initialized with parallel tessellation support"));
-		UE_LOG(LogFragments, Log, TEXT("Shell geometry will be processed on background threads"));
+		FAsyncTask<FTessellationTask>* Task = Pair.Value;
+		if (Task)
+		{
+			// Wait for completion before deleting
+			Task->EnsureCompletion();
+			delete Task;
+		}
 	}
+	PendingTessellationTasks.Empty();
+	PendingFragmentMap.Empty();
+
+	UE_LOG(LogFragments, Log, TEXT("Cleaned up pending tessellation tasks"));
 }
 
-void UFragmentsImporter::ShutdownWorkerPool()
+void UFragmentsImporter::ProcessCompletedTessellation()
 {
-	if (GeometryWorkerPool.IsValid())
-	{
-		GeometryWorkerPool->Shutdown();
-		GeometryWorkerPool.Reset();
-		UE_LOG(LogFragments, Log, TEXT("Geometry worker pool shut down"));
-	}
-}
-
-void UFragmentsImporter::ProcessCompletedGeometry()
-{
-	if (!GeometryWorkerPool.IsValid() || !GeometryWorkerPool->HasCompletedWork())
+	if (PendingTessellationTasks.Num() == 0)
 	{
 		return;
 	}
@@ -2581,67 +2599,108 @@ void UFragmentsImporter::ProcessCompletedGeometry()
 	const double BudgetSeconds = GeometryProcessingBudgetMs / 1000.0;
 	int32 ProcessedCount = 0;
 
-	FRawGeometryData GeometryData;
-	while (GeometryWorkerPool->DequeueCompletedWork(GeometryData))
-	{
-		if (!GeometryData.bSuccess)
-		{
-			UE_LOG(LogFragments, Warning, TEXT("Async geometry processing failed for mesh %s: %s"),
-				*GeometryData.MeshName, *GeometryData.ErrorMessage);
+	TArray<uint64> CompletedTaskIds;
 
-			// Remove from pending map
-			PendingFragmentMap.Remove(GeometryData.WorkItemId);
+	for (auto& Pair : PendingTessellationTasks)
+	{
+		// Check frame budget
+		if ((FPlatformTime::Seconds() - StartTime) > BudgetSeconds)
+		{
+			break;
+		}
+
+		uint64 TaskId = Pair.Key;
+		FAsyncTask<FTessellationTask>* Task = Pair.Value;
+
+		if (!Task)
+		{
+			CompletedTaskIds.Add(TaskId);
+			continue;
+		}
+
+		// Check if task is done (non-blocking)
+		if (!Task->IsDone())
+		{
+			continue;
+		}
+
+		// Ensure task is fully complete before accessing data
+		Task->EnsureCompletion();
+		FTessellationTaskData& TaskData = Task->GetTask().Data;
+
+		if (!TaskData.bSuccess)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("Async tessellation failed for mesh %s: %s"),
+				TaskData.MeshName, TaskData.ErrorMessage);
+
+			CompletedTaskIds.Add(TaskId);
+			delete Task;
 			continue;
 		}
 
 		// Find the pending fragment data
-		FPendingFragmentData* PendingData = PendingFragmentMap.Find(GeometryData.WorkItemId);
+		FPendingFragmentData* PendingData = PendingFragmentMap.Find(TaskId);
 		if (!PendingData)
 		{
-			UE_LOG(LogFragments, Warning, TEXT("No pending fragment found for work item %llu"), GeometryData.WorkItemId);
+			UE_LOG(LogFragments, Warning, TEXT("No pending fragment found for task %llu"), TaskId);
+			CompletedTaskIds.Add(TaskId);
+			delete Task;
 			continue;
 		}
 
 		// Validate package path
-		if (GeometryData.PackagePath.IsEmpty())
+		FString PackagePath(TaskData.PackagePath);
+		FString MeshName(TaskData.MeshName);
+
+		if (PackagePath.IsEmpty())
 		{
-			UE_LOG(LogFragments, Error, TEXT("ProcessCompletedGeometry: Empty package path for mesh %s"), *GeometryData.MeshName);
-			PendingFragmentMap.Remove(GeometryData.WorkItemId);
+			UE_LOG(LogFragments, Error, TEXT("ProcessCompletedTessellation: Empty package path for mesh %s"), *MeshName);
+			CompletedTaskIds.Add(TaskId);
+			delete Task;
 			continue;
 		}
 
-		// Create the UStaticMesh from raw data (must be on game thread)
-		UPackage* MeshPackage = CreatePackage(*GeometryData.PackagePath);
+		// Create the UStaticMesh from tessellation result (must be on game thread)
+		UPackage* MeshPackage = CreatePackage(*PackagePath);
 		if (!MeshPackage)
 		{
-			UE_LOG(LogFragments, Error, TEXT("ProcessCompletedGeometry: Failed to create package %s"), *GeometryData.PackagePath);
-			PendingFragmentMap.Remove(GeometryData.WorkItemId);
+			UE_LOG(LogFragments, Error, TEXT("ProcessCompletedTessellation: Failed to create package %s"), *PackagePath);
+			CompletedTaskIds.Add(TaskId);
+			delete Task;
 			continue;
 		}
 
-		UStaticMesh* Mesh = CreateMeshFromRawData(GeometryData, MeshPackage);
+		UStaticMesh* Mesh = CreateMeshFromTessellationResult(TaskData, MeshPackage);
 
 		if (Mesh)
 		{
-			// Cache the mesh
-			const FString SamplePath = GeometryData.PackagePath + TEXT(".") + GeometryData.MeshName;
+			// Cache the mesh by SamplePath
+			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
 			MeshCache.Add(SamplePath, Mesh);
 
+			// Also cache by RepresentationId for future fragments with same geometry
+			const int32 RepId = PendingData->RepresentationId;
+			if (RepId >= 0 && !RepresentationMeshCache.Contains(RepId))
+			{
+				RepresentationMeshCache.Add(RepId, Mesh);
+				UE_LOG(LogFragments, Verbose, TEXT("ProcessCompletedTessellation: Cached mesh for RepId %d"), RepId);
+			}
+
 			// Finalize the fragment with the mesh
-			FinalizeFragmentWithMesh(GeometryData, Mesh);
+			FinalizeFragmentWithTessellationResult(TaskId, Mesh, TaskData);
 
 			// Handle package saving
 			if (PendingData->bSaveMeshes)
 			{
 #if WITH_EDITOR
 				FString PackageFileName = FPackageName::LongPackageNameToFilename(
-					FPackageName::ObjectPathToPackageName(GeometryData.PackagePath),
+					FPackageName::ObjectPathToPackageName(PackagePath),
 					FPackageName::GetAssetPackageExtension());
 
 				if (!FPaths::FileExists(PackageFileName))
 				{
 					MeshPackage->FullyLoad();
-					Mesh->Rename(*GeometryData.MeshName, MeshPackage);
+					Mesh->Rename(*MeshName, MeshPackage);
 					Mesh->SetFlags(RF_Public | RF_Standalone);
 					MeshPackage->MarkPackageDirty();
 					FAssetRegistryModule::AssetCreated(Mesh);
@@ -2653,49 +2712,52 @@ void UFragmentsImporter::ProcessCompletedGeometry()
 			ProcessedCount++;
 		}
 
-		// Remove from pending map
-		PendingFragmentMap.Remove(GeometryData.WorkItemId);
+		CompletedTaskIds.Add(TaskId);
+		delete Task;
+	}
 
-		// Check frame budget
-		if ((FPlatformTime::Seconds() - StartTime) > BudgetSeconds)
-		{
-			break;
-		}
+	// Remove completed tasks
+	for (uint64 TaskId : CompletedTaskIds)
+	{
+		PendingTessellationTasks.Remove(TaskId);
+		PendingFragmentMap.Remove(TaskId);
 	}
 
 	if (ProcessedCount > 0)
 	{
-		UE_LOG(LogFragments, Verbose, TEXT("Processed %d completed geometry items in %.2fms"),
+		UE_LOG(LogFragments, Verbose, TEXT("Processed %d completed tessellation tasks in %.2fms"),
 			ProcessedCount, (FPlatformTime::Seconds() - StartTime) * 1000.0);
 	}
 }
 
-UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& GeometryData, UObject* OuterRef)
+UStaticMesh* UFragmentsImporter::CreateMeshFromTessellationResult(const FTessellationTaskData& TaskData, UObject* OuterRef)
 {
 	// Must be called from game thread
 	check(IsInGameThread());
 
-	if (GeometryData.Positions.Num() == 0 || GeometryData.Indices.Num() == 0)
+	FString MeshName(TaskData.MeshName);
+
+	if (TaskData.OutPositions.Num() == 0 || TaskData.OutIndices.Num() == 0)
 	{
-		UE_LOG(LogFragments, Warning, TEXT("CreateMeshFromRawData: No geometry data for %s"), *GeometryData.MeshName);
+		UE_LOG(LogFragments, Warning, TEXT("CreateMeshFromTessellationResult: No geometry data for %s"), *MeshName);
 		return nullptr;
 	}
 
 	if (!OuterRef)
 	{
-		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromRawData: OuterRef is null for %s"), *GeometryData.MeshName);
+		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromTessellationResult: OuterRef is null for %s"), *MeshName);
 		return nullptr;
 	}
 
 	// Log geometry stats for debugging
-	UE_LOG(LogFragments, Verbose, TEXT("CreateMeshFromRawData: %s - %d verts, %d indices"),
-		*GeometryData.MeshName, GeometryData.Positions.Num(), GeometryData.Indices.Num());
+	UE_LOG(LogFragments, Verbose, TEXT("CreateMeshFromTessellationResult: %s - %d verts, %d indices"),
+		*MeshName, TaskData.OutPositions.Num(), TaskData.OutIndices.Num());
 
 	// Create StaticMesh object
-	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*GeometryData.MeshName), RF_Public | RF_Standalone);
+	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*MeshName), RF_Public | RF_Standalone);
 	if (!StaticMesh)
 	{
-		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromRawData: Failed to create StaticMesh for %s"), *GeometryData.MeshName);
+		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromTessellationResult: Failed to create StaticMesh for %s"), *MeshName);
 		return nullptr;
 	}
 
@@ -2706,7 +2768,7 @@ UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& G
 	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(GetTransientPackage());
 	if (!StaticMeshDescription)
 	{
-		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromRawData: Failed to create StaticMeshDescription for %s"), *GeometryData.MeshName);
+		UE_LOG(LogFragments, Error, TEXT("CreateMeshFromTessellationResult: Failed to create StaticMeshDescription for %s"), *MeshName);
 		return nullptr;
 	}
 	FMeshDescription& MeshDescription = StaticMeshDescription->GetMeshDescription();
@@ -2740,28 +2802,28 @@ UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& G
 
 	// Create vertices
 	TArray<FVertexID> Vertices;
-	Vertices.Reserve(GeometryData.Positions.Num());
+	Vertices.Reserve(TaskData.OutPositions.Num());
 
-	for (int32 i = 0; i < GeometryData.Positions.Num(); i++)
+	for (int32 i = 0; i < TaskData.OutPositions.Num(); i++)
 	{
 		const FVertexID VertId = StaticMeshDescription->CreateVertex();
-		StaticMeshDescription->SetVertexPosition(VertId, FVector(GeometryData.Positions[i]));
+		StaticMeshDescription->SetVertexPosition(VertId, FVector(TaskData.OutPositions[i]));
 		Vertices.Add(VertId);
 	}
 
 	// Add material
-	FName MaterialSlotName = AddMaterialToMeshFromRawData(StaticMesh,
-		GeometryData.R, GeometryData.G, GeometryData.B, GeometryData.A, GeometryData.bIsGlass);
+	FName MaterialSlotName = AddMaterialToMeshFromTessellationData(StaticMesh,
+		TaskData.R, TaskData.G, TaskData.B, TaskData.A, TaskData.bIsGlass);
 	const FPolygonGroupID PolygonGroupId = StaticMeshDescription->CreatePolygonGroup();
 	StaticMeshDescription->SetPolygonGroupMaterialSlotName(PolygonGroupId, MaterialSlotName);
 
 	// Create triangles
 	int32 TrianglesCreated = 0;
-	for (int32 i = 0; i < GeometryData.Indices.Num(); i += 3)
+	for (int32 i = 0; i < TaskData.OutIndices.Num(); i += 3)
 	{
-		uint32 I0 = GeometryData.Indices[i];
-		uint32 I1 = GeometryData.Indices[i + 1];
-		uint32 I2 = GeometryData.Indices[i + 2];
+		uint32 I0 = TaskData.OutIndices[i];
+		uint32 I1 = TaskData.OutIndices[i + 1];
+		uint32 I2 = TaskData.OutIndices[i + 2];
 
 		if (I0 < (uint32)Vertices.Num() && I1 < (uint32)Vertices.Num() && I2 < (uint32)Vertices.Num())
 		{
@@ -2771,16 +2833,16 @@ UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& G
 			TriangleInstance.Add(MeshDescription.CreateVertexInstance(Vertices[I2]));
 
 			// Set normals on vertex instances
-			if (I0 < (uint32)GeometryData.Normals.Num() &&
-				I1 < (uint32)GeometryData.Normals.Num() &&
-				I2 < (uint32)GeometryData.Normals.Num())
+			if (I0 < (uint32)TaskData.OutNormals.Num() &&
+				I1 < (uint32)TaskData.OutNormals.Num() &&
+				I2 < (uint32)TaskData.OutNormals.Num())
 			{
 				TVertexInstanceAttributesRef<FVector3f> VertexInstanceNormals =
 					MeshDescription.VertexInstanceAttributes().GetAttributesRef<FVector3f>(MeshAttribute::VertexInstance::Normal);
 
-				VertexInstanceNormals[TriangleInstance[0]] = GeometryData.Normals[I0];
-				VertexInstanceNormals[TriangleInstance[1]] = GeometryData.Normals[I1];
-				VertexInstanceNormals[TriangleInstance[2]] = GeometryData.Normals[I2];
+				VertexInstanceNormals[TriangleInstance[0]] = TaskData.OutNormals[I0];
+				VertexInstanceNormals[TriangleInstance[1]] = TaskData.OutNormals[I1];
+				VertexInstanceNormals[TriangleInstance[2]] = TaskData.OutNormals[I2];
 			}
 
 			MeshDescription.CreatePolygon(PolygonGroupId, TriangleInstance);
@@ -2791,7 +2853,7 @@ UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& G
 	// Only proceed if we actually created triangles
 	if (TrianglesCreated == 0)
 	{
-		UE_LOG(LogFragments, Warning, TEXT("CreateMeshFromRawData: No valid triangles created for %s"), *GeometryData.MeshName);
+		UE_LOG(LogFragments, Warning, TEXT("CreateMeshFromTessellationResult: No valid triangles created for %s"), *MeshName);
 		return nullptr;
 	}
 
@@ -2803,7 +2865,7 @@ UStaticMesh* UFragmentsImporter::CreateMeshFromRawData(const FRawGeometryData& G
 	return StaticMesh;
 }
 
-FName UFragmentsImporter::AddMaterialToMeshFromRawData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass)
+FName UFragmentsImporter::AddMaterialToMeshFromTessellationData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass)
 {
 	if (!CreatedMesh) return FName();
 
@@ -2875,62 +2937,170 @@ UMaterialInstanceDynamic* UFragmentsImporter::GetPooledMaterial(uint8 R, uint8 G
 	return NewMat;
 }
 
-void UFragmentsImporter::SubmitShellForAsyncProcessing(
-	const Shell* ShellRef,
-	const Material* MaterialRef,
+uint64 UFragmentsImporter::SubmitTessellationTask(
+	const FPreExtractedGeometry& Geometry,
 	const FFragmentItem& FragmentItem,
 	int32 SampleIndex,
 	const FString& MeshName,
 	const FString& PackagePath,
-	const FTransform& LocalTransform,
 	AFragment* FragmentActor,
 	AActor* ParentActor,
 	bool bSaveMeshes)
 {
-	if (!GeometryWorkerPool.IsValid())
+	if (!Geometry.bIsValid || !Geometry.bIsShell)
 	{
-		InitializeWorkerPool();
+		UE_LOG(LogFragments, Warning, TEXT("SubmitTessellationTask: Invalid geometry for %s"), *MeshName);
+		return 0;
 	}
 
-	// Generate unique work item ID
-	uint64 WorkItemId = GeometryWorkerPool->GenerateWorkItemId();
+	// Validate geometry data before submission
+	if (Geometry.Vertices.Num() == 0)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("SubmitTessellationTask: No vertices for %s"), *MeshName);
+		return 0;
+	}
 
-	// Extract work item from FlatBuffers (copies data for thread safety)
-	FGeometryWorkItem WorkItem = FGeometryDataExtractor::ExtractShellWorkItem(
-		ShellRef,
-		MaterialRef,
-		FragmentItem,
-		SampleIndex,
-		MeshName,
-		PackagePath,
-		LocalTransform,
-		ParentActor,
-		bSaveMeshes,
-		WorkItemId
-	);
+	if (Geometry.ProfileIndices.Num() == 0)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("SubmitTessellationTask: No profile indices for %s"), *MeshName);
+		return 0;
+	}
 
-	// Store pending fragment data for later completion
+	// Generate unique task ID
+	uint64 TaskId = NextTessellationTaskId++;
+
+	// Create the async task
+	FAsyncTask<FTessellationTask>* Task = new FAsyncTask<FTessellationTask>();
+	FTessellationTaskData& TaskData = Task->GetTask().Data;
+
+	// Set task identification
+	TaskData.TaskId = TaskId;
+	TaskData.LocalId = FragmentItem.LocalId;
+	TaskData.SampleIndex = SampleIndex;
+	TaskData.RepresentationId = Geometry.RepresentationId;
+
+	// Copy strings to TCHAR arrays (safe for cross-thread transfer)
+	FCString::Strcpy(TaskData.ModelGuid, 64, *FragmentItem.ModelGuid);
+	FCString::Strcpy(TaskData.MeshName, 256, *MeshName);
+	FCString::Strcpy(TaskData.PackagePath, 512, *PackagePath);
+	FCString::Strcpy(TaskData.Category, 128, *FragmentItem.Category);
+
+	// Copy transforms
+	TaskData.LocalTransform = Geometry.LocalTransform;
+	TaskData.GlobalTransform = FragmentItem.GlobalTransform;
+
+	// Copy geometry data (already in Unreal coordinates from pre-extraction)
+	TaskData.Points = Geometry.Vertices;
+
+	// Copy material data
+	TaskData.R = Geometry.R;
+	TaskData.G = Geometry.G;
+	TaskData.B = Geometry.B;
+	TaskData.A = Geometry.A;
+	TaskData.bIsGlass = Geometry.bIsGlass;
+
+	// FLATTEN nested arrays into flat arrays + metadata for thread-safe transfer
+	const int32 NumProfiles = Geometry.ProfileIndices.Num();
+
+	// Calculate total sizes for pre-allocation
+	int32 TotalProfileIndices = 0;
+	int32 TotalHoleIndices = 0;
+	int32 TotalHoles = 0;
+
+	for (int32 p = 0; p < NumProfiles; p++)
+	{
+		TotalProfileIndices += Geometry.ProfileIndices[p].Num();
+
+		if (p < Geometry.ProfileHoles.Num())
+		{
+			const TArray<TArray<int32>>& HolesForProfile = Geometry.ProfileHoles[p];
+			TotalHoles += HolesForProfile.Num();
+			for (const TArray<int32>& Hole : HolesForProfile)
+			{
+				TotalHoleIndices += Hole.Num();
+			}
+		}
+	}
+
+	// Pre-allocate flat arrays
+	TaskData.AllProfileIndices.Reserve(TotalProfileIndices);
+	TaskData.AllHoleIndices.Reserve(TotalHoleIndices);
+	TaskData.ProfileInfos.Reserve(NumProfiles);
+	TaskData.HoleInfos.Reserve(TotalHoles);
+
+	// Flatten profiles and holes
+	int32 CurrentHoleInfoIdx = 0;
+
+	for (int32 p = 0; p < NumProfiles; p++)
+	{
+		FTessProfileInfo ProfInfo;
+		ProfInfo.IndicesStart = TaskData.AllProfileIndices.Num();
+		ProfInfo.IndicesCount = Geometry.ProfileIndices[p].Num();
+
+		// Copy profile indices to flat array
+		for (int32 Idx : Geometry.ProfileIndices[p])
+		{
+			TaskData.AllProfileIndices.Add(Idx);
+		}
+
+		// Handle holes for this profile
+		if (p < Geometry.ProfileHoles.Num() && Geometry.ProfileHoles[p].Num() > 0)
+		{
+			const TArray<TArray<int32>>& HolesForProfile = Geometry.ProfileHoles[p];
+			ProfInfo.FirstHoleIdx = CurrentHoleInfoIdx;
+			ProfInfo.HoleCount = HolesForProfile.Num();
+
+			for (const TArray<int32>& Hole : HolesForProfile)
+			{
+				FTessHoleInfo HInfo;
+				HInfo.IndicesStart = TaskData.AllHoleIndices.Num();
+				HInfo.IndicesCount = Hole.Num();
+
+				// Copy hole indices to flat array
+				for (int32 Idx : Hole)
+				{
+					TaskData.AllHoleIndices.Add(Idx);
+				}
+
+				TaskData.HoleInfos.Add(HInfo);
+				CurrentHoleInfoIdx++;
+			}
+		}
+		else
+		{
+			ProfInfo.FirstHoleIdx = INDEX_NONE;
+			ProfInfo.HoleCount = 0;
+		}
+
+		TaskData.ProfileInfos.Add(ProfInfo);
+	}
+
+	// Store pending fragment data for later completion (game thread only)
 	FPendingFragmentData PendingData;
 	PendingData.FragmentActor = FragmentActor;
 	PendingData.ParentActor = ParentActor;
-	PendingData.LocalTransform = LocalTransform;
+	PendingData.LocalTransform = Geometry.LocalTransform;
 	PendingData.SampleIndex = SampleIndex;
+	PendingData.RepresentationId = Geometry.RepresentationId;
 	PendingData.bSaveMeshes = bSaveMeshes;
 	PendingData.PackagePath = PackagePath;
 	PendingData.MeshName = MeshName;
 
-	PendingFragmentMap.Add(WorkItemId, MoveTemp(PendingData));
+	PendingFragmentMap.Add(TaskId, MoveTemp(PendingData));
 
-	// Submit work to pool
-	GeometryWorkerPool->SubmitWork(MoveTemp(WorkItem));
+	// Store task pointer and start background work
+	PendingTessellationTasks.Add(TaskId, Task);
+	Task->StartBackgroundTask();
 
-	UE_LOG(LogFragments, Verbose, TEXT("Submitted Shell for async processing: %s (WorkItemId: %llu)"),
-		*MeshName, WorkItemId);
+	UE_LOG(LogFragments, Verbose, TEXT("Submitted tessellation task: %s (TaskId: %llu, Vertices: %d, RepId: %d)"),
+		*MeshName, TaskId, Geometry.Vertices.Num(), Geometry.RepresentationId);
+
+	return TaskId;
 }
 
-void UFragmentsImporter::FinalizeFragmentWithMesh(const FRawGeometryData& GeometryData, UStaticMesh* Mesh)
+void UFragmentsImporter::FinalizeFragmentWithTessellationResult(uint64 TaskId, UStaticMesh* Mesh, const FTessellationTaskData& TaskData)
 {
-	FPendingFragmentData* PendingData = PendingFragmentMap.Find(GeometryData.WorkItemId);
+	FPendingFragmentData* PendingData = PendingFragmentMap.Find(TaskId);
 	if (!PendingData)
 	{
 		return;
@@ -2941,7 +3111,7 @@ void UFragmentsImporter::FinalizeFragmentWithMesh(const FRawGeometryData& Geomet
 	{
 		// Fragment actor doesn't exist yet or was destroyed
 		// This shouldn't happen in normal flow
-		UE_LOG(LogFragments, Warning, TEXT("FinalizeFragmentWithMesh: Fragment actor not found for mesh %s"), *GeometryData.MeshName);
+		UE_LOG(LogFragments, Warning, TEXT("FinalizeFragmentWithTessellationResult: Fragment actor not found for mesh %s"), TaskData.MeshName);
 		return;
 	}
 
@@ -2965,8 +3135,8 @@ void UFragmentsImporter::FinalizeFragmentWithMesh(const FRawGeometryData& Geomet
 	FragmentActor->AddInstanceComponent(MeshComp);
 
 	// Configure occlusion culling
-	const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
-		GeometryData.Category, GeometryData.A);
+	FString Category(TaskData.Category);
+	const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(Category, TaskData.A);
 
 	switch (Role)
 	{
@@ -3011,10 +3181,21 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromPreExtractedShell(
 
 	// Create StaticMesh object
 	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!StaticMesh)
+	{
+		UE_LOG(LogFragments, Error, TEXT("CreateStaticMeshFromPreExtractedShell: Failed to create StaticMesh for %s"), *AssetName);
+		return nullptr;
+	}
 	StaticMesh->InitResources();
 	StaticMesh->SetLightingGuid();
 
-	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(OuterRef);
+	// Use GetTransientPackage() for mesh description to avoid package-related crashes
+	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(GetTransientPackage());
+	if (!StaticMeshDescription)
+	{
+		UE_LOG(LogFragments, Error, TEXT("CreateStaticMeshFromPreExtractedShell: Failed to create StaticMeshDescription for %s"), *AssetName);
+		return nullptr;
+	}
 	FMeshDescription& MeshDescription = StaticMeshDescription->GetMeshDescription();
 	UStaticMesh::FBuildMeshDescriptionsParams MeshParams;
 
@@ -3056,7 +3237,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromPreExtractedShell(
 	}
 
 	// Add material using pre-extracted color data
-	FName MaterialSlotName = AddMaterialToMeshFromRawData(
+	FName MaterialSlotName = AddMaterialToMeshFromTessellationData(
 		StaticMesh,
 		Geometry.R, Geometry.G, Geometry.B, Geometry.A,
 		Geometry.bIsGlass);
@@ -3411,8 +3592,9 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 		Sample.ExtractedGeometry.LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
 	}
 
-	// Store representation ID for debugging
-	Sample.ExtractedGeometry.RepresentationId = representation->id();
+	// Store representation index for cache key consistency
+	// Use Sample.RepresentationIndex (array index) to match cache key used in SpawnSingleFragment
+	Sample.ExtractedGeometry.RepresentationId = Sample.RepresentationIndex;
 
 	// Handle Shell geometry
 	if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
@@ -3487,7 +3669,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 			return false;
 		}
 
-		// Build hole map first
+		// Build hole map first - keyed by profile_id with validation
 		TMap<int32, TArray<TArray<int32>>> ProfileHolesMap;
 		if (shell->holes())
 		{
@@ -3500,6 +3682,15 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 				if (!Hole) continue;
 
 				int32 ProfileId = Hole->profile_id();
+
+				// Validate profile_id is within valid range before adding to map
+				// This prevents orphaned holes from profile_ids that don't correspond to any profile
+				if (ProfileId < 0 || ProfileId >= static_cast<int32>(ProfileCount))
+				{
+					UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Invalid profile_id %d (count: %u) for hole %d in item %d"),
+						ProfileId, ProfileCount, j, ItemLocalId);
+					continue;
+				}
 
 				TArray<int32> HoleIndices;
 				if (Hole->indices())
