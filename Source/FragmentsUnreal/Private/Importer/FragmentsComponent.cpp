@@ -215,20 +215,20 @@ void UFragmentsComponent::UpdateCameraStreaming()
 	FragmentsImporter->UpdateTileStreaming(CameraLocation, CameraRotation, FOV, AspectRatio, ViewportHeight);
 }
 
-void UFragmentsComponent::SetShowDebugTileBounds(bool bShow)
+void UFragmentsComponent::SetShowDebugLodColors(bool bShow)
 {
 	if (FragmentsImporter)
 	{
-		FragmentsImporter->bShowDebugTileBounds = bShow;
-		UE_LOG(LogTemp, Log, TEXT("Debug tile bounds: %s"), bShow ? TEXT("Enabled") : TEXT("Disabled"));
+		FragmentsImporter->bShowDebugLodColors = bShow;
+		UE_LOG(LogTemp, Log, TEXT("Debug LOD colors: %s"), bShow ? TEXT("Enabled") : TEXT("Disabled"));
 	}
 }
 
-bool UFragmentsComponent::GetShowDebugTileBounds() const
+bool UFragmentsComponent::GetShowDebugLodColors() const
 {
 	if (FragmentsImporter)
 	{
-		return FragmentsImporter->bShowDebugTileBounds;
+		return FragmentsImporter->bShowDebugLodColors;
 	}
 	return false;
 }

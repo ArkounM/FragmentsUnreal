@@ -11,6 +11,7 @@
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
 #include "Optimization/GeometryDeduplicationManager.h"
 #include "Utils/FragmentGeometryWorker.h" // Required for TUniquePtr<FGeometryWorkerPool>
+#include "Spatial/PerSampleVisibilityController.h" // For EFragmentLod
 #include "FragmentsImporter.generated.h"
 
 
@@ -173,7 +174,8 @@ public:
 	// @param bOutWasInstanced Optional output - set to true if fragment was handled via GPU instancing (no actor created)
 	// @param RemainingBudgetMs Optional budget - if provided and exceeded, spawning stops early. Pass nullptr for unlimited.
 	// @param OutSamplesProcessed Optional output - number of samples actually processed (for partial spawn tracking)
-	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced = nullptr, float* RemainingBudgetMs = nullptr, int32* OutSamplesProcessed = nullptr);
+	// @param RequestedLod Optional LOD level to use (FullDetail by default). Pass desired LOD from visibility system.
+	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced = nullptr, float* RemainingBudgetMs = nullptr, int32* OutSamplesProcessed = nullptr, EFragmentLod RequestedLod = EFragmentLod::FullDetail);
 
 	UPROPERTY()
 	UGeometryDeduplicationManager* DeduplicationManager;
@@ -191,6 +193,31 @@ public:
 	 * @param MeshesRef The FlatBuffers meshes reference
 	 */
 	void PreExtractAllGeometry(FFragmentItem& RootItem, const Meshes* MeshesRef);
+
+	/**
+	 * Extract geometry on-demand for a single sample during spawn phase.
+	 * Only extracts if not already attempted. Used when bPreExtractAllGeometry is false.
+	 *
+	 * @param Sample The sample to extract geometry for (modified in place)
+	 * @param MeshesRef The FlatBuffers meshes reference
+	 * @param ItemLocalId The local ID of the containing fragment (for logging)
+	 * @return true if geometry is valid (either already extracted or just extracted successfully)
+	 */
+	bool ExtractSampleGeometryOnDemand(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId);
+
+	/**
+	 * Count instances per RepresentationId + Material combination without full geometry extraction.
+	 * This is a lightweight pass that only extracts material data for GPU instancing decisions.
+	 * Runs in ~100ms vs 10-30 seconds for full PreExtractAllGeometry.
+	 *
+	 * @param RootItem The root fragment item to process (recursively processes children)
+	 * @param MeshesRef The FlatBuffers meshes reference
+	 */
+	void CountRepresentationInstances(FFragmentItem& RootItem, const Meshes* MeshesRef);
+
+	/** Whether to pre-extract all geometry at load time (false = on-demand extraction for faster first visual) */
+	UPROPERTY(EditAnywhere, Category = "Fragments|Performance")
+	bool bPreExtractAllGeometry = false;
 
 protected:
 	// Call when Async Loading Completes
@@ -333,6 +360,69 @@ private:
 		const FString& AssetName,
 		UObject* OuterRef);
 
+	// ==========================================
+	// LOD MESH CREATION (Phase 4)
+	// ==========================================
+
+	/**
+	 * Create a simple bounding box mesh (12 triangles).
+	 * Used for distant fragments where detail is not visible.
+	 *
+	 * @param Bounds World-space bounding box
+	 * @param R Red color component (0-255)
+	 * @param G Green color component (0-255)
+	 * @param B Blue color component (0-255)
+	 * @param A Alpha component (0-255)
+	 * @param bIsGlass Whether to use glass material
+	 * @param AssetName Name for the mesh asset
+	 * @param OuterRef Package/outer for the mesh
+	 * @return Created UStaticMesh or nullptr on failure
+	 */
+	UStaticMesh* CreateBoundingBoxMesh(
+		const FBox& Bounds,
+		uint8 R, uint8 G, uint8 B, uint8 A,
+		bool bIsGlass,
+		const FString& AssetName,
+		UObject* OuterRef);
+
+	/**
+	 * Create a simplified mesh with reduced vertices (~25% of original).
+	 * Used for medium-distance fragments.
+	 *
+	 * @param Geometry The pre-extracted geometry data
+	 * @param AssetName Name for the mesh asset
+	 * @param OuterRef Package/outer for the mesh
+	 * @return Created UStaticMesh or nullptr on failure
+	 */
+	UStaticMesh* CreateSimplifiedMesh(
+		const FPreExtractedGeometry& Geometry,
+		const FString& AssetName,
+		UObject* OuterRef);
+
+	/**
+	 * Get or create a mesh for the specified LOD level.
+	 * Checks LodMeshCache first, creates and caches if not found.
+	 *
+	 * @param RepresentationId The geometry representation ID
+	 * @param LodLevel The desired LOD level
+	 * @param Geometry Pre-extracted geometry for mesh creation
+	 * @param MeshName Base name for the mesh asset
+	 * @param OuterRef Package/outer for the mesh
+	 * @return UStaticMesh for the LOD level, or nullptr on failure
+	 */
+	UStaticMesh* GetOrCreateLodMesh(
+		int32 RepresentationId,
+		EFragmentLod LodLevel,
+		const FPreExtractedGeometry& Geometry,
+		const FString& MeshName,
+		UObject* OuterRef);
+
+	/**
+	 * Calculate bounding box from vertex array.
+	 * Helper for LOD mesh creation.
+	 */
+	FBox CalculateBoundsFromVertices(const TArray<FVector>& Vertices) const;
+
 private:
 
 	UPROPERTY()
@@ -362,6 +452,10 @@ private:
 	// RepresentationId share identical geometry in FlatBuffers format
 	UPROPERTY()
 	TMap<int32, UStaticMesh*> RepresentationMeshCache;
+
+	// LOD mesh cache (Key = RepresentationId -> LOD variants)
+	// Stores bounding box, simplified, and full detail meshes per representation
+	TMap<int32, FLodMeshVariants> LodMeshCache;
 
 	UPROPERTY()
 	TArray<UPackage*> PackagesToSave;
@@ -532,8 +626,8 @@ public:
 
 	TArray<class AFragment*> FragmentActors;
 
-	/** Show debug wireframe bounds for streaming tiles (green=loading, red=culled) */
+	/** Show debug LOD color overlay on fragments (Red=BoundingBox, Yellow=Simplified, Green=FullDetail) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
-	bool bShowDebugTileBounds = false;
+	bool bShowDebugLodColors = false;
 
 };

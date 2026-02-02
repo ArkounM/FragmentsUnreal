@@ -77,10 +77,10 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		// === DEBUG MODE: SHOW ALL ===
 		if (bShowAllVisible)
 		{
-			// Skip frustum test, show everything
+			// Skip frustum test, show everything at full detail
 			FFragmentVisibilityResult Result;
 			Result.LocalId = Sample.LocalId;
-			Result.LodLevel = EFragmentLod::Visible;
+			Result.LodLevel = EFragmentLod::FullDetail;
 			Result.ScreenSize = ViewportHeight; // Max screen size
 			Result.Distance = 0.0f;
 			Result.MaterialIndex = Sample.MaterialIndex;
@@ -100,8 +100,11 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		const float Distance = GetDistanceToBox(Sample.WorldBounds);
 		const float ScreenSize = CalculateScreenSize(Sample.MaxDimension, Distance);
 
-		// === SCREEN SIZE CULLING ===
-		if (ScreenSize < MinScreen)
+		// === DETERMINE LOD LEVEL ===
+		const EFragmentLod LodLevel = DetermineLodLevel(ScreenSize);
+
+		// Skip invisible fragments
+		if (LodLevel == EFragmentLod::Invisible)
 		{
 			continue;
 		}
@@ -109,7 +112,7 @@ void UPerSampleVisibilityController::UpdateVisibility(const FVector& CameraPos, 
 		// === ADD TO VISIBLE SAMPLES ===
 		FFragmentVisibilityResult Result;
 		Result.LocalId = Sample.LocalId;
-		Result.LodLevel = EFragmentLod::Visible;
+		Result.LodLevel = LodLevel;
 		Result.ScreenSize = ScreenSize;
 		Result.Distance = Distance;
 		Result.MaterialIndex = Sample.MaterialIndex;
@@ -157,7 +160,37 @@ int32 UPerSampleVisibilityController::GetCountByLod(EFragmentLod LodLevel) const
 	return Count;
 }
 
-// EvaluateLod removed - simplified to just Visible/Invisible based on frustum and screen size
+EFragmentLod UPerSampleVisibilityController::DetermineLodLevel(float ScreenSize) const
+{
+	if (!bEnableLodSystem)
+	{
+		// Binary mode: visible or invisible only
+		return (ScreenSize >= MinScreenSize * GraphicsQuality)
+			? EFragmentLod::FullDetail
+			: EFragmentLod::Invisible;
+	}
+
+	const float QualityMin = MinScreenSize * GraphicsQuality;
+	const float QualityBoundingBox = BoundingBoxThreshold * GraphicsQuality;
+	const float QualitySimplified = SimplifiedThreshold * GraphicsQuality;
+
+	if (ScreenSize < QualityMin)
+	{
+		return EFragmentLod::Invisible;
+	}
+	else if (ScreenSize < QualityBoundingBox)
+	{
+		return EFragmentLod::BoundingBox;
+	}
+	else if (ScreenSize < QualitySimplified)
+	{
+		return EFragmentLod::Simplified;
+	}
+	else
+	{
+		return EFragmentLod::FullDetail;
+	}
+}
 
 float UPerSampleVisibilityController::GetViewDimension(float Distance) const
 {

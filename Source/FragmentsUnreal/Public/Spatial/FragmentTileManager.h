@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "UObject/NoExportTypes.h"
+#include "Spatial/PerSampleVisibilityController.h"
 #include "FragmentTileManager.generated.h"
 
 // Forward declarations
@@ -11,6 +12,8 @@ class UPerSampleVisibilityController;
 class UDynamicTileGenerator;
 class UOcclusionSpawnController;
 class UFragmentModelWrapper;
+class UMaterialInterface;
+class UMaterialInstanceDynamic;
 struct FFragmentItem;
 
 /**
@@ -163,6 +166,31 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
 	int32 GetTotalCachedFragmentCount() const { return SpawnedFragmentActors.Num(); }
 
+	// --- LOD Tracking (Phase 4) ---
+
+	/**
+	 * Get current LOD level for a fragment (from last visibility update).
+	 * @param LocalId Fragment local ID
+	 * @return Current LOD level, or Invisible if fragment not tracked
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Fragments|LOD")
+	EFragmentLod GetCurrentLodForFragment(int32 LocalId) const;
+
+	/**
+	 * Get count of fragments at each LOD level (C++ only).
+	 * @return Map of LOD level -> fragment count
+	 */
+	TMap<EFragmentLod, int32> GetLodDistribution() const;
+
+	// --- Debug Visualization ---
+
+	/**
+	 * Apply or remove debug LOD color overlay on all spawned fragment actors.
+	 * Red = BoundingBox, Yellow = Simplified, Green = FullDetail.
+	 * @param bEnable True to apply color overlay, false to restore original materials
+	 */
+	void ApplyDebugLodColors(bool bEnable);
+
 private:
 	// --- State ---
 
@@ -204,6 +232,26 @@ private:
 
 	/** Last used time for each fragment (for LRU eviction) */
 	TMap<int32, double> FragmentLastUsedTime;
+
+	/** Current LOD level for each fragment (updated from visibility results) */
+	TMap<int32, EFragmentLod> FragmentLodMap;
+
+	/** Whether debug LOD colors are currently applied */
+	bool bDebugLodColorsActive = false;
+
+	/** Saved original materials per fragment for restoring after debug overlay */
+	TMap<int32, TArray<UMaterialInterface*>> SavedFragmentMaterials;
+
+	/** Cached debug material instances (one per LOD level) */
+	UPROPERTY()
+	UMaterialInstanceDynamic* DebugMaterial_BoundingBox = nullptr;
+	UPROPERTY()
+	UMaterialInstanceDynamic* DebugMaterial_Simplified = nullptr;
+	UPROPERTY()
+	UMaterialInstanceDynamic* DebugMaterial_FullDetail = nullptr;
+
+	/** Create or get debug material for a LOD level */
+	UMaterialInstanceDynamic* GetDebugMaterialForLod(EFragmentLod LodLevel);
 
 	/** Last camera position used for update */
 	FVector LastCameraPosition = FVector::ZeroVector;

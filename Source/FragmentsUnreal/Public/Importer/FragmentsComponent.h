@@ -65,17 +65,18 @@ public:
 	void StopTileStreaming();
 
 	/**
-	 * Toggle debug visualization of tile bounds
-	 * @param bShow True to show wireframe boxes, false to hide
+	 * Toggle debug LOD color overlay on fragments.
+	 * Red = BoundingBox LOD, Yellow = Simplified LOD, Green = FullDetail LOD.
+	 * @param bShow True to show LOD color overlay, false to restore original materials
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Debug")
-	void SetShowDebugTileBounds(bool bShow);
+	void SetShowDebugLodColors(bool bShow);
 
 	/**
-	 * Get current debug visualization state
+	 * Get current LOD debug visualization state
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Debug")
-	bool GetShowDebugTileBounds() const;
+	bool GetShowDebugLodColors() const;
 
 private:
 	// Timer handle for camera update

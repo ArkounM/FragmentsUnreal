@@ -8,6 +8,7 @@
 #include "Fragment/Fragment.h"
 #include "HAL/PlatformTime.h"
 #include "Components/StaticMeshComponent.h"
+#include "Materials/MaterialInstanceDynamic.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFragmentTileManager, Log, All);
 
@@ -110,6 +111,13 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 	const TArray<FFragmentVisibilityResult>& VisibleSamples = SampleVisibility->GetVisibleSamples();
 	TileGenerator->GenerateTiles(VisibleSamples, FragmentRegistry);
 
+	// === STEP 2.5: Update LOD tracking map ===
+	FragmentLodMap.Empty(VisibleSamples.Num());
+	for (const FFragmentVisibilityResult& Result : VisibleSamples)
+	{
+		FragmentLodMap.Add(Result.LocalId, Result.LodLevel);
+	}
+
 	// === STEP 3: Determine fragments to spawn/show/hide ===
 	TArray<int32> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
 	TArray<int32> ToHide = TileGenerator->GetFragmentsToUnload(SpawnedFragments);
@@ -154,6 +162,17 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 
 	// === STEP 6: Evict hidden fragments if memory over budget ===
 	EvictFragmentsToFitBudget();
+
+	// === STEP 7: Apply debug LOD color overlay if enabled ===
+	if (Importer && Importer->bShowDebugLodColors)
+	{
+		ApplyDebugLodColors(true);
+	}
+	else if (bDebugLodColorsActive)
+	{
+		// Was enabled but now disabled - restore original materials
+		ApplyDebugLodColors(false);
+	}
 
 	// Update last camera state
 	LastCameraPosition = CameraLocation;
@@ -400,9 +419,18 @@ bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
 		}
 	}
 
-	// Spawn fragment - pass bWasInstanced to track GPU instanced fragments
+	// Get LOD level from visibility results (default to FullDetail if not tracked)
+	EFragmentLod LodLevel = GetCurrentLodForFragment(LocalId);
+	if (LodLevel == EFragmentLod::Invisible)
+	{
+		// Fragment is not visible according to current visibility - default to FullDetail
+		// This can happen if visibility was not updated or fragment was added between updates
+		LodLevel = EFragmentLod::FullDetail;
+	}
+
+	// Spawn fragment - pass bWasInstanced to track GPU instanced fragments and LOD level
 	bool bWasInstanced = false;
-	AFragment* SpawnedActor = Importer->SpawnSingleFragment(*FragmentItem, ParentActor, MeshesRef, false, &bWasInstanced);
+	AFragment* SpawnedActor = Importer->SpawnSingleFragment(*FragmentItem, ParentActor, MeshesRef, false, &bWasInstanced, nullptr, nullptr, LodLevel);
 
 	if (SpawnedActor)
 	{
@@ -753,4 +781,161 @@ void UFragmentTileManager::UpdateOcclusionTracking()
 
 	TSet<int32> RenderedFragments = CollectRenderedFragments();
 	OcclusionController->UpdateOcclusionTracking(RenderedFragments, SpawnedFragments);
+}
+
+// =============================================================================
+// LOD TRACKING METHODS (Phase 4)
+// =============================================================================
+
+EFragmentLod UFragmentTileManager::GetCurrentLodForFragment(int32 LocalId) const
+{
+	if (const EFragmentLod* Found = FragmentLodMap.Find(LocalId))
+	{
+		return *Found;
+	}
+	return EFragmentLod::Invisible;
+}
+
+TMap<EFragmentLod, int32> UFragmentTileManager::GetLodDistribution() const
+{
+	TMap<EFragmentLod, int32> Distribution;
+	Distribution.Add(EFragmentLod::Invisible, 0);
+	Distribution.Add(EFragmentLod::BoundingBox, 0);
+	Distribution.Add(EFragmentLod::Simplified, 0);
+	Distribution.Add(EFragmentLod::FullDetail, 0);
+
+	for (const auto& Pair : FragmentLodMap)
+	{
+		Distribution[Pair.Value]++;
+	}
+
+	return Distribution;
+}
+
+// =============================================================================
+// DEBUG LOD VISUALIZATION (Phase 4)
+// =============================================================================
+
+UMaterialInstanceDynamic* UFragmentTileManager::GetDebugMaterialForLod(EFragmentLod LodLevel)
+{
+	// Create debug materials lazily using the plugin's base material
+	UMaterialInterface* BaseMat = LoadObject<UMaterialInterface>(nullptr,
+		TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
+	if (!BaseMat)
+	{
+		UE_LOG(LogFragmentTileManager, Warning, TEXT("GetDebugMaterialForLod: Could not load base material"));
+		return nullptr;
+	}
+
+	switch (LodLevel)
+	{
+	case EFragmentLod::BoundingBox:
+		if (!DebugMaterial_BoundingBox)
+		{
+			DebugMaterial_BoundingBox = UMaterialInstanceDynamic::Create(BaseMat, this);
+			DebugMaterial_BoundingBox->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor(1.0f, 0.0f, 0.0f, 0.7f)); // Red
+		}
+		return DebugMaterial_BoundingBox;
+
+	case EFragmentLod::Simplified:
+		if (!DebugMaterial_Simplified)
+		{
+			DebugMaterial_Simplified = UMaterialInstanceDynamic::Create(BaseMat, this);
+			DebugMaterial_Simplified->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor(1.0f, 1.0f, 0.0f, 0.7f)); // Yellow
+		}
+		return DebugMaterial_Simplified;
+
+	case EFragmentLod::FullDetail:
+		if (!DebugMaterial_FullDetail)
+		{
+			DebugMaterial_FullDetail = UMaterialInstanceDynamic::Create(BaseMat, this);
+			DebugMaterial_FullDetail->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor(0.0f, 1.0f, 0.0f, 0.7f)); // Green
+		}
+		return DebugMaterial_FullDetail;
+
+	default:
+		return nullptr;
+	}
+}
+
+void UFragmentTileManager::ApplyDebugLodColors(bool bEnable)
+{
+	if (bEnable)
+	{
+		bDebugLodColorsActive = true;
+
+		for (const auto& Pair : SpawnedFragmentActors)
+		{
+			const int32 LocalId = Pair.Key;
+			AFragment* Actor = Pair.Value;
+			if (!Actor) continue;
+
+			// Determine LOD level for this fragment
+			EFragmentLod LodLevel = GetCurrentLodForFragment(LocalId);
+			if (LodLevel == EFragmentLod::Invisible)
+			{
+				LodLevel = EFragmentLod::FullDetail; // Default for spawned fragments
+			}
+
+			// Get debug material for this LOD level
+			UMaterialInstanceDynamic* DebugMat = GetDebugMaterialForLod(LodLevel);
+			if (!DebugMat) continue;
+
+			// Find all static mesh components on this actor
+			TArray<UStaticMeshComponent*> MeshComponents;
+			Actor->GetComponents<UStaticMeshComponent>(MeshComponents);
+
+			for (UStaticMeshComponent* MeshComp : MeshComponents)
+			{
+				if (!MeshComp) continue;
+
+				// Save original materials (only once per fragment, not on every update)
+				if (!SavedFragmentMaterials.Contains(LocalId))
+				{
+					TArray<UMaterialInterface*> OriginalMats;
+					for (int32 MatIdx = 0; MatIdx < MeshComp->GetNumMaterials(); MatIdx++)
+					{
+						OriginalMats.Add(MeshComp->GetMaterial(MatIdx));
+					}
+					SavedFragmentMaterials.Add(LocalId, OriginalMats);
+				}
+
+				// Apply debug color to all material slots
+				for (int32 MatIdx = 0; MatIdx < MeshComp->GetNumMaterials(); MatIdx++)
+				{
+					MeshComp->SetMaterial(MatIdx, DebugMat);
+				}
+			}
+		}
+	}
+	else
+	{
+		// Restore original materials
+		for (const auto& Pair : SavedFragmentMaterials)
+		{
+			const int32 LocalId = Pair.Key;
+			const TArray<UMaterialInterface*>& OriginalMats = Pair.Value;
+
+			AFragment** ActorPtr = SpawnedFragmentActors.Find(LocalId);
+			if (!ActorPtr || !*ActorPtr) continue;
+
+			TArray<UStaticMeshComponent*> MeshComponents;
+			(*ActorPtr)->GetComponents<UStaticMeshComponent>(MeshComponents);
+
+			for (UStaticMeshComponent* MeshComp : MeshComponents)
+			{
+				if (!MeshComp) continue;
+
+				for (int32 MatIdx = 0; MatIdx < FMath::Min(MeshComp->GetNumMaterials(), OriginalMats.Num()); MatIdx++)
+				{
+					MeshComp->SetMaterial(MatIdx, OriginalMats[MatIdx]);
+				}
+			}
+		}
+
+		SavedFragmentMaterials.Empty();
+		bDebugLodColorsActive = false;
+
+		UE_LOG(LogFragmentTileManager, Log, TEXT("Debug LOD colors: Restored original materials"));
+	}
 }

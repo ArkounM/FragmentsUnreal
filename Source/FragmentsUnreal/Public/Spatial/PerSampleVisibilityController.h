@@ -6,15 +6,56 @@
 
 /**
  * LOD levels for fragment visibility.
- * Simplified to just Visible/Invisible since we don't use wire LOD.
+ * Multi-level LOD based on screen-space pixel size for performance optimization.
  */
 UENUM(BlueprintType)
 enum class EFragmentLod : uint8
 {
-	/** Fragment is not visible (culled) */
+	/** Fragment is not visible (culled) - screen size < 2 pixels */
 	Invisible,
-	/** Fragment is visible and should be rendered */
-	Visible
+	/** Simple bounding box mesh (12 triangles) - screen size 2-16 pixels */
+	BoundingBox,
+	/** Reduced vertex geometry (~25% of full) - screen size 16-64 pixels */
+	Simplified,
+	/** Full detail geometry (100%) - screen size > 64 pixels */
+	FullDetail
+};
+
+/**
+ * LOD mesh variants for a representation.
+ * Holds full detail, simplified, and bounding box meshes for LOD switching.
+ * Note: This is a plain C++ struct (not USTRUCT) because it contains UObject
+ * pointers that are managed by the importer's UPROPERTY cache.
+ */
+struct FLodMeshVariants
+{
+	class UStaticMesh* FullDetailMesh = nullptr;
+	class UStaticMesh* SimplifiedMesh = nullptr;
+	class UStaticMesh* BoundingBoxMesh = nullptr;
+
+	/** Get the appropriate mesh for a given LOD level */
+	UStaticMesh* GetMeshForLod(EFragmentLod LodLevel) const
+	{
+		switch (LodLevel)
+		{
+		case EFragmentLod::BoundingBox:
+			return BoundingBoxMesh;
+		case EFragmentLod::Simplified:
+			// Fall back to full detail if simplified not available
+			return SimplifiedMesh ? SimplifiedMesh : FullDetailMesh;
+		case EFragmentLod::FullDetail:
+			return FullDetailMesh;
+		case EFragmentLod::Invisible:
+		default:
+			return nullptr;
+		}
+	}
+
+	/** Check if this variant has any meshes */
+	bool HasAnyMesh() const
+	{
+		return FullDetailMesh != nullptr || SimplifiedMesh != nullptr || BoundingBoxMesh != nullptr;
+	}
 };
 
 /**
@@ -203,6 +244,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|Thresholds")
 	float MinScreenSize = 2.0f;
 
+	// --- LOD Configuration ---
+
+	/** Screen size threshold for BoundingBox LOD (pixels) - fragments smaller use bounding box */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|LOD")
+	float BoundingBoxThreshold = 16.0f;
+
+	/** Screen size threshold for Simplified LOD (pixels) - fragments smaller use simplified mesh */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|LOD")
+	float SimplifiedThreshold = 64.0f;
+
+	/** Enable multi-level LOD system (false = binary visible/invisible only) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|LOD")
+	bool bEnableLodSystem = true;
+
 	/** Minimum camera movement to trigger update (cm) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visibility|Update")
 	float MinCameraMovement = 100.0f;  // 1 meter - matches FragmentTileManager
@@ -236,6 +291,13 @@ private:
 	FRotator LastCameraRotation = FRotator::ZeroRotator;
 
 	// --- Helper Methods ---
+
+	/**
+	 * Determine LOD level based on screen size and configured thresholds.
+	 * @param ScreenSize Calculated screen size in pixels
+	 * @return Appropriate LOD level for the fragment
+	 */
+	EFragmentLod DetermineLodLevel(float ScreenSize) const;
 
 	/**
 	 * Test if box is inside frustum.

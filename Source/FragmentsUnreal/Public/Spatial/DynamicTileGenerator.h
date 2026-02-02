@@ -26,9 +26,9 @@ struct FDynamicRenderTile
 	UPROPERTY(BlueprintReadOnly, Category = "Tile")
 	int32 MaterialIndex = 0;
 
-	/** LOD level for this tile's fragments (always Visible since we don't use Wires LOD) */
+	/** LOD level for this tile's fragments */
 	UPROPERTY(BlueprintReadOnly, Category = "Tile")
-	EFragmentLod LodLevel = EFragmentLod::Visible;
+	EFragmentLod LodLevel = EFragmentLod::FullDetail;
 
 	/** Grid position (snapped to tile dimension) */
 	UPROPERTY(BlueprintReadOnly, Category = "Tile")

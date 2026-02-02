@@ -141,6 +141,9 @@ struct FPreExtractedGeometry
 	// Validation flag - if false, geometry should be skipped during spawn
 	bool bIsValid = false;
 
+	// Track if extraction was attempted (to avoid repeated failures)
+	bool bExtractionAttempted = false;
+
 	// Representation ID (for debugging/logging)
 	int32 RepresentationId = -1;
 

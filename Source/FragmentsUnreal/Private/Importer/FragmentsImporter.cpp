@@ -409,10 +409,20 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 
 		}
 
-		// Pre-extract all geometry data from FlatBuffers at load time
-		// This eliminates FlatBuffer access during spawn phase and prevents crashes
-		// when FlatBuffer pointers become invalid in the async/TileManager path
-		PreExtractAllGeometry(Wrapper->GetModelItemRef(), _meshes);
+		// Pre-extract geometry data from FlatBuffers
+		// When bPreExtractAllGeometry is true: Extract all geometry at load time (legacy behavior)
+		// When false: Only count instances for GPU instancing decisions, defer geometry extraction to spawn time
+		if (bPreExtractAllGeometry)
+		{
+			// Full extraction at load time - eliminates FlatBuffer access during spawn phase
+			PreExtractAllGeometry(Wrapper->GetModelItemRef(), _meshes);
+		}
+		else
+		{
+			// Lightweight pass - only extract material data for instancing decisions
+			// Geometry will be extracted on-demand during spawn phase
+			CountRepresentationInstances(Wrapper->GetModelItemRef(), _meshes);
+		}
 	}
 	ModelFragmentsMap.Add(ModelGuidStr, FFragmentLookup());
 
@@ -1157,7 +1167,7 @@ void UFragmentsImporter::BuildSpawnQueue(const FFragmentItem& Item, AActor* Pare
 	// We'll handle parent-child relationships during spawning
 }
 
-AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced, float* RemainingBudgetMs, int32* OutSamplesProcessed)
+AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced, float* RemainingBudgetMs, int32* OutSamplesProcessed, EFragmentLod RequestedLod)
 {
 	// Track start time for budget checking
 	const double SpawnStartTime = FPlatformTime::Seconds();
@@ -1173,9 +1183,37 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 		*OutSamplesProcessed = 0;
 	}
 
+	// Skip invisible LOD entirely
+	if (RequestedLod == EFragmentLod::Invisible)
+	{
+		return nullptr;
+	}
+
 	if (!ParentActor) return nullptr;
 
+	// Get mutable reference to samples for on-demand geometry extraction
+	// This is safe because we're modifying internal cached data, not the logical state
+	TArray<FFragmentSample>& MutableSamples = const_cast<TArray<FFragmentSample>&>(Item.Samples);
 	const TArray<FFragmentSample>& Samples = Item.Samples;
+
+	// ==========================================
+	// ON-DEMAND GEOMETRY EXTRACTION
+	// If geometry wasn't pre-extracted, extract it now for samples we'll process
+	// ==========================================
+	if (!bPreExtractAllGeometry && MeshesRef)
+	{
+		for (FFragmentSample& Sample : MutableSamples)
+		{
+			// Skip if already valid or already attempted
+			if (Sample.ExtractedGeometry.bIsValid || Sample.ExtractedGeometry.bExtractionAttempted)
+			{
+				continue;
+			}
+
+			// Attempt on-demand extraction
+			ExtractSampleGeometryOnDemand(Sample, MeshesRef, Item.LocalId);
+		}
+	}
 
 	// ==========================================
 	// GPU INSTANCING: Check if ALL samples should be instanced
@@ -1234,21 +1272,38 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 				ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
 
 			// Get or create mesh from representation cache
+			// Use LOD-aware mesh creation when RequestedLod is not FullDetail
 			UStaticMesh* Mesh = nullptr;
-			if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepId))
+			FString MeshName = FString::Printf(TEXT("Rep_%d"), RepId);
+			UPackage* MeshPackage = CreatePackage(*FString::Printf(TEXT("/Game/Buildings/Instanced/%s"), *MeshName));
+
+			if (RequestedLod != EFragmentLod::FullDetail)
+			{
+				// Use LOD mesh cache for non-full-detail levels
+				Mesh = GetOrCreateLodMesh(RepId, RequestedLod, ExtractedGeom, MeshName, MeshPackage);
+				if (Mesh)
+				{
+					UE_LOG(LogFragments, Verbose, TEXT("GPU Instancing: Using LOD %d mesh for RepId %d"),
+						static_cast<int32>(RequestedLod), RepId);
+				}
+			}
+			else if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepId))
 			{
 				Mesh = *CachedMesh;
 			}
 			else if (CanCreateNewMesh())
 			{
 				// Create new mesh (only if we haven't exceeded the per-frame limit)
-				FString MeshName = FString::Printf(TEXT("Rep_%d"), RepId);
-				UPackage* MeshPackage = CreatePackage(*FString::Printf(TEXT("/Game/Buildings/Instanced/%s"), *MeshName));
 				Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
 				if (Mesh)
 				{
 					OnNewMeshCreated();
 					RepresentationMeshCache.Add(RepId, Mesh);
+
+					// Also cache in LOD variants for FullDetail level
+					FLodMeshVariants& LodVariants = LodMeshCache.FindOrAdd(RepId);
+					LodVariants.FullDetailMesh = Mesh;
+
 					UE_LOG(LogFragments, Verbose, TEXT("GPU Instancing: Created mesh for RepId %d [%d/%d this frame]"),
 						RepId, NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
 				}
@@ -1425,7 +1480,19 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					// All instances with the same RepresentationId share identical geometry
 					const int32 RepresentationId = Sample.RepresentationIndex;
 
-					if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepresentationId))
+					// === LOD SYSTEM (Phase 4) ===
+					// Use LOD-aware mesh creation when RequestedLod is not FullDetail
+					if (RequestedLod != EFragmentLod::FullDetail)
+					{
+						// Use LOD mesh cache - creates appropriate LOD mesh if not cached
+						Mesh = GetOrCreateLodMesh(RepresentationId, RequestedLod, ExtractedGeom, MeshName, MeshPackage);
+						if (Mesh)
+						{
+							UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Using LOD %d mesh for RepId %d (LocalId: %d)"),
+								static_cast<int32>(RequestedLod), RepresentationId, FragmentModel->GetLocalId());
+						}
+					}
+					else if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepresentationId))
 					{
 						// Reuse existing mesh for this representation (cache hit - no limit)
 						Mesh = *CachedMesh;
@@ -1445,6 +1512,10 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 							// Cache by RepresentationId for future instances
 							RepresentationMeshCache.Add(RepresentationId, Mesh);
+
+							// Also cache in LOD variants for FullDetail level
+							FLodMeshVariants& LodVariants = LodMeshCache.FindOrAdd(RepresentationId);
+							LodVariants.FullDetailMesh = Mesh;
 
 							// Save mesh if needed
 							if (!FPaths::FileExists(PackageFileName) && bSaveMeshes)
@@ -3440,8 +3511,13 @@ void UFragmentsImporter::PreExtractAllGeometry(FFragmentItem& RootItem, const Me
 
 bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId)
 {
-	// Reset the extracted geometry to ensure clean state
+	// Mark that extraction was attempted (to avoid repeated failures in on-demand path)
+	Sample.ExtractedGeometry.bExtractionAttempted = true;
+
+	// Reset the extracted geometry to ensure clean state (but preserve bExtractionAttempted)
+	bool bAttempted = Sample.ExtractedGeometry.bExtractionAttempted;
 	Sample.ExtractedGeometry = FPreExtractedGeometry();
+	Sample.ExtractedGeometry.bExtractionAttempted = bAttempted;
 
 	// Validate indices are valid
 	if (Sample.RepresentationIndex < 0 || Sample.MaterialIndex < 0 || Sample.LocalTransformIndex < 0)
@@ -3692,6 +3768,152 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Unknown representation class %d for item %d"),
 		static_cast<int32>(representation->representation_class()), ItemLocalId);
 	return false;
+}
+
+bool UFragmentsImporter::ExtractSampleGeometryOnDemand(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId)
+{
+	// If already valid, no need to extract again
+	if (Sample.ExtractedGeometry.bIsValid)
+	{
+		return true;
+	}
+
+	// If extraction was already attempted and failed, don't retry
+	if (Sample.ExtractedGeometry.bExtractionAttempted)
+	{
+		return false;
+	}
+
+	// Attempt extraction (this will set bExtractionAttempted = true)
+	return ExtractSampleGeometry(Sample, MeshesRef, ItemLocalId);
+}
+
+void UFragmentsImporter::CountRepresentationInstances(FFragmentItem& RootItem, const Meshes* MeshesRef)
+{
+	if (!MeshesRef)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CountRepresentationInstances: MeshesRef is null, skipping"));
+		return;
+	}
+
+	const double StartTime = FPlatformTime::Seconds();
+
+	// Statistics
+	int32 TotalSamples = 0;
+	int32 SuccessfulMaterialExtractions = 0;
+
+	// Clear previous counts
+	RepresentationMaterialInstanceCount.Empty();
+
+	// Use a stack-based approach to avoid deep recursion
+	TArray<FFragmentItem*> ItemStack;
+	ItemStack.Add(&RootItem);
+
+	while (ItemStack.Num() > 0)
+	{
+		FFragmentItem* CurrentItem = ItemStack.Pop();
+		if (!CurrentItem)
+		{
+			continue;
+		}
+
+		// Process all samples in this item - extract ONLY material data (lightweight)
+		for (FFragmentSample& Sample : CurrentItem->Samples)
+		{
+			TotalSamples++;
+
+			// Skip invalid indices
+			if (Sample.RepresentationIndex < 0 || Sample.MaterialIndex < 0 || Sample.LocalTransformIndex < 0)
+			{
+				continue;
+			}
+
+			// Validate FlatBuffer arrays exist
+			if (!MeshesRef->materials() || !MeshesRef->local_transforms())
+			{
+				continue;
+			}
+
+			// Bounds check material index
+			const uint32 MatCount = MeshesRef->materials()->size();
+			if (static_cast<uint32>(Sample.MaterialIndex) >= MatCount)
+			{
+				continue;
+			}
+
+			// Extract ONLY material data (no vertices, no profiles - that's the expensive part)
+			const Material* material = MeshesRef->materials()->Get(Sample.MaterialIndex);
+			if (material)
+			{
+				Sample.ExtractedGeometry.R = material->r();
+				Sample.ExtractedGeometry.G = material->g();
+				Sample.ExtractedGeometry.B = material->b();
+				Sample.ExtractedGeometry.A = material->a();
+				Sample.ExtractedGeometry.bIsGlass = material->a() < 255;
+
+				// Extract local transform (needed for spawn positioning)
+				const uint32 TransformCount = MeshesRef->local_transforms()->size();
+				if (static_cast<uint32>(Sample.LocalTransformIndex) < TransformCount)
+				{
+					const Transform* local_transform = MeshesRef->local_transforms()->Get(Sample.LocalTransformIndex);
+					if (local_transform)
+					{
+						Sample.ExtractedGeometry.LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
+					}
+				}
+
+				// Compute material hash for instancing decision
+				uint32 MatHash = HashMaterialProperties(
+					Sample.ExtractedGeometry.R,
+					Sample.ExtractedGeometry.G,
+					Sample.ExtractedGeometry.B,
+					Sample.ExtractedGeometry.A,
+					Sample.ExtractedGeometry.bIsGlass);
+
+				int64 ComboKey = ((int64)Sample.RepresentationIndex) | ((int64)MatHash << 32);
+				int32& Count = RepresentationMaterialInstanceCount.FindOrAdd(ComboKey);
+				Count++;
+
+				SuccessfulMaterialExtractions++;
+
+				// NOTE: bIsValid is still false - geometry not extracted yet
+				// NOTE: bExtractionAttempted is still false - full extraction not attempted
+			}
+		}
+
+		// Add children to the stack for processing
+		for (FFragmentItem* Child : CurrentItem->FragmentChildren)
+		{
+			if (Child)
+			{
+				ItemStack.Add(Child);
+			}
+		}
+	}
+
+	const double ElapsedMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+
+	// Log instancing analysis
+	int32 InstanceableCount = 0;
+	int32 UniqueInstanceableGroups = 0;
+	for (const auto& Pair : RepresentationMaterialInstanceCount)
+	{
+		if (Pair.Value >= InstancingThreshold)
+		{
+			InstanceableCount += Pair.Value;
+			UniqueInstanceableGroups++;
+		}
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("=== LIGHTWEIGHT INSTANCE COUNTING COMPLETE (%.1f ms) ==="), ElapsedMs);
+	UE_LOG(LogFragments, Log, TEXT("Total samples: %d"), TotalSamples);
+	UE_LOG(LogFragments, Log, TEXT("Material extractions: %d"), SuccessfulMaterialExtractions);
+	UE_LOG(LogFragments, Log, TEXT("=== GPU INSTANCING ANALYSIS ==="));
+	UE_LOG(LogFragments, Log, TEXT("Instancing threshold: %d instances"), InstancingThreshold);
+	UE_LOG(LogFragments, Log, TEXT("Total unique RepId+Material combinations: %d"), RepresentationMaterialInstanceCount.Num());
+	UE_LOG(LogFragments, Log, TEXT("Groups meeting threshold: %d"), UniqueInstanceableGroups);
+	UE_LOG(LogFragments, Log, TEXT("Fragments eligible for instancing: %d"), InstanceableCount);
+	UE_LOG(LogFragments, Log, TEXT("NOTE: Geometry will be extracted on-demand during spawn phase"));
 }
 
 // ==========================================
@@ -4303,4 +4525,373 @@ FFindResult UFragmentsImporter::FindFragmentByLocalIdUnified(int32 LocalId, cons
 	}
 
 	return FFindResult::NotFound();
+}
+
+// ==========================================
+// LOD MESH CREATION IMPLEMENTATION (Phase 4)
+// ==========================================
+
+FBox UFragmentsImporter::CalculateBoundsFromVertices(const TArray<FVector>& Vertices) const
+{
+	if (Vertices.Num() == 0)
+	{
+		return FBox(FVector::ZeroVector, FVector::ZeroVector);
+	}
+
+	FBox Bounds(ForceInit);
+	for (const FVector& Vert : Vertices)
+	{
+		Bounds += Vert;
+	}
+
+	return Bounds;
+}
+
+UStaticMesh* UFragmentsImporter::CreateBoundingBoxMesh(
+	const FBox& Bounds,
+	uint8 R, uint8 G, uint8 B, uint8 A,
+	bool bIsGlass,
+	const FString& AssetName,
+	UObject* OuterRef)
+{
+	// Validate bounds
+	if (!Bounds.IsValid || Bounds.GetSize().IsNearlyZero())
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateBoundingBoxMesh: Invalid bounds for %s"), *AssetName);
+		return nullptr;
+	}
+
+	// Create StaticMesh object
+	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*AssetName), RF_Public | RF_Standalone);
+	StaticMesh->InitResources();
+	StaticMesh->SetLightingGuid();
+
+	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(OuterRef);
+	FMeshDescription& MeshDescription = StaticMeshDescription->GetMeshDescription();
+	UStaticMesh::FBuildMeshDescriptionsParams MeshParams;
+
+	// Build Settings
+#if WITH_EDITOR
+	{
+		FStaticMeshSourceModel& SrcModel = StaticMesh->AddSourceModel();
+		SrcModel.BuildSettings.bRecomputeNormals = true;
+		SrcModel.BuildSettings.bRecomputeTangents = true;
+		SrcModel.BuildSettings.bRemoveDegenerates = true;
+		SrcModel.BuildSettings.bUseHighPrecisionTangentBasis = false;
+		SrcModel.BuildSettings.bBuildReversedIndexBuffer = true;
+		SrcModel.BuildSettings.bUseFullPrecisionUVs = false;
+		SrcModel.BuildSettings.bGenerateLightmapUVs = false; // Not needed for LOD
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f;
+	}
+#endif
+
+	MeshParams.bBuildSimpleCollision = false; // No collision for LOD meshes
+	MeshParams.bCommitMeshDescription = true;
+	MeshParams.bMarkPackageDirty = true;
+	MeshParams.bUseHashAsGuid = false;
+#if !WITH_EDITOR
+	MeshParams.bFastBuild = true;
+#endif
+
+	// 8 box corners
+	const FVector Min = Bounds.Min;
+	const FVector Max = Bounds.Max;
+	const FVector Corners[8] = {
+		{Min.X, Min.Y, Min.Z}, // 0: front-bottom-left
+		{Max.X, Min.Y, Min.Z}, // 1: front-bottom-right
+		{Max.X, Max.Y, Min.Z}, // 2: back-bottom-right
+		{Min.X, Max.Y, Min.Z}, // 3: back-bottom-left
+		{Min.X, Min.Y, Max.Z}, // 4: front-top-left
+		{Max.X, Min.Y, Max.Z}, // 5: front-top-right
+		{Max.X, Max.Y, Max.Z}, // 6: back-top-right
+		{Min.X, Max.Y, Max.Z}  // 7: back-top-left
+	};
+
+	// Create vertices
+	TArray<FVertexID> Verts;
+	Verts.Reserve(8);
+	for (const FVector& C : Corners)
+	{
+		FVertexID V = StaticMeshDescription->CreateVertex();
+		StaticMeshDescription->SetVertexPosition(V, C);
+		Verts.Add(V);
+	}
+
+	// Add material
+	FName MatSlot = AddMaterialToMeshFromRawData(StaticMesh, R, G, B, A, bIsGlass);
+	FPolygonGroupID PolyGroup = StaticMeshDescription->CreatePolygonGroup();
+	StaticMeshDescription->SetPolygonGroupMaterialSlotName(PolyGroup, MatSlot);
+
+	// 12 triangles (6 faces, 2 triangles each)
+	// Indices for each face (counter-clockwise winding for Unreal)
+	const int32 Idx[36] = {
+		// Front face (Z-)
+		0, 2, 1,  0, 3, 2,
+		// Back face (Z+)
+		4, 5, 6,  4, 6, 7,
+		// Left face (X-)
+		0, 4, 7,  0, 7, 3,
+		// Right face (X+)
+		1, 2, 6,  1, 6, 5,
+		// Bottom face (Y-)
+		0, 1, 5,  0, 5, 4,
+		// Top face (Y+)
+		3, 7, 6,  3, 6, 2
+	};
+
+	for (int32 i = 0; i < 36; i += 3)
+	{
+		TArray<FVertexInstanceID> Tri;
+		Tri.Add(MeshDescription.CreateVertexInstance(Verts[Idx[i]]));
+		Tri.Add(MeshDescription.CreateVertexInstance(Verts[Idx[i + 1]]));
+		Tri.Add(MeshDescription.CreateVertexInstance(Verts[Idx[i + 2]]));
+		MeshDescription.CreatePolygon(PolyGroup, Tri);
+	}
+
+	FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MeshDescription);
+	FStaticMeshOperations::ComputeTangentsAndNormals(MeshDescription, EComputeNTBsFlags::Normals | EComputeNTBsFlags::Tangents);
+
+	StaticMesh->BuildFromMeshDescriptions(TArray<const FMeshDescription*>{&MeshDescription}, MeshParams);
+
+	UE_LOG(LogFragments, Verbose, TEXT("CreateBoundingBoxMesh: Created 12-triangle box for %s"), *AssetName);
+
+	return StaticMesh;
+}
+
+UStaticMesh* UFragmentsImporter::CreateSimplifiedMesh(
+	const FPreExtractedGeometry& Geometry,
+	const FString& AssetName,
+	UObject* OuterRef)
+{
+	if (!Geometry.bIsValid || !Geometry.bIsShell)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateSimplifiedMesh: Invalid geometry for %s"), *AssetName);
+		return nullptr;
+	}
+
+	if (Geometry.Vertices.Num() < 3)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateSimplifiedMesh: Too few vertices for %s"), *AssetName);
+		return nullptr;
+	}
+
+	// Calculate target vertex count (~25% of original, minimum 12 for basic shapes)
+	const int32 OriginalCount = Geometry.Vertices.Num();
+	const int32 TargetCount = FMath::Max(12, OriginalCount / 4);
+
+	// Simple vertex decimation: keep every Nth vertex
+	const int32 Skip = FMath::Max(1, OriginalCount / TargetCount);
+
+	TArray<FVector> SimplifiedVerts;
+	TMap<int32, int32> RemapTable;
+
+	for (int32 i = 0; i < OriginalCount; i += Skip)
+	{
+		RemapTable.Add(i, SimplifiedVerts.Num());
+		SimplifiedVerts.Add(Geometry.Vertices[i]);
+	}
+
+	// If simplification didn't reduce much, fall back to full detail
+	if (SimplifiedVerts.Num() >= OriginalCount * 0.9f)
+	{
+		UE_LOG(LogFragments, Verbose, TEXT("CreateSimplifiedMesh: Minimal reduction for %s, skipping"), *AssetName);
+		return nullptr;
+	}
+
+	// Create StaticMesh
+	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*AssetName), RF_Public | RF_Standalone);
+	StaticMesh->InitResources();
+	StaticMesh->SetLightingGuid();
+
+	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(OuterRef);
+	FMeshDescription& MeshDescription = StaticMeshDescription->GetMeshDescription();
+	UStaticMesh::FBuildMeshDescriptionsParams MeshParams;
+
+#if WITH_EDITOR
+	{
+		FStaticMeshSourceModel& SrcModel = StaticMesh->AddSourceModel();
+		SrcModel.BuildSettings.bRecomputeNormals = true;
+		SrcModel.BuildSettings.bRecomputeTangents = true;
+		SrcModel.BuildSettings.bRemoveDegenerates = true;
+		SrcModel.BuildSettings.bUseHighPrecisionTangentBasis = false;
+		SrcModel.BuildSettings.bBuildReversedIndexBuffer = true;
+		SrcModel.BuildSettings.bUseFullPrecisionUVs = false;
+		SrcModel.BuildSettings.bGenerateLightmapUVs = false;
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f;
+	}
+#endif
+
+	MeshParams.bBuildSimpleCollision = false;
+	MeshParams.bCommitMeshDescription = true;
+	MeshParams.bMarkPackageDirty = true;
+	MeshParams.bUseHashAsGuid = false;
+#if !WITH_EDITOR
+	MeshParams.bFastBuild = true;
+#endif
+
+	// Create vertices
+	TArray<FVertexID> Vertices;
+	Vertices.Reserve(SimplifiedVerts.Num());
+	for (const FVector& V : SimplifiedVerts)
+	{
+		FVertexID VId = StaticMeshDescription->CreateVertex();
+		StaticMeshDescription->SetVertexPosition(VId, V);
+		Vertices.Add(VId);
+	}
+
+	// Add material (preserve original material properties)
+	FName MaterialSlotName = AddMaterialToMeshFromRawData(
+		StaticMesh,
+		Geometry.R, Geometry.G, Geometry.B, Geometry.A,
+		Geometry.bIsGlass);
+	FPolygonGroupID PolygonGroupId = StaticMeshDescription->CreatePolygonGroup();
+	StaticMeshDescription->SetPolygonGroupMaterialSlotName(PolygonGroupId, MaterialSlotName);
+
+	// Remap and simplify profiles
+	bool bHasValidPolygons = false;
+	for (int32 ProfileIdx = 0; ProfileIdx < Geometry.ProfileIndices.Num(); ProfileIdx++)
+	{
+		const TArray<int32>& OriginalProfile = Geometry.ProfileIndices[ProfileIdx];
+
+		// Remap indices and remove duplicates
+		TArray<int32> SimplifiedProfile;
+		SimplifiedProfile.Reserve(OriginalProfile.Num() / Skip + 1);
+
+		for (int32 OrigIdx : OriginalProfile)
+		{
+			// Find nearest simplified vertex
+			int32 NearestSimplified = (OrigIdx / Skip) * Skip;
+			if (int32* MappedIdx = RemapTable.Find(NearestSimplified))
+			{
+				// Avoid consecutive duplicates
+				if (SimplifiedProfile.Num() == 0 || SimplifiedProfile.Last() != *MappedIdx)
+				{
+					SimplifiedProfile.Add(*MappedIdx);
+				}
+			}
+		}
+
+		// Need at least 3 vertices for a polygon
+		if (SimplifiedProfile.Num() < 3)
+		{
+			continue;
+		}
+
+		// Create polygon from simplified profile
+		TArray<FVertexInstanceID> PolygonVerts;
+		PolygonVerts.Reserve(SimplifiedProfile.Num());
+
+		for (int32 Idx : SimplifiedProfile)
+		{
+			if (Vertices.IsValidIndex(Idx))
+			{
+				PolygonVerts.Add(MeshDescription.CreateVertexInstance(Vertices[Idx]));
+			}
+		}
+
+		if (PolygonVerts.Num() >= 3)
+		{
+			MeshDescription.CreatePolygon(PolygonGroupId, PolygonVerts, {});
+			bHasValidPolygons = true;
+		}
+	}
+
+	if (!bHasValidPolygons)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateSimplifiedMesh: No valid polygons for %s"), *AssetName);
+		return nullptr;
+	}
+
+	FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MeshDescription);
+	FStaticMeshOperations::ComputeTangentsAndNormals(MeshDescription, EComputeNTBsFlags::Normals | EComputeNTBsFlags::Tangents);
+
+	StaticMesh->BuildFromMeshDescriptions(TArray<const FMeshDescription*>{&MeshDescription}, MeshParams);
+
+	UE_LOG(LogFragments, Verbose, TEXT("CreateSimplifiedMesh: Reduced %d -> %d vertices for %s"),
+		OriginalCount, SimplifiedVerts.Num(), *AssetName);
+
+	return StaticMesh;
+}
+
+UStaticMesh* UFragmentsImporter::GetOrCreateLodMesh(
+	int32 RepresentationId,
+	EFragmentLod LodLevel,
+	const FPreExtractedGeometry& Geometry,
+	const FString& MeshName,
+	UObject* OuterRef)
+{
+	// Check LOD cache first
+	if (FLodMeshVariants* Variants = LodMeshCache.Find(RepresentationId))
+	{
+		if (UStaticMesh* Cached = Variants->GetMeshForLod(LodLevel))
+		{
+			return Cached;
+		}
+	}
+
+	// Check mesh creation budget
+	if (!CanCreateNewMesh())
+	{
+		return nullptr;
+	}
+
+	// Create appropriate LOD mesh
+	UStaticMesh* NewMesh = nullptr;
+
+	switch (LodLevel)
+	{
+	case EFragmentLod::BoundingBox:
+		{
+			FBox Bounds = CalculateBoundsFromVertices(Geometry.Vertices);
+			NewMesh = CreateBoundingBoxMesh(Bounds,
+				Geometry.R, Geometry.G, Geometry.B, Geometry.A,
+				Geometry.bIsGlass,
+				MeshName + TEXT("_BB"),
+				OuterRef);
+		}
+		break;
+
+	case EFragmentLod::Simplified:
+		{
+			NewMesh = CreateSimplifiedMesh(Geometry, MeshName + TEXT("_Simp"), OuterRef);
+			// If simplified creation fails, fall through to full detail
+			if (!NewMesh)
+			{
+				NewMesh = CreateStaticMeshFromPreExtractedShell(Geometry, MeshName, OuterRef);
+			}
+		}
+		break;
+
+	case EFragmentLod::FullDetail:
+	default:
+		NewMesh = CreateStaticMeshFromPreExtractedShell(Geometry, MeshName, OuterRef);
+		break;
+	}
+
+	if (NewMesh)
+	{
+		OnNewMeshCreated();
+
+		// Cache in LOD variants
+		FLodMeshVariants& Variants = LodMeshCache.FindOrAdd(RepresentationId);
+		switch (LodLevel)
+		{
+		case EFragmentLod::BoundingBox:
+			Variants.BoundingBoxMesh = NewMesh;
+			break;
+		case EFragmentLod::Simplified:
+			Variants.SimplifiedMesh = NewMesh;
+			break;
+		case EFragmentLod::FullDetail:
+			Variants.FullDetailMesh = NewMesh;
+			break;
+		default:
+			break;
+		}
+
+		UE_LOG(LogFragments, Verbose, TEXT("GetOrCreateLodMesh: Created LOD %d mesh for RepId %d"),
+			static_cast<int32>(LodLevel), RepresentationId);
+	}
+
+	return NewMesh;
 }
