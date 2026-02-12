@@ -75,8 +75,6 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 		UE_LOG(LogFragments, Warning, TEXT("No owner provided for async spawn"));
 	}
 
-	// Leverage existing ProcessLoadedFragment to spawn actors
-	// TEMP: Use nullptr owner and save meshes -> in the future this will be a passed obj and bool respectively
 	ProcessLoadedFragment(ModelGuid, PendingOwner, true);
 
 	UE_LOG(LogFragments, Log, TEXT("ProcessLoadedFragment returned for: %s"), *ModelGuid);
@@ -295,6 +293,11 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 				UE_LOG(LogFragments, Error, TEXT("Decompression failed with error code: %d"), ret);
 				break;
 			}
+		}
+
+		if (ret != Z_STREAM_END)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("Decompression may be incomplete: loop limit reached (100 iterations, %d bytes out)"), TotalOut);
 		}
 
 		ret = inflateEnd(&stream);

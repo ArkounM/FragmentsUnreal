@@ -21,7 +21,7 @@ class UHierarchicalInstancedStaticMeshComponent;
 // Use FlatBuffers Model type
 using Model = ::Model;
 
-// Task for spawning a signle fragment
+// Task for spawning a single fragment
 struct FFragmentSpawnTask
 {
 	FFragmentItem FragmentItem;

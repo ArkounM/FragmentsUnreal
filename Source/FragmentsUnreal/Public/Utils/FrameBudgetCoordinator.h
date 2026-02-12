@@ -79,7 +79,6 @@ struct FFrameBudgetCoordinator
 			FrameHistoryCount = FMath::Min(FrameHistoryCount + 1, FrameHistorySize);
 		}
 
-		// Log statistics periodically (every 5 seconds)
 		FramesSinceLastLog++;
 		const double CurrentTime = FPlatformTime::Seconds();
 		if (CurrentTime - LastLogTime >= 5.0)
