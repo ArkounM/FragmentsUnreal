@@ -53,16 +53,6 @@ TArray<int32> UFragmentsImporterSubsystem::GetElementsByCategory(const FString& 
     return Importer->GetElementsByCategory(InCategory, ModelGuid);
 }
 
-void UFragmentsImporterSubsystem::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
-{
-    if (!Importer)
-    {
-        Importer = NewObject<UFragmentsImporter>(this);
-    }
-
-    Importer->ProcessFragmentAsync(FragmentPath, Owner, OnComplete);
-}
-
 FFragmentItem* UFragmentsImporterSubsystem::GetFragmentItemByLocalId(int32 InLocalId, const FString& InModelGuid)
 {
     check(Importer);
