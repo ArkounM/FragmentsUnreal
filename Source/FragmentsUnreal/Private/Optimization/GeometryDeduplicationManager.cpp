@@ -1,4 +1,5 @@
 #include "Optimization/GeometryDeduplicationManager.h"
+#include "Utils/FragmentsLog.h"
 #include "Engine/StaticMesh.h"
 #include "StaticMeshDescription.h"
 #include "StaticMeshAttributes.h"
@@ -109,12 +110,12 @@ FGeometryTemplate* UGeometryDeduplicationManager::GetOrCreateTemplate(
     // Check if template already exists
     if (FGeometryTemplate** FoundTemplate = GeometryTemplates.Find(Hash))
     {
-        UE_LOG(LogTemp, Verbose, TEXT("Geometry template found (hash: %llu), reusing"), Hash);
+        UE_LOG(LogFragments, Verbose, TEXT("Geometry template found (hash: %llu), reusing"), Hash);
         return *FoundTemplate;
     }
 
     // Create new template
-    UE_LOG(LogTemp, Log, TEXT("Creating new geometry template (hash: %llu, verts: %d, tris: %d)"),
+    UE_LOG(LogFragments, Log, TEXT("Creating new geometry template (hash: %llu, verts: %d, tris: %d)"),
         Hash, Vertices.Num(), Triangles.Num() / 3);
 
     FGeometryTemplate* NewTemplate = new FGeometryTemplate();
@@ -128,7 +129,7 @@ FGeometryTemplate* UGeometryDeduplicationManager::GetOrCreateTemplate(
 
     if (!NewTemplate->SharedMesh)
     {
-        UE_LOG(LogTemp, Error, TEXT("Failed to create static mesh for template"));
+        UE_LOG(LogFragments, Error, TEXT("Failed to create static mesh for template"));
         delete NewTemplate;
         return nullptr;
     }
@@ -151,7 +152,7 @@ void UGeometryDeduplicationManager::AddInstance(uint64 Hash, const FTransform& T
     }
     else
     {
-        UE_LOG(LogTemp, Warning, TEXT("Attempted to add instance to non-existent template (hash: %llu)"), Hash);
+        UE_LOG(LogFragments, Warning, TEXT("Attempted to add instance to non-existent template (hash: %llu)"), Hash);
     }
 }
 

@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Index/index_generated.h"
+#include "Utils/FragmentsLog.h"
 #include "FragmentsUtils.generated.h"
 
 struct FFragmentEdge
@@ -52,7 +53,7 @@ struct FProjectionPlane
 	{
 		if (Points.Num() < 3)
 		{
-			UE_LOG(LogTemp, Error, TEXT("[Projection] Not enoguht points (%d) to define a plane."), Points.Num());
+			UE_LOG(LogFragments, Error, TEXT("[Projection] Not enoguht points (%d) to define a plane."), Points.Num());
 			return false;
 		}
 
@@ -75,14 +76,14 @@ struct FProjectionPlane
 
 		if (!bFound)
 		{
-			UE_LOG(LogTemp, Error, TEXT("[Projection] Could not find non-collinear points."));
+			UE_LOG(LogFragments, Error, TEXT("[Projection] Could not find non-collinear points."));
 			return false;
 		}
 
 		FVector Normal = FVector::CrossProduct(A, B).GetSafeNormal();
 		if (Normal.IsNearlyZero())
 		{
-			UE_LOG(LogTemp, Error, TEXT("[Projection] Cross product resulted in zero normal (points may be collinear)."));
+			UE_LOG(LogFragments, Error, TEXT("[Projection] Cross product resulted in zero normal (points may be collinear)."));
 			return false;
 		}
 

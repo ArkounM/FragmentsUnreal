@@ -49,18 +49,18 @@ FString UFragmentsComponent::TestImportFragmentFile(const FString& Path, TArray<
 			FString FileContents;
 			if (FFileHelper::LoadFileToString(FileContents, *AndroidFilePath))
 			{
-				UE_LOG(LogTemp, Log, TEXT("Loaded %s from Download"), *AndroidFilePath);
+				UE_LOG(LogFragments, Log, TEXT("Loaded %s from Download"), *AndroidFilePath);
 				return FragmentsImporter->Process(GetOwner(), AndroidFilePath, OutFragments, bSaveMeshes);
 			}
 			else
 			{
-				UE_LOG(LogTemp, Error, TEXT("Failed to read %s"), *AndroidFilePath);
+				UE_LOG(LogFragments, Error, TEXT("Failed to read %s"), *AndroidFilePath);
 				// fall through to plugin‐Content fallback
 			}
 		}
 		else
 		{
-			UE_LOG(LogTemp, Warning, TEXT("File not found in Download: %s"), *AndroidFilePath);
+			UE_LOG(LogFragments, Warning, TEXT("File not found in Download: %s"), *AndroidFilePath);
 			// fall through to plugin‐Content fallback
 		}
 
@@ -69,7 +69,7 @@ FString UFragmentsComponent::TestImportFragmentFile(const FString& Path, TArray<
 		TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("FragmentsUnreal"));
 		if (!Plugin.IsValid())
 		{
-			UE_LOG(LogTemp, Error, TEXT("Could not find FragmentsUnreal plugin!"));
+			UE_LOG(LogFragments, Error, TEXT("Could not find FragmentsUnreal plugin!"));
 			return FString();
 		}
 
@@ -120,7 +120,7 @@ void UFragmentsComponent::ProcessFragmentAsync(const FString& Path, FOnFragmentL
 {
 	if (!FragmentsImporter)
 	{
-		UE_LOG(LogTemp, Error, TEXT("ProcessFragmentAsync: No FragmentsImporter"));
+		UE_LOG(LogFragments, Error, TEXT("ProcessFragmentAsync: No FragmentsImporter"));
 		OnComplete.ExecuteIfBound(false, TEXT("No importer"), TEXT(""));
 		return;
 	}
@@ -132,14 +132,14 @@ void UFragmentsComponent::StartTileStreaming()
 {
 	if (!FragmentsImporter)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("StartTileStreaming: No FragmentsImporter"));
+		UE_LOG(LogFragments, Warning, TEXT("StartTileStreaming: No FragmentsImporter"));
 		return;
 	}
 
 	UWorld* World = GetWorld();
 	if (!World)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("StartTileStreaming: No World"));
+		UE_LOG(LogFragments, Warning, TEXT("StartTileStreaming: No World"));
 		return;
 	}
 
@@ -152,7 +152,7 @@ void UFragmentsComponent::StartTileStreaming()
 		true  // Loop
 	);
 
-	UE_LOG(LogTemp, Log, TEXT("Tile streaming started"));
+	UE_LOG(LogFragments, Log, TEXT("Tile streaming started"));
 }
 
 void UFragmentsComponent::StopTileStreaming()
@@ -161,7 +161,7 @@ void UFragmentsComponent::StopTileStreaming()
 	if (World && World->GetTimerManager().IsTimerActive(CameraUpdateTimerHandle))
 	{
 		World->GetTimerManager().ClearTimer(CameraUpdateTimerHandle);
-		UE_LOG(LogTemp, Log, TEXT("Tile streaming stopped"));
+		UE_LOG(LogFragments, Log, TEXT("Tile streaming stopped"));
 	}
 }
 
@@ -220,7 +220,7 @@ void UFragmentsComponent::SetShowDebugTileBounds(bool bShow)
 	if (FragmentsImporter)
 	{
 		FragmentsImporter->bShowDebugTileBounds = bShow;
-		UE_LOG(LogTemp, Log, TEXT("Debug tile bounds: %s"), bShow ? TEXT("Enabled") : TEXT("Disabled"));
+		UE_LOG(LogFragments, Log, TEXT("Debug tile bounds: %s"), bShow ? TEXT("Enabled") : TEXT("Disabled"));
 	}
 }
 

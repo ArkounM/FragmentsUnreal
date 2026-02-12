@@ -2,6 +2,7 @@
 
 
 #include "Importer/DeferredPackageSaveManager.h"
+#include "Utils/FragmentsLog.h"
 #include "Misc/PackageName.h"
 #include "Serialization/ArchiveSaveCompressedProxy.h"
 #include "UObject/SavePackage.h"
@@ -55,7 +56,7 @@ bool FDeferredPackageSaveManager::ThickSave(float DeltaTime)
         bool bSuccess = UPackage::SavePackage(Package, nullptr, *FileName, SaveArgs);
         if (!bSuccess)
         {
-            UE_LOG(LogTemp, Error, TEXT("Failed to save package: %s"), *Package->GetName());
+            UE_LOG(LogFragments, Error, TEXT("Failed to save package: %s"), *Package->GetName());
         }
 #if WITH_EDITOR
         if (SlowTask.IsValid())

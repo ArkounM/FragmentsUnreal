@@ -64,7 +64,7 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 		return;	
 	}
 
-	UE_LOG(LogFragments, Error, TEXT("About to call ProcessLoadedFragment for: %p"), PendingOwner);
+	UE_LOG(LogFragments, Log, TEXT("About to call ProcessLoadedFragment for: %p"), PendingOwner);
 
 	// Set Owner reference before spawning
 	if (PendingOwner)
@@ -80,7 +80,7 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 	// TEMP: Use nullptr owner and save meshes -> in the future this will be a passed obj and bool respectively
 	ProcessLoadedFragment(ModelGuid, PendingOwner, true);
 
-	UE_LOG(LogFragments, Error, TEXT("ProcessLoadedFragment returned for: %s"), *ModelGuid);
+	UE_LOG(LogFragments, Log, TEXT("ProcessLoadedFragment returned for: %s"), *ModelGuid);
 
 	// Just notify success for now
 	PendingCallback.ExecuteIfBound(true, TEXT(""), ModelGuid);
@@ -614,14 +614,14 @@ void UFragmentsImporter::SpawnStaticMesh(UStaticMesh* StaticMesh,const Transform
 	FMatrix LocalMatrix(XLocal, YLocal, ZLocal, FVector::ZeroVector);  // Local rotation matrix
 
 	// Debug log the rotation matrices
-	//UE_LOG(LogTemp, Log, TEXT("GlobalMatrix: X(%s) Y(%s) Z(%s)"), *XGlobal.ToString(), *YGlobal.ToString(), *ZGlobal.ToString());
-	//UE_LOG(LogTemp, Log, TEXT("LocalMatrix: X(%s) Y(%s) Z(%s)"), *XLocal.ToString(), *YLocal.ToString(), *ZLocal.ToString());
+	//UE_LOG(LogFragments, Log, TEXT("GlobalMatrix: X(%s) Y(%s) Z(%s)"), *XGlobal.ToString(), *YGlobal.ToString(), *ZGlobal.ToString());
+	//UE_LOG(LogFragments, Log, TEXT("LocalMatrix: X(%s) Y(%s) Z(%s)"), *XLocal.ToString(), *YLocal.ToString(), *ZLocal.ToString());
 
 
 	FMatrix FinalRotationMatrix = LocalMatrix.Inverse() * GlobalMatrix;
 	//FMatrix FinalRotationMatrix = LocalMatrix.GetTransposed() * GlobalMatrix;
 
-	//UE_LOG(LogTemp, Log, TEXT("FinalRotationMatrix: %s"), *FinalRotationMatrix.ToString());
+	//UE_LOG(LogFragments, Log, TEXT("FinalRotationMatrix: %s"), *FinalRotationMatrix.ToString());
 
 
 	FRotator Rot = FinalRotationMatrix.Rotator();
@@ -894,7 +894,7 @@ void UFragmentsImporter::ExtractShellGeometry(
 			}
 			else
 			{
-				UE_LOG(LogTemp, Warning, TEXT("Triangulation failed for profile %d"), i);
+				UE_LOG(LogFragments, Warning, TEXT("Triangulation failed for profile %d"), i);
 			}
 		}
 		else
@@ -961,7 +961,7 @@ void UFragmentsImporter::ExtractCircleExtrusionGeometry(
 	// and fall back to the existing CreateStaticMeshFromCircleExtrusion
 	// TODO: Implement full extraction in future optimization
 
-	UE_LOG(LogTemp, Warning, TEXT("Circle extrusion geometry extraction not yet implemented for deduplication"));
+	UE_LOG(LogFragments, Warning, TEXT("Circle extrusion geometry extraction not yet implemented for deduplication"));
 
 	// Leave arrays empty - the calling code will skip if Vertices.Num() == 0
 }
@@ -1114,7 +1114,7 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 #endif
 						}
 
-						UE_LOG(LogTemp, Verbose, TEXT("Using deduplicated mesh (hash: %llu, instances: %d, new: %d)"),
+						UE_LOG(LogFragments, Verbose, TEXT("Using deduplicated mesh (hash: %llu, instances: %d, new: %d)"),
 							Template->GeometryHash, Template->ReferenceCount, bIsNewTemplate ? 1 : 0);
 					}
 				}
@@ -1882,7 +1882,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 		PointsRef.Add(FVector(P.x() * 100, P.z() * 100, P.y() * 100));
 		Vertices.Add(VertId);
 
-		//UE_LOG(LogTemp, Log, TEXT("\t\t\t\tpoint %d: x: %f, y:%f, z:%f"), i, P.x(), P.y(), P.z());
+		//UE_LOG(LogFragments, Log, TEXT("\t\t\t\tpoint %d: x: %f, y:%f, z:%f"), i, P.x(), P.y(), P.z());
 	}
 
 	FName MaterialSlotName = AddMaterialToMesh(StaticMesh, RefMaterial);
@@ -1922,7 +1922,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 	for (flatbuffers::uoffset_t i = 0; i < Profiles->size(); i++)
 	{
 		// Create Profile Polygons for those that has no holes reference
-		//UE_LOG(LogTemp, Log, TEXT("Processing Profile %d"), i);
+		//UE_LOG(LogFragments, Log, TEXT("Processing Profile %d"), i);
 		if (!ProfileHolesIdx.Contains(i))
 		{
 			const ShellProfile* Profile = Profiles->Get(i);
@@ -1972,7 +1972,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 
 			TArray<TArray<FVector>> ProfileHolesPoints;
 
-			/*UE_LOG(LogTemp, Log, TEXT("Profile %d has %d points and %d holes"),
+			/*UE_LOG(LogFragments, Log, TEXT("Profile %d has %d points and %d holes"),
 				i, Indices->size(), ProfileHolesIdx.Contains(i) ? ProfileHolesIdx[i].Num() : 0);*/
 
 			TArray<int32> OutIndices;
@@ -2082,7 +2082,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromCircleExtrusion(const Circl
 	//}
 	//else
 	//{
-	//	UE_LOG(LogTemp, Warning, TEXT("Unexpected: Only %d LODs were created!"), StaticMesh->GetNumSourceModels());
+	//	UE_LOG(LogFragments, Warning, TEXT("Unexpected: Only %d LODs were created!"), StaticMesh->GetNumSourceModels());
 	//}
 	return StaticMesh;
 }
@@ -2170,12 +2170,12 @@ bool UFragmentsImporter::TriangulatePolygonWithHoles(const TArray<FVector>& Poin
 
 			/*for (const FVector2D& P : Projected)
 			{
-				UE_LOG(LogTemp, Log, TEXT("\tProjected Point before winding check: X: %.3f, Y: %.3f"), P.X, P.Y);
+				UE_LOG(LogFragments, Log, TEXT("\tProjected Point before winding check: X: %.3f, Y: %.3f"), P.X, P.Y);
 			}*/
 
 			// Fix winding
 			bool bClockwise = UFragmentsUtils::IsClockwise(Projected);
-			//UE_LOG(LogTemp, Log, TEXT("Contour winding is %s"), bClockwise ? TEXT("CW") : TEXT("CCW"));
+			//UE_LOG(LogFragments, Log, TEXT("Contour winding is %s"), bClockwise ? TEXT("CW") : TEXT("CCW"));
 
 			if (!bIsHole && bClockwise)
 			{
@@ -2190,7 +2190,7 @@ bool UFragmentsImporter::TriangulatePolygonWithHoles(const TArray<FVector>& Poin
 			{
 				Contour.Add(P.X);
 				Contour.Add(P.Y);
-				//UE_LOG(LogTemp, Warning, TEXT("    X: %.6f, Y: %.6f"), P.X, P.Y);
+				//UE_LOG(LogFragments, Warning, TEXT("    X: %.6f, Y: %.6f"), P.X, P.Y);
 			}
 
 			tessAddContour(Tess, 2, Contour.GetData(), sizeof(float) * 2, Projected.Num());
@@ -2242,7 +2242,7 @@ bool UFragmentsImporter::TriangulatePolygonWithHoles(const TArray<FVector>& Poin
 	}
 	const int32* Indices = tessGetElements(Tess);
 	const int32 ElementCount = tessGetElementCount(Tess);
-	//UE_LOG(LogTemp, Log, TEXT("Tessellated VertexCount: %d, ElementCount: %d"), VertexCount, ElementCount);
+	//UE_LOG(LogFragments, Log, TEXT("Tessellated VertexCount: %d, ElementCount: %d"), VertexCount, ElementCount);
 
 	for (int32 i = 0; i < ElementCount; ++i)
 	{

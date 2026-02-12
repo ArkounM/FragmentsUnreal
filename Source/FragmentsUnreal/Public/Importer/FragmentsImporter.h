@@ -11,10 +11,8 @@
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
 #include "Optimization/GeometryDeduplicationManager.h"
 #include "Utils/FragmentGeometryWorker.h" // Required for TUniquePtr<FGeometryWorkerPool>
+#include "Utils/FragmentsLog.h"
 #include "FragmentsImporter.generated.h"
-
-
-FRAGMENTSUNREAL_API DECLARE_LOG_CATEGORY_EXTERN(LogFragments, Log, All);
 
 // Forward Declarations
 class UFragmentsAsyncLoader;

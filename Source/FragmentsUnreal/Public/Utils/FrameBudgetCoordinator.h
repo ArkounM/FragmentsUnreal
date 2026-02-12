@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "HAL/PlatformTime.h"
+#include "Utils/FragmentsLog.h"
 
 /**
  * Result of a budget allocation request.
@@ -222,7 +223,7 @@ private:
 		const float AvgFrameTime = GetAverageFrameTimeMs();
 		const float BudgetUtilization = (AllocatedBudgetMs / TotalFrameBudgetMs) * 100.0f;
 
-		UE_LOG(LogTemp, Log, TEXT("[FrameBudgetCoordinator] Budget: %.1fms, Last: %.2fms, Avg: %.2fms, Utilization: %.0f%%"),
+		UE_LOG(LogFragments, Log, TEXT("[FrameBudgetCoordinator] Budget: %.1fms, Last: %.2fms, Avg: %.2fms, Utilization: %.0f%%"),
 			TotalFrameBudgetMs, LastFrameTimeMs, AvgFrameTime, BudgetUtilization);
 	}
 };
