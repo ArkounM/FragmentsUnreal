@@ -9,8 +9,6 @@
 #include "Utils/FrameBudgetCoordinator.h"
 #include "Importer/DeferredPackageSaveManager.h"
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
-#include "Optimization/GeometryDeduplicationManager.h"
-#include "Utils/FragmentGeometryWorker.h" // Required for TUniquePtr<FGeometryWorkerPool>
 #include "Utils/FragmentsLog.h"
 #include "FragmentsImporter.generated.h"
 
@@ -19,8 +17,6 @@ class UFragmentsAsyncLoader;
 class UFragmentTileManager;
 class AFragment;
 class UHierarchicalInstancedStaticMeshComponent;
-struct FRawGeometryData;
-struct FGeometryWorkItem;
 
 // Use FlatBuffers Model type
 using Model = ::Model;
@@ -47,7 +43,6 @@ public:
 	void ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete);
 
 	UFragmentsImporter();
-	~UFragmentsImporter();
 
 	FString Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes = true);
 	void SetOwnerRef(AActor* NewOwnerRef) { OwnerRef = NewOwnerRef; }
@@ -173,9 +168,6 @@ public:
 	// @param OutSamplesProcessed Optional output - number of samples actually processed (for partial spawn tracking)
 	AFragment* SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced = nullptr, float* RemainingBudgetMs = nullptr, int32* OutSamplesProcessed = nullptr);
 
-	UPROPERTY()
-	UGeometryDeduplicationManager* DeduplicationManager;
-
 	// ==========================================
 	// EAGER GEOMETRY EXTRACTION (Public for AsyncLoader access)
 	// ==========================================
@@ -216,6 +208,9 @@ private:
 
 	FName AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial);
 
+	/** Add material to mesh from raw color data (used by pre-extracted geometry path) */
+	FName AddMaterialToMeshFromRawData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass);
+
 	bool TriangulatePolygonWithHoles(
 		const TArray<FVector>& Points,
 		const TArray<int32>& Profiles,
@@ -234,45 +229,6 @@ private:
 	// Async Loader Instance
 	UPROPERTY()
 	UFragmentsAsyncLoader* AsyncLoader;
-
-	// ==========================================
-	// ASYNC GEOMETRY PROCESSING (Phase 1)
-	// ==========================================
-
-	/** Initialize the geometry worker pool */
-	void InitializeWorkerPool();
-
-	/** Shutdown the geometry worker pool */
-	void ShutdownWorkerPool();
-
-	/**
-	 * Process completed geometry work items within frame budget.
-	 * @param BudgetMs Budget in milliseconds (-1.0 to use default GeometryProcessingBudgetMs)
-	 * @return Actual time spent processing in milliseconds
-	 */
-	float ProcessCompletedGeometry(float BudgetMs = -1.0f);
-
-	/** Create a UStaticMesh from raw geometry data (game thread only) */
-	UStaticMesh* CreateMeshFromRawData(const FRawGeometryData& GeometryData, UObject* OuterRef);
-
-	/** Add material to mesh from raw data */
-	FName AddMaterialToMeshFromRawData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass);
-
-	/** Submit a Shell for async geometry processing */
-	void SubmitShellForAsyncProcessing(
-		const Shell* ShellRef,
-		const Material* MaterialRef,
-		const FFragmentItem& FragmentItem,
-		int32 SampleIndex,
-		const FString& MeshName,
-		const FString& PackagePath,
-		const FTransform& LocalTransform,
-		AFragment* FragmentActor,
-		AActor* ParentActor,
-		bool bSaveMeshes);
-
-	/** Finalize a spawned fragment with completed mesh data */
-	void FinalizeFragmentWithMesh(const FRawGeometryData& GeometryData, UStaticMesh* Mesh);
 
 	// Chunked Spawning Functions
 	// Build flat queue of all fragments to spawn (recursive)
@@ -402,21 +358,6 @@ private:
 	int32 FragmentsSpawned = 0;
 
 	// ==========================================
-	// ASYNC GEOMETRY PROCESSING MEMBERS
-	// ==========================================
-
-	/** Geometry worker pool for parallel processing */
-	TUniquePtr<FGeometryWorkerPool> GeometryWorkerPool;
-
-	/** Whether to use async geometry processing (can be disabled for debugging) */
-	// DISABLED: TileManager path has invalid FlatBuffer data when accessing Shell profiles
-	// The sync path works correctly. Need to investigate why TileManager's MeshesRef differs.
-	bool bUseAsyncGeometryProcessing = false;
-
-	/** Frame budget for processing completed geometry (milliseconds) - legacy fallback */
-	float GeometryProcessingBudgetMs = 4.0f;
-
-	// ==========================================
 	// FRAME BUDGET COORDINATION
 	// ==========================================
 
@@ -459,21 +400,6 @@ private:
 	{
 		NewMeshCreationsThisFrame++;
 	}
-
-	/** Map of pending fragments waiting for geometry completion */
-	struct FPendingFragmentData
-	{
-		TWeakObjectPtr<AFragment> FragmentActor;
-		TWeakObjectPtr<AActor> ParentActor;
-		FTransform LocalTransform;
-		int32 SampleIndex = -1;
-		bool bSaveMeshes = false;
-		FString PackagePath;
-		FString MeshName;
-	};
-
-	/** Map WorkItemId -> pending fragment data for async completion */
-	TMap<uint64, FPendingFragmentData> PendingFragmentMap;
 
 	/** Material pool for CRC-based deduplication */
 	UPROPERTY()

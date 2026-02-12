@@ -27,10 +27,6 @@ struct FBudgetAllocationResult
  * Usage:
  *   FrameBudgetCoordinator.BeginFrame();
  *
- *   auto GeoBudget = FrameBudgetCoordinator.AllocateGeometryBudget();
- *   if (GeoBudget.bHasBudget)
- *       ProcessCompletedGeometry(GeoBudget.BudgetMs);
- *
  *   for (int i = 0; i < TileManagers.Num(); i++)
  *   {
  *       if (FrameBudgetCoordinator.IsBudgetExhausted()) break;

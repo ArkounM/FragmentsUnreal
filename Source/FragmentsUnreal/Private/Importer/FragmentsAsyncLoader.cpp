@@ -114,17 +114,6 @@ void FFragmentLoadTask::DoWork()
 		ModelGuid = TEXT("Unknown");
 	}
 	
-	LoadingStage = TEXT("Building hierarchy...");
-
-	// Step 4: Build Hierarchy tree by first storing structure async and then do the full build on game thread
-	// Get spatial structure root
-	const SpatialStructure * SpatialRoot = ParsedModel->spatial_structure();
-	if (SpatialRoot)
-	{
-		// Will parse on game thread
-		// For now just mark success
-	}
-
 	LoadingStage = TEXT("Complete!");
 	bSuccess = true;
 }
