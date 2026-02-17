@@ -114,17 +114,6 @@ void FFragmentLoadTask::DoWork()
 		ModelGuid = TEXT("Unknown");
 	}
 	
-	LoadingStage = TEXT("Building hierarchy...");
-
-	// Step 4: Build Hierarchy tree by first storing structure async and then do the full build on game thread
-	// Get spatial structure root
-	const SpatialStructure * SpatialRoot = ParsedModel->spatial_structure();
-	if (SpatialRoot)
-	{
-		// Will parse on game thread
-		// For now just mark success
-	}
-
 	LoadingStage = TEXT("Complete!");
 	bSuccess = true;
 }
@@ -135,7 +124,7 @@ void UFragmentsAsyncLoader::LoadFragmentAsync(const FString& FragmentPath, FOnFr
 		// Don't start if already loading
 	if (bIsLoading)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("Already loading a fragment, ignoring new request"));
+		UE_LOG(LogFragments, Warning, TEXT("Already loading a fragment, ignoring new request"));
 
 		OnComplete.ExecuteIfBound(false, TEXT("Already loading"), TEXT(""));
 			return;
@@ -156,7 +145,7 @@ void UFragmentsAsyncLoader::LoadFragmentAsync(const FString& FragmentPath, FOnFr
 
 	if (!Importer)
 	{
-		UE_LOG(LogTemp, Error, TEXT("No importer provided to LoadFragmentAsync"));
+		UE_LOG(LogFragments, Error, TEXT("No importer provided to LoadFragmentAsync"));
 		OnComplete.ExecuteIfBound(false, TEXT("No Importer"), TEXT(""));
 		return;
 	}
@@ -255,7 +244,7 @@ void UFragmentsAsyncLoader::CheckTaskCompletion()
 							SamplesByItem.FindOrAdd(sample->item()).Add(sample);
 						}
 
-						UE_LOG(LogTemp, Log, TEXT("Found %d sample groups"), SamplesByItem.Num());
+						UE_LOG(LogFragments, Log, TEXT("Found %d sample groups"), SamplesByItem.Num());
 
 						// Assign samples to corresponding fragment items
 						for (const auto& Item : SamplesByItem)
@@ -295,18 +284,26 @@ void UFragmentsAsyncLoader::CheckTaskCompletion()
 									FoundFragmentItem->Samples.Add(SampleInfo);
 								}
 
-								UE_LOG(LogTemp, Verbose, TEXT("Populated %d samples for LocalId %d"), ItemSamples.Num(), local_id);
+								UE_LOG(LogFragments, Verbose, TEXT("Populated %d samples for LocalId %d"), ItemSamples.Num(), local_id);
 							}
 							else
 							{
-								UE_LOG(LogTemp, Warning, TEXT("Could not find FragmentItem for LocalId: %d"), local_id);
+								UE_LOG(LogFragments, Warning, TEXT("Could not find FragmentItem for LocalId: %d"), local_id);
 							}
 						}
 					}
 				}
 				else
 				{
-					UE_LOG(LogTemp, Warning, TEXT("Model has no meshes or local_ids"));
+					UE_LOG(LogFragments, Warning, TEXT("Model has no meshes or local_ids"));
+				}
+
+				// Pre-extract all geometry data from FlatBuffers at load time
+				// This eliminates FlatBuffer access during spawn phase and prevents crashes
+				// when FlatBuffer pointers become invalid in the async/TileManager path
+				if (_meshes && Importer)
+				{
+					Importer->PreExtractAllGeometry(Wrapper->GetModelItemRef(), _meshes);
 				}
 
 				// Store wrapper in importer's FragmentModels map
@@ -315,11 +312,11 @@ void UFragmentsAsyncLoader::CheckTaskCompletion()
 					Importer->GetFragmentModels_Mutable().Add(Task.ModelGuid, Wrapper);
 				}
 
-				UE_LOG(LogTemp, Log, TEXT("Model stored successfully: %s"), *Task.ModelGuid);
+				UE_LOG(LogFragments, Log, TEXT("Model stored successfully: %s"), *Task.ModelGuid);
 			}
 			else
 			{
-				UE_LOG(LogTemp, Error, TEXT("Failed to parse spatial structure"));
+				UE_LOG(LogFragments, Error, TEXT("Failed to parse spatial structure"));
 				CompletionCallback.ExecuteIfBound(false, TEXT("Invalid spatial structure"), TEXT(""));
 				delete CurrentTask;
 				CurrentTask = nullptr;

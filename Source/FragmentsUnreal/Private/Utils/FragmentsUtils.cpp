@@ -2,13 +2,14 @@
 
 
 #include "Utils/FragmentsUtils.h"
+#include "Utils/FragmentsLog.h"
 #include "Fragment/Fragment.h"
 
 FTransform UFragmentsUtils::MakeTransform(const Transform* FragmentsTransform, bool bIsLocalTransform)
 {
 	if (!FragmentsTransform)
 	{
-		UE_LOG(LogTemp, Error, TEXT("MakeTransform received null Transform pointer."));
+		UE_LOG(LogFragments, Error, TEXT("MakeTransform received null Transform pointer."));
 		return FTransform::Identity;
 	}
 
@@ -37,7 +38,7 @@ FTransform UFragmentsUtils::MakeTransform(const Transform* FragmentsTransform, b
 	Rotator = SafeRotator(Rotator);
 
 	FTransform OutTransform = FTransform(Rotator, Pos, FVector(1.0f));
-	UE_LOG(LogTemp, Verbose, TEXT("Final FTransform: %s"), *OutTransform.ToString());
+	UE_LOG(LogFragments, Verbose, TEXT("Final FTransform: %s"), *OutTransform.ToString());
 	return OutTransform;
 }
 
@@ -75,7 +76,7 @@ FPlaneProjection UFragmentsUtils::BuildProjectionPlane(const TArray<FVector>& Po
 	if (!bFound)
 	{
 		// Fallback: default projection
-		UE_LOG(LogTemp, Error, TEXT("Failed to find non-collinear points in profile! Projection may be invalid."));
+		UE_LOG(LogFragments, Error, TEXT("Failed to find non-collinear points in profile! Projection may be invalid."));
 		Projection.Origin = A;
 		Projection.AxisX = FVector(1, 0, 0);
 		Projection.AxisY = FVector(0, 1, 0);
@@ -325,4 +326,84 @@ int32 UFragmentsUtils::GetIndexForLocalId(const Model* InModelRef, int32 LocalId
 		}
 	}
 	return INDEX_NONE;
+}
+
+// ==========================================
+// FFindResult Implementation (GPU Instancing Phase 4)
+// ==========================================
+
+int32 FFindResult::GetLocalId() const
+{
+	if (bIsInstanced)
+	{
+		return Proxy.LocalId;
+	}
+	else if (Fragment)
+	{
+		return Fragment->GetLocalId();
+	}
+	return INDEX_NONE;
+}
+
+FString FFindResult::GetCategory() const
+{
+	if (bIsInstanced)
+	{
+		return Proxy.Category;
+	}
+	else if (Fragment)
+	{
+		return Fragment->GetCategory();
+	}
+	return FString();
+}
+
+FTransform FFindResult::GetWorldTransform() const
+{
+	if (bIsInstanced)
+	{
+		return Proxy.WorldTransform;
+	}
+	else if (Fragment)
+	{
+		return Fragment->GetActorTransform();
+	}
+	return FTransform::Identity;
+}
+
+FFindResult FFindResult::NotFound()
+{
+	FFindResult Result;
+	Result.bFound = false;
+	Result.bIsInstanced = false;
+	Result.Fragment = nullptr;
+	return Result;
+}
+
+FFindResult FFindResult::FromActor(AFragment* Actor)
+{
+	FFindResult Result;
+	if (Actor)
+	{
+		Result.bFound = true;
+		Result.bIsInstanced = false;
+		Result.Fragment = Actor;
+	}
+	else
+	{
+		Result.bFound = false;
+		Result.bIsInstanced = false;
+		Result.Fragment = nullptr;
+	}
+	return Result;
+}
+
+FFindResult FFindResult::FromProxy(const FFragmentProxy& InProxy)
+{
+	FFindResult Result;
+	Result.bFound = true;
+	Result.bIsInstanced = true;
+	Result.Fragment = nullptr;
+	Result.Proxy = InProxy;
+	return Result;
 }

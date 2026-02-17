@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Index/index_generated.h"
+#include "Utils/FragmentsLog.h"
 #include "FragmentsUtils.generated.h"
 
 struct FFragmentEdge
@@ -52,7 +53,7 @@ struct FProjectionPlane
 	{
 		if (Points.Num() < 3)
 		{
-			UE_LOG(LogTemp, Error, TEXT("[Projection] Not enoguht points (%d) to define a plane."), Points.Num());
+			UE_LOG(LogFragments, Error, TEXT("[Projection] Not enoguht points (%d) to define a plane."), Points.Num());
 			return false;
 		}
 
@@ -75,14 +76,14 @@ struct FProjectionPlane
 
 		if (!bFound)
 		{
-			UE_LOG(LogTemp, Error, TEXT("[Projection] Could not find non-collinear points."));
+			UE_LOG(LogFragments, Error, TEXT("[Projection] Could not find non-collinear points."));
 			return false;
 		}
 
 		FVector Normal = FVector::CrossProduct(A, B).GetSafeNormal();
 		if (Normal.IsNearlyZero())
 		{
-			UE_LOG(LogTemp, Error, TEXT("[Projection] Cross product resulted in zero normal (points may be collinear)."));
+			UE_LOG(LogFragments, Error, TEXT("[Projection] Cross product resulted in zero normal (points may be collinear)."));
 			return false;
 		}
 
@@ -103,6 +104,50 @@ struct FTriangulationResult
 	TArray<int32> TriangleIndices;
 };
 
+/**
+ * Pre-extracted geometry data for a fragment sample.
+ * Contains all geometry data extracted from FlatBuffers at load time,
+ * eliminating the need for FlatBuffer access during spawn phase.
+ * This solves the crash issue where FlatBuffer pointers become invalid
+ * when accessed via the async/TileManager path.
+ *
+ * Note: This is a plain C++ struct (not USTRUCT) because Unreal's reflection
+ * system doesn't support nested TArrays. This is runtime-only data that
+ * doesn't need serialization.
+ */
+struct FPreExtractedGeometry
+{
+	// Vertex data (already converted to Unreal coordinates: Z-up, cm units)
+	TArray<FVector> Vertices;
+
+	// Profile indices - each profile's vertex indices into the Vertices array
+	TArray<TArray<int32>> ProfileIndices;
+
+	// Holes per profile - ProfileHoles[i] contains holes for profile i
+	TArray<TArray<TArray<int32>>> ProfileHoles;
+
+	// Local transform for this sample
+	FTransform LocalTransform;
+
+	// Material data
+	uint8 R = 255;
+	uint8 G = 255;
+	uint8 B = 255;
+	uint8 A = 255;
+	bool bIsGlass = false;
+
+	// Geometry type
+	bool bIsShell = true;  // true = Shell, false = CircleExtrusion
+
+	// Validation flag - if false, geometry should be skipped during spawn
+	bool bIsValid = false;
+
+	// Representation ID (for debugging/logging)
+	int32 RepresentationId = -1;
+
+	FPreExtractedGeometry() = default;
+};
+
 USTRUCT(BlueprintType)
 struct FFragmentLookup
 {
@@ -119,6 +164,7 @@ struct FFragmentSample
 {
 	GENERATED_BODY()
 
+	// Original indices (kept for debugging and backward compatibility)
 	UPROPERTY()
 	int32 SampleIndex = -1;
 	UPROPERTY()
@@ -127,6 +173,11 @@ struct FFragmentSample
 	int32 RepresentationIndex = -1;
 	UPROPERTY()
 	int32 MaterialIndex = -1;
+
+	// Pre-extracted geometry data (populated at load time)
+	// This eliminates FlatBuffer access during spawn phase
+	// Note: Not UPROPERTY because FPreExtractedGeometry contains nested TArrays
+	FPreExtractedGeometry ExtractedGeometry;
 };
 
 
@@ -210,8 +261,183 @@ struct FFragmentItem
 	}
 };
 
+// Forward declaration for FFindResult
+class AFragment;
+
 /**
- * 
+ * Lightweight proxy for instanced BIM elements.
+ * ~200 bytes vs ~5KB for AFragment actor.
+ * Used for fragments rendered via UHierarchicalInstancedStaticMeshComponent.
+ */
+USTRUCT(BlueprintType)
+struct FFragmentProxy
+{
+	GENERATED_BODY()
+
+	/** Weak reference to the HISMC containing this instance */
+	UPROPERTY()
+	TWeakObjectPtr<class UHierarchicalInstancedStaticMeshComponent> ISMC;
+
+	/** Index of this instance within the ISMC */
+	UPROPERTY()
+	int32 InstanceIndex = INDEX_NONE;
+
+	/** LocalId of the fragment in the BIM model */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	int32 LocalId = INDEX_NONE;
+
+	/** Global unique ID (GUID) of the fragment */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	FString GlobalId;
+
+	/** IFC category (e.g., IfcDoor, IfcWindow) */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	FString Category;
+
+	/** Model GUID this fragment belongs to */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	FString ModelGuid;
+
+	/** Attributes/properties of the BIM element */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	TArray<FItemAttribute> Attributes;
+
+	/** Parent fragment LocalId (INDEX_NONE if root) */
+	UPROPERTY()
+	int32 ParentLocalId = INDEX_NONE;
+
+	/** Child fragment LocalIds */
+	UPROPERTY()
+	TArray<int32> ChildLocalIds;
+
+	/** Cached world transform of this instance */
+	UPROPERTY()
+	FTransform WorldTransform;
+
+	FFragmentProxy() = default;
+};
+
+/**
+ * Pending instance data collected during spawn phase.
+ * Used for batch instance addition after spawning completes.
+ */
+struct FPendingInstanceData
+{
+	FTransform WorldTransform;
+	int32 LocalId = INDEX_NONE;
+	FString GlobalId;
+	FString Category;
+	FString ModelGuid;
+	TArray<FItemAttribute> Attributes;
+
+	FPendingInstanceData() = default;
+	FPendingInstanceData(const FTransform& InTransform, int32 InLocalId, const FString& InGlobalId,
+		const FString& InCategory, const FString& InModelGuid, const TArray<FItemAttribute>& InAttributes)
+		: WorldTransform(InTransform), LocalId(InLocalId), GlobalId(InGlobalId),
+		  Category(InCategory), ModelGuid(InModelGuid), Attributes(InAttributes) {}
+};
+
+/**
+ * HISMC group for a RepresentationId + Material combination.
+ * Each unique geometry+material pair gets one HISMC containing all instances.
+ * Uses Hierarchical ISM for per-cluster culling performance.
+ */
+USTRUCT()
+struct FInstancedMeshGroup
+{
+	GENERATED_BODY()
+
+	/** The HierarchicalInstancedStaticMeshComponent for this group */
+	UPROPERTY()
+	class UHierarchicalInstancedStaticMeshComponent* ISMC = nullptr;
+
+	/** RepresentationId from FlatBuffers (unique geometry ID) */
+	UPROPERTY()
+	int32 RepresentationId = INDEX_NONE;
+
+	/** Hash of material properties (color + glass flag) */
+	UPROPERTY()
+	uint32 MaterialHash = 0;
+
+	/** Number of instances in this ISMC */
+	UPROPERTY()
+	int32 InstanceCount = 0;
+
+	/** Map from ISMC instance index to BIM LocalId */
+	TMap<int32, int32> InstanceToLocalId;
+
+	/** Map from BIM LocalId to ISMC instance index */
+	TMap<int32, int32> LocalIdToInstance;
+
+	/** Pending instances to be batch-added (collected during spawn phase) */
+	TArray<FPendingInstanceData> PendingInstances;
+
+	/** Cached mesh for batch creation */
+	UPROPERTY()
+	class UStaticMesh* CachedMesh = nullptr;
+
+	/** Cached material for batch creation */
+	UPROPERTY()
+	class UMaterialInstanceDynamic* CachedMaterial = nullptr;
+
+	/** Category from the first instance (for occlusion classification) */
+	FString FirstCategory;
+
+	/** Material alpha from the first instance (for occlusion classification, 0-255) */
+	uint8 FirstMaterialAlpha = 255;
+
+	FInstancedMeshGroup() = default;
+};
+
+/**
+ * Unified lookup result for both actors and instanced proxies.
+ * Allows querying fragments regardless of whether they are
+ * spawned as individual actors or GPU-instanced.
+ */
+USTRUCT(BlueprintType)
+struct FRAGMENTSUNREAL_API FFindResult
+{
+	GENERATED_BODY()
+
+	/** Whether a fragment was found */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	bool bFound = false;
+
+	/** Whether the fragment is GPU-instanced (true) or an actor (false) */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	bool bIsInstanced = false;
+
+	/** Fragment actor (valid if bIsInstanced == false) */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	AFragment* Fragment = nullptr;
+
+	/** Proxy data (valid if bIsInstanced == true) */
+	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
+	FFragmentProxy Proxy;
+
+	/** Get LocalId regardless of instancing */
+	int32 GetLocalId() const;
+
+	/** Get Category regardless of instancing */
+	FString GetCategory() const;
+
+	/** Get world transform regardless of instancing */
+	FTransform GetWorldTransform() const;
+
+	/** Create a not-found result */
+	static FFindResult NotFound();
+
+	/** Create a result from an actor */
+	static FFindResult FromActor(AFragment* Actor);
+
+	/** Create a result from a proxy */
+	static FFindResult FromProxy(const FFragmentProxy& InProxy);
+
+	FFindResult() = default;
+};
+
+/**
+ *
  */
 UCLASS()
 class FRAGMENTSUNREAL_API UFragmentsUtils : public UBlueprintFunctionLibrary

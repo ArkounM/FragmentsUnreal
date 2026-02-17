@@ -56,6 +56,14 @@ public:
 	void ProcessSpawnChunk();
 
 	/**
+	 * Process spawning/unloading with explicit time budget (coordinated mode).
+	 * Used by FrameBudgetCoordinator for unified frame budgeting.
+	 * @param BudgetMs Time budget in milliseconds for this chunk
+	 * @return Actual time spent processing in milliseconds
+	 */
+	float ProcessSpawnChunkWithBudget(float BudgetMs);
+
+	/**
 	 * Get current spawn progress (0.0 to 1.0)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
@@ -81,7 +89,7 @@ public:
 
 	/** How long after leaving frustum before unloading (seconds) */
 	UPROPERTY(EditAnywhere, Category = "Streaming")
-	float UnloadHysteresis = 10.0f; // CHANGED from 5.0f
+	float UnloadHysteresis = 10.0f;
 
 	/** Maximum time to spend spawning per frame (milliseconds) */
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "1.0", ClampMax = "16.0"))

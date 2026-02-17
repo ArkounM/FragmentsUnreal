@@ -42,6 +42,7 @@ public:
 	void SetModelItem(FFragmentItem InModelItem) { ModelItem = InModelItem; }
 	FFragmentItem GetModelItem() { return ModelItem; }
 	const FFragmentItem& GetModelItemRef() const { return ModelItem; }
+	FFragmentItem& GetModelItemRef() { return ModelItem; }  // Non-const for geometry extraction
 
 	/**
 	 * Build fragment registry for per-sample visibility

@@ -52,10 +52,11 @@ public:
 	void ProcessFragmentAsync(const FString& Path, FOnFragmentLoadComplete OnComplete);
 
 	/**
-	 * Start tile-based streaming (call after loading fragment)
-	 * Updates visible tiles based on camera frustum
+	 * Start fragment streaming based on camera view.
+	 * Call after loading a fragment to begin spawning visible geometry.
+	 * Updates at 5 Hz, culling and prioritizing fragments by camera frustum.
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming")
+	UFUNCTION(BlueprintCallable, Category = "Fragments|Streaming", meta = (DisplayName = "Start Fragment Streaming"))
 	void StartTileStreaming();
 
 	/**

@@ -23,6 +23,7 @@
 #include "Importer/FragmentsAsyncLoader.h"
 #include "Spatial/FragmentTileManager.h"
 #include "Utils/FragmentOcclusionClassifier.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -62,7 +63,7 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 		return;	
 	}
 
-	UE_LOG(LogFragments, Error, TEXT("About to call ProcessLoadedFragment for: %p"), PendingOwner);
+	UE_LOG(LogFragments, Log, TEXT("About to call ProcessLoadedFragment for: %p"), PendingOwner);
 
 	// Set Owner reference before spawning
 	if (PendingOwner)
@@ -74,11 +75,9 @@ void UFragmentsImporter::OnAsyncLoadComplete(bool bSuccess, const FString& Error
 		UE_LOG(LogFragments, Warning, TEXT("No owner provided for async spawn"));
 	}
 
-	// Leverage existing ProcessLoadedFragment to spawn actors
-	// TEMP: Use nullptr owner and save meshes -> in the future this will be a passed obj and bool respectively
 	ProcessLoadedFragment(ModelGuid, PendingOwner, true);
 
-	UE_LOG(LogFragments, Error, TEXT("ProcessLoadedFragment returned for: %s"), *ModelGuid);
+	UE_LOG(LogFragments, Log, TEXT("ProcessLoadedFragment returned for: %s"), *ModelGuid);
 
 	// Just notify success for now
 	PendingCallback.ExecuteIfBound(true, TEXT(""), ModelGuid);
@@ -88,7 +87,6 @@ DEFINE_LOG_CATEGORY(LogFragments);
 
 UFragmentsImporter::UFragmentsImporter()
 {
-	DeduplicationManager = CreateDefaultSubobject<UGeometryDeduplicationManager>(TEXT("DeduplicationManager"));
 }
 
 FString UFragmentsImporter::Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes)
@@ -297,6 +295,11 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 			}
 		}
 
+		if (ret != Z_STREAM_END)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("Decompression may be incomplete: loop limit reached (100 iterations, %d bytes out)"), TotalOut);
+		}
+
 		ret = inflateEnd(&stream);
 		if (ret != Z_OK)
 		{
@@ -305,7 +308,6 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 		}
 
 		Decompressed.SetNum(TotalOut);
-		//UE_LOG(LogFragments, Log, TEXT("Decompression complete. Total bytes: %d"), TotalOut);
 	}
 	else
 	{
@@ -400,6 +402,11 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 			}
 
 		}
+
+		// Pre-extract all geometry data from FlatBuffers at load time
+		// This eliminates FlatBuffer access during spawn phase and prevents crashes
+		// when FlatBuffer pointers become invalid in the async/TileManager path
+		PreExtractAllGeometry(Wrapper->GetModelItemRef(), _meshes);
 	}
 	ModelFragmentsMap.Add(ModelGuidStr, FFragmentLookup());
 
@@ -600,15 +607,11 @@ void UFragmentsImporter::SpawnStaticMesh(UStaticMesh* StaticMesh,const Transform
 	FMatrix GlobalMatrix(XGlobal, YGlobal, ZGlobal, FVector::ZeroVector);  // Global rotation matrix
 	FMatrix LocalMatrix(XLocal, YLocal, ZLocal, FVector::ZeroVector);  // Local rotation matrix
 
-	// Debug log the rotation matrices
-	//UE_LOG(LogTemp, Log, TEXT("GlobalMatrix: X(%s) Y(%s) Z(%s)"), *XGlobal.ToString(), *YGlobal.ToString(), *ZGlobal.ToString());
-	//UE_LOG(LogTemp, Log, TEXT("LocalMatrix: X(%s) Y(%s) Z(%s)"), *XLocal.ToString(), *YLocal.ToString(), *ZLocal.ToString());
 
 
 	FMatrix FinalRotationMatrix = LocalMatrix.Inverse() * GlobalMatrix;
 	//FMatrix FinalRotationMatrix = LocalMatrix.GetTransposed() * GlobalMatrix;
 
-	//UE_LOG(LogTemp, Log, TEXT("FinalRotationMatrix: %s"), *FinalRotationMatrix.ToString());
 
 
 	FRotator Rot = FinalRotationMatrix.Rotator();
@@ -683,7 +686,6 @@ void UFragmentsImporter::SpawnFragmentModel(AFragment* InFragmentModel, AActor* 
 		{
 			const FFragmentSample& Sample = Samples[i];
 
-			//FString PackagePath = FString::Printf(TEXT("/Game/Buildings/%s"), *InFragmentModel->GetModelGuid());
 			FString MeshName = FString::Printf(TEXT("%d_%d"), InFragmentModel->GetLocalId(), i);
 			FString PackagePath = TEXT("/Game/Buildings") / InFragmentModel->GetModelGuid()/ MeshName;
 			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
@@ -698,7 +700,6 @@ void UFragmentsImporter::SpawnFragmentModel(AFragment* InFragmentModel, AActor* 
 			FTransform LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
 
 			UStaticMesh* Mesh = nullptr;
-			//FString MeshName = FString::Printf(TEXT("sample_%d_%d"), InFragmentModel->GetLocalId(), i);
 			if (MeshCache.Contains(SamplePath))
 			{
 				Mesh = MeshCache[SamplePath];
@@ -706,7 +707,6 @@ void UFragmentsImporter::SpawnFragmentModel(AFragment* InFragmentModel, AActor* 
 			else if (FPaths::FileExists(PackageFileName))
 			{
 				UPackage* ExistingPackage = LoadPackage(nullptr, *PackagePath, LOAD_None);
-				//UStaticMesh* Mesh = Cast<UStaticMesh>(StaticLoadObject(UStaticMesh::StaticClass(), nullptr, *MeshObjectPath));
 				if (ExistingPackage)
 				{
 					Mesh = FindObject<UStaticMesh>(ExistingPackage, *MeshName);
@@ -881,7 +881,7 @@ void UFragmentsImporter::ExtractShellGeometry(
 			}
 			else
 			{
-				UE_LOG(LogTemp, Warning, TEXT("Triangulation failed for profile %d"), i);
+				UE_LOG(LogFragments, Warning, TEXT("Triangulation failed for profile %d"), i);
 			}
 		}
 		else
@@ -948,7 +948,7 @@ void UFragmentsImporter::ExtractCircleExtrusionGeometry(
 	// and fall back to the existing CreateStaticMeshFromCircleExtrusion
 	// TODO: Implement full extraction in future optimization
 
-	UE_LOG(LogTemp, Warning, TEXT("Circle extrusion geometry extraction not yet implemented for deduplication"));
+	UE_LOG(LogFragments, Warning, TEXT("Circle extrusion geometry extraction not yet implemented for deduplication"));
 
 	// Leave arrays empty - the calling code will skip if Vertices.Num() == 0
 }
@@ -1003,7 +1003,6 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 		{
 			const FFragmentSample& Sample = Samples[i];
 
-			//FString PackagePath = FString::Printf(TEXT("/Game/Buildings/%s"), *InFragmentModel->GetModelGuid());
 			FString MeshName = FString::Printf(TEXT("%d_%d"), FragmentModel->GetLocalId(), i);
 			FString PackagePath = TEXT("/Game/Buildings") / FragmentModel->GetModelGuid() / MeshName;
 			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
@@ -1018,7 +1017,6 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 			FTransform LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
 
 			UStaticMesh* Mesh = nullptr;
-			//FString MeshName = FString::Printf(TEXT("sample_%d_%d"), InFragmentModel->GetLocalId(), i);
 			if (MeshCache.Contains(SamplePath))
 			{
 				Mesh = MeshCache[SamplePath];
@@ -1026,7 +1024,6 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 			else if (FPaths::FileExists(PackageFileName))
 			{
 				UPackage* ExistingPackage = LoadPackage(nullptr, *PackagePath, LOAD_None);
-				//UStaticMesh* Mesh = Cast<UStaticMesh>(StaticLoadObject(UStaticMesh::StaticClass(), nullptr, *MeshObjectPath));
 				if (ExistingPackage)
 				{
 					Mesh = FindObject<UStaticMesh>(ExistingPackage, *MeshName);
@@ -1034,76 +1031,29 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 			}
 			else
 			{
-				// Create package first (needed for both deduplication and fallback)
 				UPackage* MeshPackage = CreatePackage(*PackagePath);
-
-				// Extract geometry data first
-				TArray<FVector> Vertices;
-				TArray<int32> Triangles;
-				TArray<FVector> Normals;
-				TArray<FVector2D> UVs;
 
 				if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
 				{
 					const auto* shell = MeshesRef->shells()->Get(representation->id());
-					ExtractShellGeometry(shell, Vertices, Triangles, Normals, UVs);
+					Mesh = CreateStaticMeshFromShell(shell, material, MeshName, MeshPackage);
 				}
 				else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
 				{
 					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-					ExtractCircleExtrusionGeometry(circleExtrusion, Vertices, Triangles, Normals, UVs);
+					Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, MeshName, MeshPackage);
 				}
 
-				if (Vertices.Num() > 0 && Triangles.Num() > 0)
+				if (Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
 				{
-					// Use deduplication manager
-
-					FGeometryTemplate* Template = DeduplicationManager->GetOrCreateTemplate(
-						Vertices,
-						Triangles,
-						Normals,
-						UVs,
-						Sample.MaterialIndex,
-						*MeshName,
-						MeshPackage
-					);
-
-					if (Template)
-					{
-						// Check if this is a newly created template (ReferenceCount will be 0)
-						bool bIsNewTemplate = (Template->ReferenceCount == 0);
-
-						//Add this instance to the template
-						DeduplicationManager->AddInstance(
-							Template->GeometryHash,
-							LocalTransform,
-							FragmentModel->GetLocalId(),
-							Sample.MaterialIndex
-						);
-						Mesh = Template->SharedMesh;
-
-						// Apply material to newly created mesh
-						if (bIsNewTemplate && Mesh)
-						{
-							AddMaterialToMesh(Mesh, material);
-						}
-
-						// Only save the package if this is a newly created mesh
-						if (bIsNewTemplate && Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
-						{
 #if WITH_EDITOR
-							MeshPackage->FullyLoad();
-							Mesh->Rename(*MeshName, MeshPackage);
-							Mesh->SetFlags(RF_Public | RF_Standalone);
-							MeshPackage->MarkPackageDirty();
-							FAssetRegistryModule::AssetCreated(Mesh);
-							PackagesToSave.Add(MeshPackage);
+					MeshPackage->FullyLoad();
+					Mesh->Rename(*MeshName, MeshPackage);
+					Mesh->SetFlags(RF_Public | RF_Standalone);
+					MeshPackage->MarkPackageDirty();
+					FAssetRegistryModule::AssetCreated(Mesh);
+					PackagesToSave.Add(MeshPackage);
 #endif
-						}
-
-						UE_LOG(LogTemp, Verbose, TEXT("Using deduplicated mesh (hash: %llu, instances: %d, new: %d)"),
-							Template->GeometryHash, Template->ReferenceCount, bIsNewTemplate ? 1 : 0);
-					}
 				}
 
 				MeshCache.Add(SamplePath, Mesh);
@@ -1144,11 +1094,146 @@ void UFragmentsImporter::BuildSpawnQueue(const FFragmentItem& Item, AActor* Pare
 	// We'll handle parent-child relationships during spawning
 }
 
-AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes)
+AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AActor* ParentActor, const Meshes* MeshesRef, bool bSaveMeshes, bool* bOutWasInstanced, float* RemainingBudgetMs, int32* OutSamplesProcessed)
 {
+	// Track start time for budget checking
+	const double SpawnStartTime = FPlatformTime::Seconds();
+	int32 SamplesProcessed = 0;
+
+	// Initialize output parameters
+	if (bOutWasInstanced)
+	{
+		*bOutWasInstanced = false;
+	}
+	if (OutSamplesProcessed)
+	{
+		*OutSamplesProcessed = 0;
+	}
+
 	if (!ParentActor) return nullptr;
 
-	// Create AFragment actor
+	const TArray<FFragmentSample>& Samples = Item.Samples;
+
+	// ==========================================
+	// GPU INSTANCING: Check if ALL samples should be instanced
+	// If so, we can skip actor creation entirely and just use a proxy
+	// ==========================================
+	bool bAllSamplesInstanced = bEnableGPUInstancing && (Samples.Num() > 0);
+	int32 ValidSampleCount = 0;
+
+	if (bEnableGPUInstancing)
+	{
+		for (const FFragmentSample& Sample : Samples)
+		{
+			if (!Sample.ExtractedGeometry.bIsValid) continue;
+			ValidSampleCount++;
+
+			// Only Shell geometry supports instancing currently
+			if (!Sample.ExtractedGeometry.bIsShell)
+			{
+				bAllSamplesInstanced = false;
+				break;
+			}
+
+			const int32 RepId = Sample.RepresentationIndex;
+			const FPreExtractedGeometry& Geom = Sample.ExtractedGeometry;
+			const uint32 MatHash = HashMaterialProperties(Geom.R, Geom.G, Geom.B, Geom.A, Geom.bIsGlass);
+
+			if (!ShouldUseInstancing(RepId, MatHash))
+			{
+				bAllSamplesInstanced = false;
+				break;
+			}
+		}
+
+		// If no valid samples, don't treat as all-instanced
+		if (ValidSampleCount == 0)
+		{
+			bAllSamplesInstanced = false;
+		}
+	}
+
+	// ==========================================
+	// FULLY INSTANCED PATH: Queue for batch addition (no ISMC created yet)
+	// Actual ISMC creation happens in FinalizeAllISMCs() after spawning completes
+	// ==========================================
+	if (bAllSamplesInstanced)
+	{
+		for (int32 i = 0; i < Samples.Num(); i++)
+		{
+			const FFragmentSample& Sample = Samples[i];
+			const FPreExtractedGeometry& ExtractedGeom = Sample.ExtractedGeometry;
+
+			if (!ExtractedGeom.bIsValid) continue;
+
+			const int32 RepId = Sample.RepresentationIndex;
+			const uint32 MatHash = HashMaterialProperties(ExtractedGeom.R, ExtractedGeom.G,
+				ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+
+			// Get or create mesh from representation cache
+			UStaticMesh* Mesh = nullptr;
+			if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepId))
+			{
+				Mesh = *CachedMesh;
+			}
+			else if (CanCreateNewMesh())
+			{
+				// Create new mesh (only if we haven't exceeded the per-frame limit)
+				FString MeshName = FString::Printf(TEXT("Rep_%d"), RepId);
+				UPackage* MeshPackage = CreatePackage(*FString::Printf(TEXT("/Game/Buildings/Instanced/%s"), *MeshName));
+				Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
+				if (Mesh)
+				{
+					OnNewMeshCreated();
+					RepresentationMeshCache.Add(RepId, Mesh);
+					UE_LOG(LogFragments, Verbose, TEXT("GPU Instancing: Created mesh for RepId %d [%d/%d this frame]"),
+						RepId, NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
+				}
+			}
+			else
+			{
+				// Skip this sample - mesh creation limit reached
+				continue;
+			}
+
+			if (!Mesh) continue;
+
+			// Get pooled material
+			UMaterialInstanceDynamic* Material = GetPooledMaterial(ExtractedGeom.R, ExtractedGeom.G,
+				ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+
+			if (!Material)
+			{
+				continue;
+			}
+
+			// Compute world transform: LocalTransform * GlobalTransform
+			FTransform SampleWorldTransform = ExtractedGeom.LocalTransform * Item.GlobalTransform;
+
+			// QUEUE instance for batch addition (no ISMC created yet!)
+			// Proxies will be created in FinalizeAllISMCs()
+			QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material, ExtractedGeom.A);
+		}
+
+		// Store null in actor lookup map to indicate this fragment exists but is instanced
+		if (ModelFragmentsMap.Contains(Item.ModelGuid))
+		{
+			ModelFragmentsMap[Item.ModelGuid].Fragments.Add(Item.LocalId, nullptr);
+		}
+
+		// Set output flag to indicate fragment was GPU instanced (no actor, but handled)
+		if (bOutWasInstanced)
+		{
+			*bOutWasInstanced = true;
+		}
+
+		// Return nullptr since no actor was created
+		return nullptr;
+	}
+
+	// ==========================================
+	// STANDARD PATH: Create AFragment actor
+	// ==========================================
 	AFragment* FragmentModel = OwnerRef->GetWorld()->SpawnActor<AFragment>(
 		AFragment::StaticClass(), Item.GlobalTransform);
 
@@ -1174,14 +1259,72 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 #endif
 
 	// Create Meshes If Sample Exists
-	const TArray<FFragmentSample>& Samples = FragmentModel->GetSamples();
+	const TArray<FFragmentSample>& ActorSamples = FragmentModel->GetSamples();
 
-	if (Samples.Num() > 0)
+	if (ActorSamples.Num() > 0)
 	{
-		for (int32 i = 0; i < Samples.Num(); i++)
+		for (int32 i = 0; i < ActorSamples.Num(); i++)
 		{
-			const FFragmentSample& Sample = Samples[i];
+			const FFragmentSample& Sample = ActorSamples[i];
+			const FPreExtractedGeometry& ExtractedGeom = Sample.ExtractedGeometry;
 
+			// Skip samples with invalid pre-extracted geometry
+			if (!ExtractedGeom.bIsValid)
+			{
+				UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Skipping sample %d with invalid geometry (LocalId: %d)"),
+					i, FragmentModel->GetLocalId());
+				continue;
+			}
+
+			const int32 RepId = Sample.RepresentationIndex;
+			const uint32 MatHash = HashMaterialProperties(ExtractedGeom.R, ExtractedGeom.G,
+				ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+
+			// ==========================================
+			// PER-SAMPLE INSTANCING CHECK (for mixed fragments)
+			// Queue for batch addition instead of immediate ISMC creation
+			// ==========================================
+			if (bEnableGPUInstancing && ExtractedGeom.bIsShell && ShouldUseInstancing(RepId, MatHash))
+			{
+				// This sample goes to an ISMC instead of a component
+
+				// Get or create mesh
+				UStaticMesh* Mesh = nullptr;
+				if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepId))
+				{
+					Mesh = *CachedMesh;
+				}
+				else if (CanCreateNewMesh())
+				{
+					FString MeshName = FString::Printf(TEXT("Rep_%d"), RepId);
+					UPackage* MeshPackage = CreatePackage(*FString::Printf(TEXT("/Game/Buildings/Instanced/%s"), *MeshName));
+					Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
+					if (Mesh)
+					{
+						OnNewMeshCreated();
+						RepresentationMeshCache.Add(RepId, Mesh);
+					}
+				}
+				// If mesh creation limit reached, Mesh stays nullptr and we fall through
+
+				if (Mesh)
+				{
+					UMaterialInstanceDynamic* Material = GetPooledMaterial(ExtractedGeom.R, ExtractedGeom.G,
+						ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+
+					if (Material)
+					{
+						FTransform SampleWorldTransform = ExtractedGeom.LocalTransform * Item.GlobalTransform;
+						QueueInstanceForBatchAdd(RepId, MatHash, SampleWorldTransform, Item, Mesh, Material, ExtractedGeom.A);
+						continue;  // Skip standard component creation for this sample
+					}
+					// Fall through to standard component creation if material is null
+				}
+			}
+
+			// ==========================================
+			// STANDARD COMPONENT CREATION PATH
+			// ==========================================
 			FString MeshName = FString::Printf(TEXT("%d_%d"), FragmentModel->GetLocalId(), i);
 			FString PackagePath = TEXT("/Game/Buildings") / FragmentModel->GetModelGuid() / MeshName;
 			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
@@ -1189,11 +1332,8 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 			FString UniquePackageName = FPackageName::ObjectPathToPackageName(PackagePath);
 			FString PackageFileName = FPackageName::LongPackageNameToFilename(UniquePackageName, FPackageName::GetAssetPackageExtension());
 
-			const Material* material = MeshesRef->materials()->Get(Sample.MaterialIndex);
-			const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
-			const Transform* local_transform = MeshesRef->local_transforms()->Get(Sample.LocalTransformIndex);
-
-			FTransform LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
+			// Use pre-extracted local transform instead of FlatBuffer access
+			FTransform LocalTransform = ExtractedGeom.LocalTransform;
 
 			UStaticMesh* Mesh = nullptr;
 
@@ -1211,94 +1351,109 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					Mesh = FindObject<UStaticMesh>(ExistingPackage, *MeshName);
 				}
 			}
-			// Create new mesh using deduplication
+			// Create new mesh from pre-extracted geometry (NO FLATBUFFER ACCESS)
 			else
 			{
-				// Extract geometry data first
-				TArray<FVector> Vertices;
-				TArray<int32> Triangles;
-				TArray<FVector> Normals;
-				TArray<FVector2D> UVs;
+				UPackage* MeshPackage = CreatePackage(*PackagePath);
 
-				if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+				if (ExtractedGeom.bIsShell)
 				{
-					const auto* shell = MeshesRef->shells()->Get(representation->id());
-					ExtractShellGeometry(shell, Vertices, Triangles, Normals, UVs);
-				}
-				else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
-				{
-					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-					ExtractCircleExtrusionGeometry(circleExtrusion, Vertices, Triangles, Normals, UVs);
-				}
+					// Use RepresentationId-based caching (more reliable than geometry hashing)
+					// All instances with the same RepresentationId share identical geometry
+					const int32 RepresentationId = Sample.RepresentationIndex;
 
-				if (Vertices.Num() > 0 && Triangles.Num() > 0)
-				{
-					// Use deduplication manager
-					UPackage* MeshPackage = CreatePackage(*PackagePath);
-
-					FGeometryTemplate* Template = DeduplicationManager->GetOrCreateTemplate(
-						Vertices,
-						Triangles,
-						Normals,
-						UVs,
-						Sample.MaterialIndex,
-						*MeshName,
-						MeshPackage
-					);
-
-					if (Template)
+					if (UStaticMesh** CachedMesh = RepresentationMeshCache.Find(RepresentationId))
 					{
-						// Check if this is a newly created template (ReferenceCount will be 0)
-						bool bIsNewTemplate = (Template->ReferenceCount == 0);
+						// Reuse existing mesh for this representation (cache hit - no limit)
+						Mesh = *CachedMesh;
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Reusing cached mesh for RepId %d (LocalId: %d)"),
+							RepresentationId, FragmentModel->GetLocalId());
+					}
+					else if (CanCreateNewMesh())
+					{
+						// Create new mesh using the working pre-extracted shell function
+						// (only if we haven't exceeded the per-frame mesh creation limit)
+						Mesh = CreateStaticMeshFromPreExtractedShell(ExtractedGeom, MeshName, MeshPackage);
 
-						// Add this instance to the template
-						DeduplicationManager->AddInstance(
-							Template->GeometryHash,
-							LocalTransform,
-							FragmentModel->GetLocalId(),
-							Sample.MaterialIndex
-						);
-
-						Mesh = Template->SharedMesh;
-
-						// Apply material to newly created mesh
-						if (bIsNewTemplate && Mesh)
+						if (Mesh)
 						{
-							AddMaterialToMesh(Mesh, material);
-						}
+							// Track that we created a new mesh this frame
+							OnNewMeshCreated();
 
-						// Only save the package if this is a newly created mesh
-						if (bIsNewTemplate && Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
-						{
+							// Cache by RepresentationId for future instances
+							RepresentationMeshCache.Add(RepresentationId, Mesh);
+
+							// Save mesh if needed
+							if (!FPaths::FileExists(PackageFileName) && bSaveMeshes)
+							{
 #if WITH_EDITOR
-							MeshPackage->FullyLoad();
-							Mesh->Rename(*MeshName, MeshPackage);
-							Mesh->SetFlags(RF_Public | RF_Standalone);
-							MeshPackage->MarkPackageDirty();
-							FAssetRegistryModule::AssetCreated(Mesh);
-							PackagesToSave.Add(MeshPackage);
+								MeshPackage->FullyLoad();
+								Mesh->Rename(*MeshName, MeshPackage);
+								Mesh->SetFlags(RF_Public | RF_Standalone);
+								MeshPackage->MarkPackageDirty();
+								FAssetRegistryModule::AssetCreated(Mesh);
+								PackagesToSave.Add(MeshPackage);
 #endif
-						}
+							}
 
-						UE_LOG(LogTemp, Verbose, TEXT("Using deduplicated mesh (hash: %llu, instances: %d, new: %d)"),
-							Template->GeometryHash, Template->ReferenceCount, bIsNewTemplate ? 1 : 0);
+							UE_LOG(LogFragments, Log, TEXT("SpawnSingleFragment: Created and cached mesh for RepId %d (LocalId: %d) [%d/%d this frame]"),
+								RepresentationId, FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
+						}
+					}
+					else
+					{
+						// Mesh creation limit reached - skip this sample for now
+						// It will be created on a future frame when this fragment is visible again
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Deferred mesh creation for RepId %d (LocalId: %d) - limit reached [%d/%d]"),
+							RepresentationId, FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
+						continue;  // Skip to next sample
 					}
 				}
 				else
 				{
-					// Fallback to old method if extraction failed
-					UPackage* MeshPackage = CreatePackage(*PackagePath);
-					if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+					// CircleExtrusion: still use FlatBuffer path (not pre-extracted)
+					// This is acceptable because CircleExtrusion works correctly with FlatBuffer access
+
+					// Check mesh creation limit first
+					if (!CanCreateNewMesh())
 					{
-						const auto* shell = MeshesRef->shells()->Get(representation->id());
-						Mesh = CreateStaticMeshFromShell(shell, material, *MeshName, MeshPackage);
-					}
-					else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
-					{
-						const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-						Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Deferred CircleExtrusion mesh creation (LocalId: %d) - limit reached [%d/%d]"),
+							FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
+						continue;  // Skip to next sample
 					}
 
+					if (MeshesRef && MeshesRef->representations() && MeshesRef->circle_extrusions())
+					{
+						const uint32 RepCount = MeshesRef->representations()->size();
+						if (static_cast<uint32>(Sample.RepresentationIndex) < RepCount)
+						{
+							const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
+							if (representation && representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
+							{
+								const uint32 ExtrusionId = representation->id();
+								if (ExtrusionId < MeshesRef->circle_extrusions()->size())
+								{
+									const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(ExtrusionId);
+
+									// Get material from FlatBuffer for CircleExtrusion (still needed)
+									const Material* material = nullptr;
+									if (MeshesRef->materials() && static_cast<uint32>(Sample.MaterialIndex) < MeshesRef->materials()->size())
+									{
+										material = MeshesRef->materials()->Get(Sample.MaterialIndex);
+									}
+
+									Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+
+									if (Mesh)
+									{
+										OnNewMeshCreated();
+									}
+								}
+							}
+						}
+					}
+
+					// Save CircleExtrusion mesh if needed
 					if (Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
 					{
 #if WITH_EDITOR
@@ -1335,10 +1490,20 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 				MeshComp->RegisterComponent();
 				FragmentModel->AddInstanceComponent(MeshComp);
 
+				// IMPORTANT: Apply material AFTER registration - material overrides don't persist on unregistered components
+				// This applies the correct material for this sample, which may differ from the mesh's embedded material
+				// (e.g., when the mesh is cached by RepresentationId but different samples have different materials)
+				UMaterialInstanceDynamic* Material = GetPooledMaterial(ExtractedGeom.R, ExtractedGeom.G,
+					ExtractedGeom.B, ExtractedGeom.A, ExtractedGeom.bIsGlass);
+				if (Material)
+				{
+					MeshComp->SetMaterial(0, Material);
+				}
+
 				// Configure occlusion culling based on fragment classification
-				const uint8 MaterialAlpha = material ? material->a() : 255;
+				// Use pre-extracted material alpha instead of FlatBuffer access
 				const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
-					Item.Category, MaterialAlpha);
+					Item.Category, ExtractedGeom.A);
 
 				switch (Role)
 				{
@@ -1377,10 +1542,18 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 
 void UFragmentsImporter::ProcessSpawnChunk()
 {
+	// Reset per-frame mesh creation counter (for non-TileManager path)
+	NewMeshCreationsThisFrame = 0;
+
 	if (PendingSpawnQueue.Num() == 0)
 	{
 		// Spawning complete
 		UE_LOG(LogFragments, Log, TEXT("Chunked spawning complete! Total fragments: %d"), FragmentsSpawned);
+
+		// FINALIZE ALL ISMCs - batch-add all queued instances
+		// This is the key performance optimization: all instances are added at once
+		// instead of one-at-a-time which causes UE5 GPU buffer rebuilds
+		FinalizeAllISMCs();
 
 		// Clear timer
 		if (UWorld* World = GetWorld())
@@ -1410,7 +1583,8 @@ void UFragmentsImporter::ProcessSpawnChunk()
 		PendingSpawnQueue.RemoveAt(0);
 
 		// Spawn this fragment
-		AFragment* SpawnedActor = SpawnSingleFragment(Task.FragmentItem, Task.ParentActor, CurrentMeshesRef, bCurrentSaveMeshes);
+		bool bWasInstanced = false;
+		AFragment* SpawnedActor = SpawnSingleFragment(Task.FragmentItem, Task.ParentActor, CurrentMeshesRef, bCurrentSaveMeshes, &bWasInstanced);
 
 		if (SpawnedActor)
 		{
@@ -1418,6 +1592,16 @@ void UFragmentsImporter::ProcessSpawnChunk()
 			for (FFragmentItem* Child : Task.FragmentItem.FragmentChildren)
 			{
 				PendingSpawnQueue.Add(FFragmentSpawnTask(*Child, SpawnedActor));
+				TotalFragmentsToSpawn++;
+			}
+		}
+		else if (bWasInstanced && Task.FragmentItem.FragmentChildren.Num() > 0)
+		{
+			// Fragment was GPU instanced but has children - add them with original parent
+			// (This is rare for BIM models since instanced elements are usually leaf nodes)
+			for (FFragmentItem* Child : Task.FragmentItem.FragmentChildren)
+			{
+				PendingSpawnQueue.Add(FFragmentSpawnTask(*Child, Task.ParentActor));
 				TotalFragmentsToSpawn++;
 			}
 		}
@@ -1434,18 +1618,51 @@ void UFragmentsImporter::ProcessSpawnChunk()
 
 void UFragmentsImporter::ProcessAllTileManagerChunks()
 {
-	// Process spawn chunks for all tile managers (per-sample visibility only)
+	// Reset per-frame mesh creation counter
+	NewMeshCreationsThisFrame = 0;
+
+	// Sync coordinator settings from UPROPERTY values
+	FrameBudgetCoordinator.TotalFrameBudgetMs = TotalFrameBudgetMs;
+	FrameBudgetCoordinator.GeometryBudgetRatio = GeometryBudgetRatio;
+	FrameBudgetCoordinator.MinimumBudgetThresholdMs = MinimumBudgetThresholdMs;
+	FrameBudgetCoordinator.bEnableAdaptiveBudget = bEnableAdaptiveBudget;
+
+	// Begin coordinated frame budget
+	FrameBudgetCoordinator.BeginFrame();
+
+	// Spawning (budget split among TileManagers)
+	const int32 TMCount = TileManagers.Num();
+	int32 TMIndex = 0;
+
 	for (auto& Pair : TileManagers)
 	{
+		// Check if budget exhausted before processing each TileManager
+		if (FrameBudgetCoordinator.IsBudgetExhausted())
+		{
+			UE_LOG(LogFragments, Verbose, TEXT("Frame budget exhausted at TileManager %d/%d"), TMIndex, TMCount);
+			break;
+		}
+
 		UFragmentTileManager* TileManager = Pair.Value;
 		if (!TileManager)
 		{
+			TMIndex++;
 			continue;
 		}
 
-		// Per-sample mode: process spawning based on dynamic tiles
-		TileManager->ProcessSpawnChunk();
+		// Allocate proportional spawn budget for this TileManager
+		FBudgetAllocationResult SpawnBudget = FrameBudgetCoordinator.AllocateSpawnBudget(TMCount, TMIndex);
+		if (SpawnBudget.bHasBudget)
+		{
+			// Per-sample mode: process spawning with coordinated budget
+			TileManager->ProcessSpawnChunkWithBudget(SpawnBudget.BudgetMs);
+		}
+
+		TMIndex++;
 	}
+
+	// End frame (logs statistics periodically)
+	FrameBudgetCoordinator.EndFrame();
 
 	// Check if all tile managers are idle
 	bool bAnyLoading = false;
@@ -1508,23 +1725,6 @@ void UFragmentsImporter::StartChunkedSpawning(const FFragmentItem& RootItem, AAc
 			true // Loop
 		);
 	}
-	// At the end of StartChunkedSpawning:
-	if (DeduplicationManager)
-	{
-		int32 UniqueGeometries = 0;
-		int32 TotalInstances = 0;
-		float Ratio = 0.0f;
-
-		DeduplicationManager->GetStats(UniqueGeometries, TotalInstances, Ratio);
-
-		UE_LOG(LogFragments, Log, TEXT("=== DEDUPLICATION STATS ==="));
-		UE_LOG(LogFragments, Log, TEXT("Unique geometries: %d"), UniqueGeometries);
-		UE_LOG(LogFragments, Log, TEXT("Total instances: %d"), TotalInstances);
-		UE_LOG(LogFragments, Log, TEXT("Deduplication ratio: %.1fx"), Ratio);
-		UE_LOG(LogFragments, Log, TEXT("Memory saved: ~%.0f%%"),
-			(1.0f - (1.0f / Ratio)) * 100.0f);
-	}
-
 	UE_LOG(LogFragments, Log, TEXT("Chunked Spawning Started. Processing %d fragments per frame."), FragmentsPerChunk);
 }
 
@@ -1553,6 +1753,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 		SrcModel.BuildSettings.SrcLightmapIndex = 0;
 		SrcModel.BuildSettings.DstLightmapIndex = 1;
 		SrcModel.BuildSettings.MinLightmapResolution = 64;
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f; // Disable distance field generation for runtime meshes
 	}
 #endif
 
@@ -1578,7 +1779,6 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 		PointsRef.Add(FVector(P.x() * 100, P.z() * 100, P.y() * 100));
 		Vertices.Add(VertId);
 
-		//UE_LOG(LogTemp, Log, TEXT("\t\t\t\tpoint %d: x: %f, y:%f, z:%f"), i, P.x(), P.y(), P.z());
 	}
 
 	FName MaterialSlotName = AddMaterialToMesh(StaticMesh, RefMaterial);
@@ -1618,7 +1818,6 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 	for (flatbuffers::uoffset_t i = 0; i < Profiles->size(); i++)
 	{
 		// Create Profile Polygons for those that has no holes reference
-		//UE_LOG(LogTemp, Log, TEXT("Processing Profile %d"), i);
 		if (!ProfileHolesIdx.Contains(i))
 		{
 			const ShellProfile* Profile = Profiles->Get(i);
@@ -1667,9 +1866,6 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 			}
 
 			TArray<TArray<FVector>> ProfileHolesPoints;
-
-			/*UE_LOG(LogTemp, Log, TEXT("Profile %d has %d points and %d holes"),
-				i, Indices->size(), ProfileHolesIdx.Contains(i) ? ProfileHolesIdx[i].Num() : 0);*/
 
 			TArray<int32> OutIndices;
 			TArray<FVector> OutVertices;
@@ -1735,6 +1931,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromCircleExtrusion(const Circl
 		SrcModel.BuildSettings.SrcLightmapIndex = 0;
 		SrcModel.BuildSettings.DstLightmapIndex = 1;
 		SrcModel.BuildSettings.MinLightmapResolution = 64;
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f; // Disable distance field generation for runtime meshes
 	}
 #endif
 
@@ -1768,61 +1965,27 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromCircleExtrusion(const Circl
 
 	StaticMesh->BuildFromMeshDescriptions(MeshDescriptionPtrs, MeshParams);
 
-	// THIS IS EDITOR ONLY. TO DO: Find the way to make it in Runtime??
-	//if (StaticMesh->GetNumSourceModels() >= 3)
-	//{
-	//	StaticMesh->GetSourceModel(0).ScreenSize.Default = 1.0f;
-	//	StaticMesh->GetSourceModel(1).ScreenSize.Default = 0.5f;
-	//	StaticMesh->GetSourceModel(2).ScreenSize.Default = 0.1f;
-	//}
-	//else
-	//{
-	//	UE_LOG(LogTemp, Warning, TEXT("Unexpected: Only %d LODs were created!"), StaticMesh->GetNumSourceModels());
-	//}
 	return StaticMesh;
 }
 
 FName UFragmentsImporter::AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial)
 {
-	if (!RefMaterial || !CreatedMesh)return FName();
+	if (!RefMaterial || !CreatedMesh) return FName();
 
-	bool HasTransparency = false;
-	float R = RefMaterial->r() / 255.f;
-	float G = RefMaterial->g() / 255.f;
-	float B = RefMaterial->b() / 255.f;
-	float A = RefMaterial->a() / 255.f;
+	// Extract material properties
+	uint8 R = RefMaterial->r();
+	uint8 G = RefMaterial->g();
+	uint8 B = RefMaterial->b();
+	uint8 A = RefMaterial->a();
+	bool bIsGlass = A < 255; // Glass is determined by transparency
 
-	UMaterialInterface* Material = nullptr;
-	if (A < 1)
-	{
-		///Script/Engine.Material'/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial'
-		Material = BaseGlassMaterial;
-		HasTransparency = true;
-	}
-	else
-	{
-		Material = BaseMaterial;
-	}
-	if (!Material)
-	{
-		UE_LOG(LogFragments, Error, TEXT("Unable to load Base Material"));
-		return FName();
-	}
-
-	UMaterialInstanceDynamic* DynamicMaterial = UMaterialInstanceDynamic::Create(Material, CreatedMesh);
+	// Use pooled material for CRC-based deduplication
+	UMaterialInstanceDynamic* DynamicMaterial = GetPooledMaterial(R, G, B, A, bIsGlass);
 	if (!DynamicMaterial)
 	{
-		UE_LOG(LogFragments, Error, TEXT("Failed to create dynamic material."));
+		UE_LOG(LogFragments, Error, TEXT("Failed to get pooled material"));
 		return FName();
 	}
-
-	if (HasTransparency)
-	{
-		DynamicMaterial->SetScalarParameterValue(TEXT("Opacity"), A);
-	}
-
-	DynamicMaterial->SetVectorParameterValue(TEXT("BaseColor"), FVector4(R, G, B, A));
-
 
 	// Add Material
 	return CreatedMesh->AddMaterial(DynamicMaterial);
@@ -1886,14 +2049,8 @@ bool UFragmentsImporter::TriangulatePolygonWithHoles(const TArray<FVector>& Poin
 			}
 			Projected = UniqueProjected;
 
-			/*for (const FVector2D& P : Projected)
-			{
-				UE_LOG(LogTemp, Log, TEXT("\tProjected Point before winding check: X: %.3f, Y: %.3f"), P.X, P.Y);
-			}*/
-
 			// Fix winding
 			bool bClockwise = UFragmentsUtils::IsClockwise(Projected);
-			//UE_LOG(LogTemp, Log, TEXT("Contour winding is %s"), bClockwise ? TEXT("CW") : TEXT("CCW"));
 
 			if (!bIsHole && bClockwise)
 			{
@@ -1908,7 +2065,6 @@ bool UFragmentsImporter::TriangulatePolygonWithHoles(const TArray<FVector>& Poin
 			{
 				Contour.Add(P.X);
 				Contour.Add(P.Y);
-				//UE_LOG(LogTemp, Warning, TEXT("    X: %.6f, Y: %.6f"), P.X, P.Y);
 			}
 
 			tessAddContour(Tess, 2, Contour.GetData(), sizeof(float) * 2, Projected.Num());
@@ -1960,7 +2116,6 @@ bool UFragmentsImporter::TriangulatePolygonWithHoles(const TArray<FVector>& Poin
 	}
 	const int32* Indices = tessGetElements(Tess);
 	const int32 ElementCount = tessGetElementCount(Tess);
-	//UE_LOG(LogTemp, Log, TEXT("Tessellated VertexCount: %d, ElementCount: %d"), VertexCount, ElementCount);
 
 	for (int32 i = 0; i < ElementCount; ++i)
 	{
@@ -2353,4 +2508,1300 @@ void UFragmentsImporter::SavePackagesWithProgress(const TArray<UPackage*>& InPac
 	// Runtime: do not save packages, just log
 	UE_LOG(LogFragments, Log, TEXT("Skipping package saving in runtime environment."));
 #endif
+}
+
+//////////////////////////////////////////////////////////////////////////
+// MATERIAL POOLING
+//////////////////////////////////////////////////////////////////////////
+
+FName UFragmentsImporter::AddMaterialToMeshFromRawData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass)
+{
+	if (!CreatedMesh) return FName();
+
+	// Use pooled material
+	UMaterialInstanceDynamic* DynamicMaterial = GetPooledMaterial(R, G, B, A, bIsGlass);
+	if (!DynamicMaterial)
+	{
+		UE_LOG(LogFragments, Error, TEXT("Failed to get pooled material"));
+		return FName();
+	}
+
+	return CreatedMesh->AddMaterial(DynamicMaterial);
+}
+
+uint32 UFragmentsImporter::HashMaterialProperties(uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass) const
+{
+	uint32 Hash = 0;
+	Hash = HashCombine(Hash, GetTypeHash(R));
+	Hash = HashCombine(Hash, GetTypeHash(G));
+	Hash = HashCombine(Hash, GetTypeHash(B));
+	Hash = HashCombine(Hash, GetTypeHash(A));
+	Hash = HashCombine(Hash, GetTypeHash(bIsGlass));
+	return Hash;
+}
+
+UMaterialInstanceDynamic* UFragmentsImporter::GetPooledMaterial(uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass)
+{
+	uint32 Hash = HashMaterialProperties(R, G, B, A, bIsGlass);
+
+	if (UMaterialInstanceDynamic** Found = MaterialPool.Find(Hash))
+	{
+		return *Found;
+	}
+
+	// Create new material instance
+	UMaterialInterface* BaseMat = bIsGlass ? BaseGlassMaterial : BaseMaterial;
+	if (!BaseMat)
+	{
+		// Load materials if not already loaded
+		BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
+		BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
+		BaseMat = bIsGlass ? BaseGlassMaterial : BaseMaterial;
+	}
+
+	if (!BaseMat)
+	{
+		UE_LOG(LogFragments, Error, TEXT("Failed to load base material for pooling"));
+		return nullptr;
+	}
+
+	UMaterialInstanceDynamic* NewMat = UMaterialInstanceDynamic::Create(BaseMat, this);
+	if (!NewMat)
+	{
+		return nullptr;
+	}
+
+	float Rf = R / 255.f;
+	float Gf = G / 255.f;
+	float Bf = B / 255.f;
+	float Af = A / 255.f;
+
+	if (Af < 1.0f)
+	{
+		NewMat->SetScalarParameterValue(TEXT("Opacity"), Af);
+	}
+	NewMat->SetVectorParameterValue(TEXT("BaseColor"), FVector4(Rf, Gf, Bf, Af));
+
+	MaterialPool.Add(Hash, NewMat);
+	return NewMat;
+}
+
+//////////////////////////////////////////////////////////////////////////
+// EAGER GEOMETRY EXTRACTION
+// Extracts all geometry data from FlatBuffers at load time to eliminate
+// FlatBuffer access during spawn phase. This prevents crashes when
+// FlatBuffer pointers become invalid in the async/TileManager path.
+//////////////////////////////////////////////////////////////////////////
+
+UStaticMesh* UFragmentsImporter::CreateStaticMeshFromPreExtractedShell(
+	const FPreExtractedGeometry& Geometry,
+	const FString& AssetName,
+	UObject* OuterRef)
+{
+	if (!Geometry.bIsValid || !Geometry.bIsShell)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateStaticMeshFromPreExtractedShell: Invalid geometry for %s"), *AssetName);
+		return nullptr;
+	}
+
+	if (Geometry.Vertices.Num() == 0)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateStaticMeshFromPreExtractedShell: No vertices for %s"), *AssetName);
+		return nullptr;
+	}
+
+	// Create StaticMesh object
+	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*AssetName), RF_Public | RF_Standalone);
+	StaticMesh->InitResources();
+	StaticMesh->SetLightingGuid();
+
+	UStaticMeshDescription* StaticMeshDescription = StaticMesh->CreateStaticMeshDescription(OuterRef);
+	FMeshDescription& MeshDescription = StaticMeshDescription->GetMeshDescription();
+	UStaticMesh::FBuildMeshDescriptionsParams MeshParams;
+
+	// Build Settings
+#if WITH_EDITOR
+	{
+		FStaticMeshSourceModel& SrcModel = StaticMesh->AddSourceModel();
+		SrcModel.BuildSettings.bRecomputeNormals = true;
+		SrcModel.BuildSettings.bRecomputeTangents = true;
+		SrcModel.BuildSettings.bRemoveDegenerates = true;
+		SrcModel.BuildSettings.bUseHighPrecisionTangentBasis = false;
+		SrcModel.BuildSettings.bBuildReversedIndexBuffer = true;
+		SrcModel.BuildSettings.bUseFullPrecisionUVs = false;
+		SrcModel.BuildSettings.bGenerateLightmapUVs = true;
+		SrcModel.BuildSettings.SrcLightmapIndex = 0;
+		SrcModel.BuildSettings.DstLightmapIndex = 1;
+		SrcModel.BuildSettings.MinLightmapResolution = 64;
+		SrcModel.BuildSettings.DistanceFieldResolutionScale = 0.0f; // Disable distance field generation for runtime meshes
+	}
+#endif
+
+	MeshParams.bBuildSimpleCollision = true;
+	MeshParams.bCommitMeshDescription = true;
+	MeshParams.bMarkPackageDirty = true;
+	MeshParams.bUseHashAsGuid = false;
+#if !WITH_EDITOR
+	MeshParams.bFastBuild = true;
+#endif
+
+	// Create vertices from pre-extracted data
+	TArray<FVertexID> Vertices;
+	Vertices.Reserve(Geometry.Vertices.Num());
+
+	for (int32 i = 0; i < Geometry.Vertices.Num(); i++)
+	{
+		const FVertexID VertId = StaticMeshDescription->CreateVertex();
+		StaticMeshDescription->SetVertexPosition(VertId, Geometry.Vertices[i]);
+		Vertices.Add(VertId);
+	}
+
+	// Add material using pre-extracted color data
+	FName MaterialSlotName = AddMaterialToMeshFromRawData(
+		StaticMesh,
+		Geometry.R, Geometry.G, Geometry.B, Geometry.A,
+		Geometry.bIsGlass);
+	const FPolygonGroupID PolygonGroupId = StaticMeshDescription->CreatePolygonGroup();
+	StaticMeshDescription->SetPolygonGroupMaterialSlotName(PolygonGroupId, MaterialSlotName);
+
+	// Build hole map
+	TMap<int32, TArray<TArray<int32>>> ProfileHolesMap;
+	for (int32 ProfileIdx = 0; ProfileIdx < Geometry.ProfileHoles.Num(); ProfileIdx++)
+	{
+		if (Geometry.ProfileHoles[ProfileIdx].Num() > 0)
+		{
+			ProfileHolesMap.Add(ProfileIdx, Geometry.ProfileHoles[ProfileIdx]);
+		}
+	}
+
+	// Process profiles
+	bool bHasValidPolygons = false;
+	for (int32 ProfileIdx = 0; ProfileIdx < Geometry.ProfileIndices.Num(); ProfileIdx++)
+	{
+		const TArray<int32>& ProfileVertexIndices = Geometry.ProfileIndices[ProfileIdx];
+
+		if (ProfileVertexIndices.Num() < 3)
+		{
+			continue;
+		}
+
+		bool bHasHoles = ProfileHolesMap.Contains(ProfileIdx);
+
+		if (!bHasHoles)
+		{
+			// Simple polygon - direct creation
+			TArray<FVertexInstanceID> TriangleInstance;
+			TriangleInstance.Reserve(ProfileVertexIndices.Num());
+
+			for (int32 Idx : ProfileVertexIndices)
+			{
+				if (Vertices.IsValidIndex(Idx))
+				{
+					TriangleInstance.Add(MeshDescription.CreateVertexInstance(Vertices[Idx]));
+				}
+			}
+
+			if (TriangleInstance.Num() >= 3)
+			{
+				MeshDescription.CreatePolygon(PolygonGroupId, TriangleInstance, {});
+				bHasValidPolygons = true;
+			}
+		}
+		else
+		{
+			// Polygon with holes - tessellate
+			TArray<FVector> OutVertices;
+			TArray<int32> OutIndices;
+
+			if (TriangulatePolygonWithHoles(
+				Geometry.Vertices,
+				ProfileVertexIndices,
+				ProfileHolesMap[ProfileIdx],
+				OutVertices,
+				OutIndices))
+			{
+				// Create new vertices for tessellated geometry
+				TMap<int32, FVertexID> TempVertexMap;
+				for (int32 j = 0; j < OutVertices.Num(); j++)
+				{
+					FVertexID VId = StaticMeshDescription->CreateVertex();
+					StaticMeshDescription->SetVertexPosition(VId, OutVertices[j]);
+					TempVertexMap.Add(j, VId);
+				}
+
+				// Create triangles
+				for (int32 j = 0; j < OutIndices.Num(); j += 3)
+				{
+					if (j + 2 < OutIndices.Num())
+					{
+						TArray<FVertexInstanceID> Triangle;
+						Triangle.Add(MeshDescription.CreateVertexInstance(TempVertexMap[OutIndices[j]]));
+						Triangle.Add(MeshDescription.CreateVertexInstance(TempVertexMap[OutIndices[j + 1]]));
+						Triangle.Add(MeshDescription.CreateVertexInstance(TempVertexMap[OutIndices[j + 2]]));
+
+						MeshDescription.CreatePolygon(PolygonGroupId, Triangle);
+						bHasValidPolygons = true;
+					}
+				}
+			}
+			else
+			{
+				UE_LOG(LogFragments, Warning, TEXT("Tessellation failed for profile %d in mesh %s"), ProfileIdx, *AssetName);
+			}
+		}
+	}
+
+	if (!bHasValidPolygons)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("CreateStaticMeshFromPreExtractedShell: No valid polygons for %s"), *AssetName);
+		return nullptr;
+	}
+
+	FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MeshDescription);
+	FStaticMeshOperations::ComputeTangentsAndNormals(MeshDescription, EComputeNTBsFlags::Normals | EComputeNTBsFlags::Tangents);
+
+	StaticMesh->BuildFromMeshDescriptions(TArray<const FMeshDescription*>{&MeshDescription}, MeshParams);
+
+	return StaticMesh;
+}
+
+void UFragmentsImporter::PreExtractAllGeometry(FFragmentItem& RootItem, const Meshes* MeshesRef)
+{
+	if (!MeshesRef)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("PreExtractAllGeometry: MeshesRef is null, skipping extraction"));
+		return;
+	}
+
+	// Statistics for logging
+	int32 TotalSamples = 0;
+	int32 SuccessfulExtractions = 0;
+	int32 FailedExtractions = 0;
+
+	// Use a stack-based approach to avoid deep recursion
+	TArray<FFragmentItem*> ItemStack;
+	ItemStack.Add(&RootItem);
+
+	while (ItemStack.Num() > 0)
+	{
+		FFragmentItem* CurrentItem = ItemStack.Pop();
+		if (!CurrentItem)
+		{
+			continue;
+		}
+
+		// Process all samples in this item
+		for (FFragmentSample& Sample : CurrentItem->Samples)
+		{
+			TotalSamples++;
+
+			if (ExtractSampleGeometry(Sample, MeshesRef, CurrentItem->LocalId))
+			{
+				SuccessfulExtractions++;
+			}
+			else
+			{
+				FailedExtractions++;
+			}
+		}
+
+		// Add children to the stack for processing
+		for (FFragmentItem* Child : CurrentItem->FragmentChildren)
+		{
+			if (Child)
+			{
+				ItemStack.Add(Child);
+			}
+		}
+	}
+
+	// Calculate approximate memory usage for extracted geometry
+	int64 TotalVertexBytes = 0;
+	int64 TotalProfileBytes = 0;
+	int64 TotalHoleBytes = 0;
+
+	// Re-traverse to calculate memory
+	ItemStack.Add(&RootItem);
+	while (ItemStack.Num() > 0)
+	{
+		FFragmentItem* CurrentItem = ItemStack.Pop();
+		if (!CurrentItem) continue;
+
+		for (const FFragmentSample& Sample : CurrentItem->Samples)
+		{
+			const FPreExtractedGeometry& Geom = Sample.ExtractedGeometry;
+			if (Geom.bIsValid && Geom.bIsShell)
+			{
+				// Vertices: TArray overhead (24 bytes) + sizeof(FVector) * count
+				TotalVertexBytes += 24 + (sizeof(FVector) * Geom.Vertices.Num());
+
+				// Profile indices: TArray overhead + nested array overhead + actual indices
+				TotalProfileBytes += 24;  // Outer array
+				for (const TArray<int32>& Profile : Geom.ProfileIndices)
+				{
+					TotalProfileBytes += 24 + (sizeof(int32) * Profile.Num());
+				}
+
+				// Holes: triple-nested arrays
+				TotalHoleBytes += 24;  // Outer array
+				for (const TArray<TArray<int32>>& HolesForProfile : Geom.ProfileHoles)
+				{
+					TotalHoleBytes += 24;
+					for (const TArray<int32>& Hole : HolesForProfile)
+					{
+						TotalHoleBytes += 24 + (sizeof(int32) * Hole.Num());
+					}
+				}
+			}
+		}
+
+		for (FFragmentItem* Child : CurrentItem->FragmentChildren)
+		{
+			if (Child) ItemStack.Add(Child);
+		}
+	}
+
+	int64 TotalBytes = TotalVertexBytes + TotalProfileBytes + TotalHoleBytes;
+	float TotalMB = TotalBytes / (1024.0f * 1024.0f);
+
+	UE_LOG(LogFragments, Log, TEXT("=== GEOMETRY PRE-EXTRACTION COMPLETE ==="));
+	UE_LOG(LogFragments, Log, TEXT("Total samples: %d"), TotalSamples);
+	UE_LOG(LogFragments, Log, TEXT("Successful extractions: %d"), SuccessfulExtractions);
+	UE_LOG(LogFragments, Log, TEXT("Failed extractions: %d"), FailedExtractions);
+	UE_LOG(LogFragments, Log, TEXT("=== GEOMETRY MEMORY USAGE ==="));
+	UE_LOG(LogFragments, Log, TEXT("Vertex data: %.2f MB"), TotalVertexBytes / (1024.0f * 1024.0f));
+	UE_LOG(LogFragments, Log, TEXT("Profile data: %.2f MB"), TotalProfileBytes / (1024.0f * 1024.0f));
+	UE_LOG(LogFragments, Log, TEXT("Hole data: %.2f MB"), TotalHoleBytes / (1024.0f * 1024.0f));
+	UE_LOG(LogFragments, Log, TEXT("Total pre-extracted geometry: %.2f MB"), TotalMB);
+
+	if (FailedExtractions > 0)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("Some geometry extractions failed. These fragments will be skipped during spawn."));
+	}
+
+	// ==========================================
+	// GPU INSTANCING: Count instances per RepresentationId + Material combination
+	// This runs AFTER geometry extraction so we have access to pre-extracted material data
+	// ==========================================
+	RepresentationMaterialInstanceCount.Empty();
+	{
+		TArray<FFragmentItem*> CountStack;
+		CountStack.Add(&RootItem);
+
+		while (CountStack.Num() > 0)
+		{
+			FFragmentItem* CurrentItem = CountStack.Pop();
+			if (!CurrentItem) continue;
+
+			for (const FFragmentSample& Sample : CurrentItem->Samples)
+			{
+				// Only count samples with valid pre-extracted geometry
+				if (Sample.RepresentationIndex >= 0 && Sample.ExtractedGeometry.bIsValid)
+				{
+					// Compute material hash from pre-extracted geometry data
+					const FPreExtractedGeometry& Geom = Sample.ExtractedGeometry;
+					uint32 MatHash = HashMaterialProperties(Geom.R, Geom.G, Geom.B, Geom.A, Geom.bIsGlass);
+					int64 ComboKey = ((int64)Sample.RepresentationIndex) | ((int64)MatHash << 32);
+
+					int32& Count = RepresentationMaterialInstanceCount.FindOrAdd(ComboKey);
+					Count++;
+				}
+			}
+
+			// Add children to count stack
+			for (FFragmentItem* Child : CurrentItem->FragmentChildren)
+			{
+				if (Child) CountStack.Add(Child);
+			}
+		}
+	}
+
+	// Log instancing analysis
+	int32 InstanceableCount = 0;
+	int32 UniqueInstanceableGroups = 0;
+	for (const auto& Pair : RepresentationMaterialInstanceCount)
+	{
+		if (Pair.Value >= InstancingThreshold)
+		{
+			InstanceableCount += Pair.Value;
+			UniqueInstanceableGroups++;
+		}
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("=== GPU INSTANCING ANALYSIS ==="));
+	UE_LOG(LogFragments, Log, TEXT("Instancing threshold: %d instances"), InstancingThreshold);
+	UE_LOG(LogFragments, Log, TEXT("Total unique RepId+Material combinations: %d"), RepresentationMaterialInstanceCount.Num());
+	UE_LOG(LogFragments, Log, TEXT("Groups meeting threshold: %d"), UniqueInstanceableGroups);
+	UE_LOG(LogFragments, Log, TEXT("Fragments eligible for instancing: %d"), InstanceableCount);
+	UE_LOG(LogFragments, Log, TEXT("Estimated draw call reduction: %d -> %d (%.1f%%)"),
+		SuccessfulExtractions,
+		SuccessfulExtractions - InstanceableCount + UniqueInstanceableGroups,
+		InstanceableCount > 0 ? ((float)(InstanceableCount - UniqueInstanceableGroups) / SuccessfulExtractions * 100.0f) : 0.0f);
+}
+
+bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId)
+{
+	// Reset the extracted geometry to ensure clean state
+	Sample.ExtractedGeometry = FPreExtractedGeometry();
+
+	// Validate indices are valid
+	if (Sample.RepresentationIndex < 0 || Sample.MaterialIndex < 0 || Sample.LocalTransformIndex < 0)
+	{
+		UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: Invalid indices for item %d, sample %d"),
+			ItemLocalId, Sample.SampleIndex);
+		return false;
+	}
+
+	// Validate FlatBuffer arrays exist
+	if (!MeshesRef->representations() || !MeshesRef->materials() || !MeshesRef->local_transforms())
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Missing FlatBuffer arrays for item %d"), ItemLocalId);
+		return false;
+	}
+
+	// Bounds check representation index
+	const uint32 RepCount = MeshesRef->representations()->size();
+	if (static_cast<uint32>(Sample.RepresentationIndex) >= RepCount)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: RepresentationIndex %d >= count %u for item %d"),
+			Sample.RepresentationIndex, RepCount, ItemLocalId);
+		return false;
+	}
+
+	// Get representation
+	const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
+	if (!representation)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Representation is null for item %d"), ItemLocalId);
+		return false;
+	}
+
+	// Get material
+	const uint32 MatCount = MeshesRef->materials()->size();
+	if (static_cast<uint32>(Sample.MaterialIndex) >= MatCount)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: MaterialIndex %d >= count %u for item %d"),
+			Sample.MaterialIndex, MatCount, ItemLocalId);
+		return false;
+	}
+	const Material* material = MeshesRef->materials()->Get(Sample.MaterialIndex);
+
+	// Get local transform
+	const uint32 TransformCount = MeshesRef->local_transforms()->size();
+	if (static_cast<uint32>(Sample.LocalTransformIndex) >= TransformCount)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: LocalTransformIndex %d >= count %u for item %d"),
+			Sample.LocalTransformIndex, TransformCount, ItemLocalId);
+		return false;
+	}
+	const Transform* local_transform = MeshesRef->local_transforms()->Get(Sample.LocalTransformIndex);
+
+	// Extract material data
+	if (material)
+	{
+		Sample.ExtractedGeometry.R = material->r();
+		Sample.ExtractedGeometry.G = material->g();
+		Sample.ExtractedGeometry.B = material->b();
+		Sample.ExtractedGeometry.A = material->a();
+		Sample.ExtractedGeometry.bIsGlass = material->a() < 255;
+	}
+
+	// Extract local transform
+	if (local_transform)
+	{
+		Sample.ExtractedGeometry.LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
+	}
+
+	// Store representation ID for debugging
+	Sample.ExtractedGeometry.RepresentationId = representation->id();
+
+	// Handle Shell geometry
+	if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+	{
+		Sample.ExtractedGeometry.bIsShell = true;
+
+		if (!MeshesRef->shells())
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: shells() is null for item %d"), ItemLocalId);
+			return false;
+		}
+
+		const uint32 ShellId = representation->id();
+		const uint32 ShellCount = MeshesRef->shells()->size();
+
+		if (ShellId >= ShellCount)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell id %u >= count %u for item %d"),
+				ShellId, ShellCount, ItemLocalId);
+			return false;
+		}
+
+		const Shell* shell = MeshesRef->shells()->Get(ShellId);
+		if (!shell)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u is null for item %d"), ShellId, ItemLocalId);
+			return false;
+		}
+
+		// Validate and extract points
+		if (!shell->points() || shell->points()->size() == 0)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u has no points for item %d"), ShellId, ItemLocalId);
+			return false;
+		}
+
+		const auto* Points = shell->points();
+		const uint32 PointCount = Points->size();
+
+		// Sanity check - prevent extremely large allocations
+		constexpr uint32 MaxPointCount = 1000000;
+		if (PointCount > MaxPointCount)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Point count %u exceeds limit for item %d"), PointCount, ItemLocalId);
+			return false;
+		}
+
+		Sample.ExtractedGeometry.Vertices.Reserve(PointCount);
+		for (flatbuffers::uoffset_t i = 0; i < PointCount; i++)
+		{
+			const auto* P = Points->Get(i);
+			if (P)
+			{
+				// Convert to Unreal coordinates: Z-up, cm units
+				Sample.ExtractedGeometry.Vertices.Add(FVector(P->x() * 100.0f, P->z() * 100.0f, P->y() * 100.0f));
+			}
+		}
+
+		// Validate and extract profiles
+		const auto* Profiles = shell->profiles();
+		if (!Profiles)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u has no profiles for item %d"), ShellId, ItemLocalId);
+			return false;
+		}
+
+		const uint32 ProfileCount = Profiles->size();
+		constexpr uint32 MaxProfileCount = 100000;
+		if (ProfileCount > MaxProfileCount)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Profile count %u exceeds limit for item %d"), ProfileCount, ItemLocalId);
+			return false;
+		}
+
+		// Build hole map first
+		TMap<int32, TArray<TArray<int32>>> ProfileHolesMap;
+		if (shell->holes())
+		{
+			const auto* Holes = shell->holes();
+			const uint32 HoleCount = Holes->size();
+
+			for (flatbuffers::uoffset_t j = 0; j < HoleCount && j < MaxProfileCount; j++)
+			{
+				const auto* Hole = Holes->Get(j);
+				if (!Hole) continue;
+
+				int32 ProfileId = Hole->profile_id();
+
+				TArray<int32> HoleIndices;
+				if (Hole->indices())
+				{
+					const uint32 HoleIndexCount = Hole->indices()->size();
+					constexpr uint32 MaxIndicesPerProfile = 100000;
+					if (HoleIndexCount <= MaxIndicesPerProfile)
+					{
+						HoleIndices.Reserve(HoleIndexCount);
+						for (flatbuffers::uoffset_t k = 0; k < HoleIndexCount; k++)
+						{
+							HoleIndices.Add(Hole->indices()->Get(k));
+						}
+					}
+				}
+
+				ProfileHolesMap.FindOrAdd(ProfileId).Add(MoveTemp(HoleIndices));
+			}
+		}
+
+		// Extract profile indices
+		Sample.ExtractedGeometry.ProfileIndices.Reserve(ProfileCount);
+		Sample.ExtractedGeometry.ProfileHoles.SetNum(ProfileCount);
+
+		bool bHasValidProfile = false;
+		for (flatbuffers::uoffset_t i = 0; i < ProfileCount; i++)
+		{
+			const auto* Profile = Profiles->Get(i);
+			TArray<int32> ProfileVertexIndices;
+
+			if (Profile && Profile->indices())
+			{
+				const auto* Indices = Profile->indices();
+				const uint32 IndexCount = Indices->size();
+
+				// Skip profiles with fewer than 3 indices (not a valid polygon)
+				if (IndexCount >= 3)
+				{
+					constexpr uint32 MaxIndicesPerProfile = 100000;
+					if (IndexCount <= MaxIndicesPerProfile)
+					{
+						ProfileVertexIndices.Reserve(IndexCount);
+						for (flatbuffers::uoffset_t j = 0; j < IndexCount; j++)
+						{
+							ProfileVertexIndices.Add(Indices->Get(j));
+						}
+						bHasValidProfile = true;
+					}
+					else
+					{
+						UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: Profile %d has %u indices (limit %u), skipping"),
+							i, IndexCount, MaxIndicesPerProfile);
+					}
+				}
+			}
+
+			Sample.ExtractedGeometry.ProfileIndices.Add(MoveTemp(ProfileVertexIndices));
+
+			// Copy holes for this profile
+			if (TArray<TArray<int32>>* HolesForProfile = ProfileHolesMap.Find(i))
+			{
+				Sample.ExtractedGeometry.ProfileHoles[i] = *HolesForProfile;
+			}
+		}
+
+		if (!bHasValidProfile)
+		{
+			UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: No valid profiles for Shell %u, item %d"), ShellId, ItemLocalId);
+			return false;
+		}
+
+		// Mark as valid
+		Sample.ExtractedGeometry.bIsValid = true;
+		return true;
+	}
+	// Handle CircleExtrusion geometry
+	else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
+	{
+		Sample.ExtractedGeometry.bIsShell = false;
+
+		// For CircleExtrusion, we mark as valid but don't pre-extract the complex geometry
+		// The spawn phase will still use the FlatBuffer path for CircleExtrusion
+		// This is acceptable because CircleExtrusion uses a different (working) code path
+		// TODO: Implement full CircleExtrusion extraction if needed
+		Sample.ExtractedGeometry.bIsValid = true;
+		return true;
+	}
+
+	// Unknown representation class
+	UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Unknown representation class %d for item %d"),
+		static_cast<int32>(representation->representation_class()), ItemLocalId);
+	return false;
+}
+
+// ==========================================
+// GPU INSTANCING METHODS (Phase 4)
+// ==========================================
+
+bool UFragmentsImporter::ShouldUseInstancing(int32 RepresentationId, uint32 MaterialHash) const
+{
+	if (!bEnableGPUInstancing)
+	{
+		return false;
+	}
+
+	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
+	if (const int32* Count = RepresentationMaterialInstanceCount.Find(ComboKey))
+	{
+		return *Count >= InstancingThreshold;
+	}
+	return false;
+}
+
+UHierarchicalInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
+	int32 RepresentationId, uint32 MaterialHash,
+	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material)
+{
+	if (!Mesh)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("GetOrCreateISMC: Mesh is null for RepId=%d"), RepresentationId);
+		return nullptr;
+	}
+
+	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
+
+	// Check if HISMC already exists for this combination
+	if (FInstancedMeshGroup* Existing = InstancedMeshGroups.Find(ComboKey))
+	{
+		return Existing->ISMC;
+	}
+
+	// Create host actor if needed (single actor holds all HISMCs for organization)
+	if (!ISMCHostActor && OwnerRef)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = OwnerRef;
+		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
+			FTransform::Identity, SpawnParams);
+
+		if (ISMCHostActor)
+		{
+#if WITH_EDITOR
+			ISMCHostActor->SetActorLabel(TEXT("FragmentHISMCHost"));
+#endif
+			UE_LOG(LogFragments, Log, TEXT("Created HISMC host actor"));
+		}
+	}
+
+	if (!ISMCHostActor)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("GetOrCreateISMC: Failed to create host actor"));
+		return nullptr;
+	}
+
+	// Create new HISMC for per-cluster culling
+	UHierarchicalInstancedStaticMeshComponent* ISMC = NewObject<UHierarchicalInstancedStaticMeshComponent>(ISMCHostActor);
+	if (!ISMC)
+	{
+		UE_LOG(LogFragments, Error, TEXT("GetOrCreateISMC: Failed to create HISMC for RepId=%d"), RepresentationId);
+		return nullptr;
+	}
+
+	ISMC->SetStaticMesh(Mesh);
+	ISMC->SetMobility(EComponentMobility::Static);
+
+	// Disable Lumen/Distance Field to avoid "Preparing mesh distance fields" delays
+	ISMC->bAffectDistanceFieldLighting = false;
+	ISMC->bAffectDynamicIndirectLighting = false;
+	ISMC->bAffectIndirectLightingWhileHidden = false;
+
+	// CRITICAL: Disable shadow casting - this was causing 280ms+ Shadow Depths overhead!
+	// Instanced furniture/repeated elements typically don't need per-instance shadows
+	ISMC->SetCastShadow(false);
+	ISMC->bCastDynamicShadow = false;
+	ISMC->bCastStaticShadow = false;
+
+	// Store LocalId in custom data for picking support
+	ISMC->NumCustomDataFloats = 1;
+
+	// Default: most instanced elements are furniture, not occluders
+	ISMC->bUseAsOccluder = false;
+
+	// Attach and register
+	ISMC->AttachToComponent(ISMCHostActor->GetRootComponent(),
+		FAttachmentTransformRules::KeepRelativeTransform);
+	ISMC->RegisterComponent();
+	ISMCHostActor->AddInstanceComponent(ISMC);
+
+	// IMPORTANT: Set material AFTER registration - material overrides don't persist on unregistered components
+	if (Material)
+	{
+		ISMC->SetMaterial(0, Material);
+	}
+
+	// Create and store the group
+	FInstancedMeshGroup Group;
+	Group.ISMC = ISMC;
+	Group.RepresentationId = RepresentationId;
+	Group.MaterialHash = MaterialHash;
+	Group.InstanceCount = 0;
+	InstancedMeshGroups.Add(ComboKey, Group);
+
+	UE_LOG(LogFragments, Log, TEXT("Created HISMC for RepId=%d, MatHash=%u"), RepresentationId, MaterialHash);
+	return ISMC;
+}
+
+void UFragmentsImporter::QueueInstanceForBatchAdd(int32 RepresentationId, uint32 MaterialHash,
+	const FTransform& WorldTransform, const FFragmentItem& Item,
+	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material, uint8 MaterialAlpha)
+{
+	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
+
+	// Check if ISMC already exists (from previous incremental finalization)
+	FInstancedMeshGroup* ExistingGroup = InstancedMeshGroups.Find(ComboKey);
+	if (ExistingGroup && ExistingGroup->ISMC != nullptr)
+	{
+		// ISMC already exists - add directly to it instead of queuing
+		// This handles the TileManager streaming case where ISMC was finalized earlier
+		AddInstanceToExistingISMC(RepresentationId, MaterialHash, WorldTransform, Item, Mesh, Material, MaterialAlpha);
+		return;
+	}
+
+	// Get or create group (but DON'T create ISMC yet - that happens in FinalizeAllISMCs or incrementally)
+	FInstancedMeshGroup& Group = InstancedMeshGroups.FindOrAdd(ComboKey);
+
+	// Store classification data from first instance (all instances in a group share the same classification)
+	const bool bIsNewGroup = Group.PendingInstances.Num() == 0;
+	if (bIsNewGroup)
+	{
+		Group.FirstCategory = Item.Category;
+		Group.FirstMaterialAlpha = MaterialAlpha;
+	}
+
+	Group.RepresentationId = RepresentationId;
+	Group.MaterialHash = MaterialHash;
+	Group.CachedMesh = Mesh;
+	Group.CachedMaterial = Material;
+
+	// Queue the instance data for batch addition later
+	Group.PendingInstances.Emplace(WorldTransform, Item.LocalId, Item.Guid, Item.Category, Item.ModelGuid, Item.Attributes);
+	TotalPendingInstances++;
+
+	// ==========================================
+	// INCREMENTAL FINALIZATION: Prevent OOM on large models
+	// ==========================================
+
+	// Check 1: If this group has too many pending instances, finalize it now
+	if (IncrementalFinalizationThreshold > 0 &&
+		Group.PendingInstances.Num() >= IncrementalFinalizationThreshold)
+	{
+		UE_LOG(LogFragments, Log, TEXT("Incremental finalization triggered: RepId=%d has %d pending instances (threshold=%d)"),
+			RepresentationId, Group.PendingInstances.Num(), IncrementalFinalizationThreshold);
+		FinalizeISMCGroup(ComboKey, Group);
+		return;
+	}
+
+	// Check 2: If total pending instances exceed the global limit, finalize largest groups
+	if (MaxPendingInstancesTotal > 0 && TotalPendingInstances >= MaxPendingInstancesTotal)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("Global pending limit reached: %d instances (limit=%d) - finalizing groups"),
+			TotalPendingInstances, MaxPendingInstancesTotal);
+
+		// Find and finalize groups with the most pending instances until under limit
+		while (TotalPendingInstances >= MaxPendingInstancesTotal * 0.8) // Target 80% to give headroom
+		{
+			int64 LargestKey = 0;
+			int32 LargestCount = 0;
+
+			for (auto& Pair : InstancedMeshGroups)
+			{
+				if (Pair.Value.ISMC == nullptr && Pair.Value.PendingInstances.Num() > LargestCount)
+				{
+					LargestKey = Pair.Key;
+					LargestCount = Pair.Value.PendingInstances.Num();
+				}
+			}
+
+			if (LargestCount == 0)
+			{
+				break; // No more groups to finalize
+			}
+
+			FInstancedMeshGroup& LargestGroup = InstancedMeshGroups[LargestKey];
+			FinalizeISMCGroup(LargestKey, LargestGroup);
+		}
+	}
+}
+
+void UFragmentsImporter::FinalizeAllISMCs()
+{
+	if (InstancedMeshGroups.Num() == 0)
+	{
+		return;
+	}
+
+	// Create host actor if needed
+	if (!ISMCHostActor && OwnerRef)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = OwnerRef;
+		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
+			FTransform::Identity, SpawnParams);
+		if (ISMCHostActor)
+		{
+#if WITH_EDITOR
+			ISMCHostActor->SetActorLabel(TEXT("FragmentISMCHost"));
+#endif
+		}
+	}
+
+	if (!ISMCHostActor)
+	{
+		UE_LOG(LogFragments, Error, TEXT("FinalizeAllISMCs: Failed to create host actor"));
+		return;
+	}
+
+	int32 TotalInstancesAdded = 0;
+	int32 TotalISMCsCreated = 0;
+
+	for (auto& Pair : InstancedMeshGroups)
+	{
+		FInstancedMeshGroup& Group = Pair.Value;
+
+		// Skip already-finalized groups (from incremental finalization)
+		if (Group.ISMC != nullptr)
+		{
+			UE_LOG(LogFragments, Verbose, TEXT("FinalizeAllISMCs: Skipping already-finalized group RepId=%d (%d instances)"),
+				Group.RepresentationId, Group.InstanceCount);
+			continue;
+		}
+
+		if (Group.PendingInstances.Num() == 0)
+		{
+			continue;
+		}
+
+		if (!Group.CachedMesh)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("FinalizeAllISMCs: No cached mesh for RepId=%d"), Group.RepresentationId);
+			continue;
+		}
+
+		// Create HISMC (NOT registered yet - we'll register after adding all instances)
+		// HISMC provides per-cluster culling for better performance
+		UHierarchicalInstancedStaticMeshComponent* ISMC = NewObject<UHierarchicalInstancedStaticMeshComponent>(ISMCHostActor);
+		if (!ISMC)
+		{
+			UE_LOG(LogFragments, Error, TEXT("FinalizeAllISMCs: Failed to create HISMC for RepId=%d"), Group.RepresentationId);
+			continue;
+		}
+
+		ISMC->SetStaticMesh(Group.CachedMesh);
+		ISMC->SetMobility(EComponentMobility::Static);
+
+		// Disable expensive Lumen/Distance Field features
+		ISMC->bAffectDistanceFieldLighting = false;
+		ISMC->bAffectDynamicIndirectLighting = false;
+		ISMC->bAffectIndirectLightingWhileHidden = false;
+
+		// Configure occlusion culling based on fragment classification
+		const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
+			Group.FirstCategory, Group.FirstMaterialAlpha);
+
+		switch (Role)
+		{
+		case EOcclusionRole::Occluder:
+			// Large structural elements that block visibility
+			ISMC->bUseAsOccluder = true;
+			ISMC->SetCastShadow(true);
+			ISMC->bCastDynamicShadow = true;
+			ISMC->bCastStaticShadow = true;
+			break;
+
+		case EOcclusionRole::Occludee:
+			// Objects that can be hidden by occluders
+			ISMC->bUseAsOccluder = false;
+			ISMC->SetCastShadow(true);
+			ISMC->bCastDynamicShadow = true;
+			ISMC->bCastStaticShadow = true;
+			break;
+
+		case EOcclusionRole::NonOccluder:
+			// Transparent/glass elements
+			ISMC->bUseAsOccluder = false;
+			ISMC->SetCastShadow(false);
+			ISMC->bCastDynamicShadow = false;
+			ISMC->bCastStaticShadow = false;
+			break;
+		}
+
+		// Custom data for picking
+		ISMC->NumCustomDataFloats = 1;
+
+		// Attach to host (still not registered)
+		ISMC->AttachToComponent(ISMCHostActor->GetRootComponent(),
+			FAttachmentTransformRules::KeepRelativeTransform);
+
+		// Build transform array for batch add
+		TArray<FTransform> Transforms;
+		Transforms.Reserve(Group.PendingInstances.Num());
+		for (const FPendingInstanceData& Pending : Group.PendingInstances)
+		{
+			Transforms.Add(Pending.WorldTransform);
+		}
+
+		// BATCH ADD ALL INSTANCES AT ONCE (this is the key optimization!)
+		// This avoids the UE5 per-instance GPU buffer rebuild issue
+		TArray<int32> NewIndices = ISMC->AddInstances(Transforms, /*bShouldReturnIndices=*/true, /*bWorldSpace=*/true);
+
+		// NOW register the component (after all instances are added)
+		ISMC->RegisterComponent();
+		ISMCHostActor->AddInstanceComponent(ISMC);
+
+		// Set material AFTER registration - material overrides don't persist on unregistered components
+		if (Group.CachedMaterial)
+		{
+			ISMC->SetMaterial(0, Group.CachedMaterial);
+		}
+
+		// Set custom data and build lookup maps (after registration, with dirty marking disabled)
+		for (int32 i = 0; i < Group.PendingInstances.Num(); i++)
+		{
+			const FPendingInstanceData& Pending = Group.PendingInstances[i];
+			int32 InstanceIndex = (i < NewIndices.Num()) ? NewIndices[i] : i;
+
+			// Store LocalId in custom data
+			ISMC->SetCustomDataValue(InstanceIndex, 0, static_cast<float>(Pending.LocalId), /*bMarkRenderStateDirty=*/false);
+
+			// Update lookup maps
+			Group.InstanceToLocalId.Add(InstanceIndex, Pending.LocalId);
+			Group.LocalIdToInstance.Add(Pending.LocalId, InstanceIndex);
+
+			// Create proxy for this instance
+			FFragmentProxy Proxy;
+			Proxy.ISMC = ISMC;
+			Proxy.InstanceIndex = InstanceIndex;
+			Proxy.LocalId = Pending.LocalId;
+			Proxy.GlobalId = Pending.GlobalId;
+			Proxy.Category = Pending.Category;
+			Proxy.ModelGuid = Pending.ModelGuid;
+			Proxy.Attributes = Pending.Attributes;
+			Proxy.WorldTransform = Pending.WorldTransform;
+			LocalIdToProxyMap.Add(Pending.LocalId, Proxy);
+		}
+
+		// Mark render state dirty once for all custom data
+		ISMC->MarkRenderStateDirty();
+
+		Group.ISMC = ISMC;
+		Group.InstanceCount = Group.PendingInstances.Num();
+
+		TotalInstancesAdded += Group.PendingInstances.Num();
+		TotalISMCsCreated++;
+
+		// Clear pending instances to free memory
+		Group.PendingInstances.Empty();
+
+		UE_LOG(LogFragments, Log, TEXT("Created ISMC for RepId=%d with %d instances"),
+			Group.RepresentationId, Group.InstanceCount);
+	}
+
+	UE_LOG(LogFragments, Log, TEXT("=== ISMC FINALIZATION COMPLETE: %d ISMCs, %d total instances ==="),
+		TotalISMCsCreated, TotalInstancesAdded);
+
+	// Reset pending counter
+	TotalPendingInstances = 0;
+}
+
+int32 UFragmentsImporter::FinalizeISMCGroup(int64 ComboKey, FInstancedMeshGroup& Group)
+{
+	// Skip if already finalized or no pending instances
+	if (Group.ISMC != nullptr || Group.PendingInstances.Num() == 0)
+	{
+		return 0;
+	}
+
+	// Ensure host actor exists
+	if (!ISMCHostActor && OwnerRef)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = OwnerRef;
+		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
+			FTransform::Identity, SpawnParams);
+		if (ISMCHostActor)
+		{
+#if WITH_EDITOR
+			ISMCHostActor->SetActorLabel(TEXT("FragmentISMCHost"));
+#endif
+		}
+	}
+
+	if (!ISMCHostActor)
+	{
+		UE_LOG(LogFragments, Error, TEXT("FinalizeISMCGroup: Failed to create host actor"));
+		return -1;
+	}
+
+	if (!Group.CachedMesh)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("FinalizeISMCGroup: No cached mesh for RepId=%d"), Group.RepresentationId);
+		return -1;
+	}
+
+	// Create HISMC (NOT registered yet - we'll register after adding all instances)
+	// HISMC provides per-cluster culling for better performance
+	UHierarchicalInstancedStaticMeshComponent* ISMC = NewObject<UHierarchicalInstancedStaticMeshComponent>(ISMCHostActor);
+	if (!ISMC)
+	{
+		UE_LOG(LogFragments, Error, TEXT("FinalizeISMCGroup: Failed to create HISMC for RepId=%d"), Group.RepresentationId);
+		return -1;
+	}
+
+	ISMC->SetStaticMesh(Group.CachedMesh);
+	ISMC->SetMobility(EComponentMobility::Static);
+
+	// Disable expensive Lumen/Distance Field features
+	ISMC->bAffectDistanceFieldLighting = false;
+	ISMC->bAffectDynamicIndirectLighting = false;
+	ISMC->bAffectIndirectLightingWhileHidden = false;
+
+	// Configure occlusion culling based on fragment classification
+	const EOcclusionRole Role = UFragmentOcclusionClassifier::ClassifyFragment(
+		Group.FirstCategory, Group.FirstMaterialAlpha);
+
+	switch (Role)
+	{
+	case EOcclusionRole::Occluder:
+		// Large structural elements that block visibility
+		ISMC->bUseAsOccluder = true;
+		ISMC->SetCastShadow(true);
+		ISMC->bCastDynamicShadow = true;
+		ISMC->bCastStaticShadow = true;
+		break;
+
+	case EOcclusionRole::Occludee:
+		// Objects that can be hidden by occluders
+		ISMC->bUseAsOccluder = false;
+		ISMC->SetCastShadow(true);
+		ISMC->bCastDynamicShadow = true;
+		ISMC->bCastStaticShadow = true;
+		break;
+
+	case EOcclusionRole::NonOccluder:
+		// Transparent/glass elements
+		ISMC->bUseAsOccluder = false;
+		ISMC->SetCastShadow(false);
+		ISMC->bCastDynamicShadow = false;
+		ISMC->bCastStaticShadow = false;
+		break;
+	}
+
+	// Custom data for picking
+	ISMC->NumCustomDataFloats = 1;
+
+	// Attach to host (still not registered)
+	ISMC->AttachToComponent(ISMCHostActor->GetRootComponent(),
+		FAttachmentTransformRules::KeepRelativeTransform);
+
+	// Build transform array for batch add
+	TArray<FTransform> Transforms;
+	Transforms.Reserve(Group.PendingInstances.Num());
+	for (const FPendingInstanceData& Pending : Group.PendingInstances)
+	{
+		Transforms.Add(Pending.WorldTransform);
+	}
+
+	// BATCH ADD ALL INSTANCES AT ONCE
+	TArray<int32> NewIndices = ISMC->AddInstances(Transforms, /*bShouldReturnIndices=*/true, /*bWorldSpace=*/true);
+
+	// NOW register the component (after all instances are added)
+	ISMC->RegisterComponent();
+	ISMCHostActor->AddInstanceComponent(ISMC);
+
+	// Set material AFTER registration - material overrides don't persist on unregistered components
+	if (Group.CachedMaterial)
+	{
+		ISMC->SetMaterial(0, Group.CachedMaterial);
+	}
+
+	// Set custom data and build lookup maps
+	for (int32 i = 0; i < Group.PendingInstances.Num(); i++)
+	{
+		const FPendingInstanceData& Pending = Group.PendingInstances[i];
+		int32 InstanceIndex = (i < NewIndices.Num()) ? NewIndices[i] : i;
+
+		// Store LocalId in custom data
+		ISMC->SetCustomDataValue(InstanceIndex, 0, static_cast<float>(Pending.LocalId), /*bMarkRenderStateDirty=*/false);
+
+		// Update lookup maps
+		Group.InstanceToLocalId.Add(InstanceIndex, Pending.LocalId);
+		Group.LocalIdToInstance.Add(Pending.LocalId, InstanceIndex);
+
+		// Create proxy for this instance
+		FFragmentProxy Proxy;
+		Proxy.ISMC = ISMC;
+		Proxy.InstanceIndex = InstanceIndex;
+		Proxy.LocalId = Pending.LocalId;
+		Proxy.GlobalId = Pending.GlobalId;
+		Proxy.Category = Pending.Category;
+		Proxy.ModelGuid = Pending.ModelGuid;
+		Proxy.Attributes = Pending.Attributes;
+		Proxy.WorldTransform = Pending.WorldTransform;
+		LocalIdToProxyMap.Add(Pending.LocalId, Proxy);
+	}
+
+	// Mark render state dirty once for all custom data
+	ISMC->MarkRenderStateDirty();
+
+	Group.ISMC = ISMC;
+	int32 InstancesAdded = Group.PendingInstances.Num();
+	Group.InstanceCount = InstancesAdded;
+
+	// Update pending counter
+	TotalPendingInstances -= InstancesAdded;
+	TotalPendingInstances = FMath::Max(0, TotalPendingInstances);
+
+	// Clear pending instances to free memory
+	Group.PendingInstances.Empty();
+	Group.PendingInstances.Shrink();  // Release allocated memory
+
+	UE_LOG(LogFragments, Log, TEXT("FinalizeISMCGroup: Created ISMC for RepId=%d with %d instances (incremental)"),
+		Group.RepresentationId, InstancesAdded);
+
+	return InstancesAdded;
+}
+
+bool UFragmentsImporter::AddInstanceToExistingISMC(int32 RepresentationId, uint32 MaterialHash,
+	const FTransform& WorldTransform, const FFragmentItem& Item,
+	UStaticMesh* Mesh, UMaterialInstanceDynamic* Material, uint8 MaterialAlpha)
+{
+	int64 ComboKey = ((int64)RepresentationId) | ((int64)MaterialHash << 32);
+
+	FInstancedMeshGroup* Group = InstancedMeshGroups.Find(ComboKey);
+	if (!Group || !Group->ISMC)
+	{
+		// ISMC not yet created - queue for batch addition instead
+		QueueInstanceForBatchAdd(RepresentationId, MaterialHash, WorldTransform, Item, Mesh, Material, MaterialAlpha);
+		return false;
+	}
+
+	UHierarchicalInstancedStaticMeshComponent* ISMC = Group->ISMC;
+	if (!ISMC || !IsValid(ISMC))
+	{
+		UE_LOG(LogFragments, Warning, TEXT("AddInstanceToExistingISMC: HISMC invalid for RepId=%d"), RepresentationId);
+		return false;
+	}
+
+	// Add single instance to existing HISMC
+	// Note: This is less efficient than batch add, but necessary for streaming
+	int32 NewIndex = ISMC->AddInstance(WorldTransform, /*bWorldSpace=*/true);
+	if (NewIndex == INDEX_NONE)
+	{
+		UE_LOG(LogFragments, Warning, TEXT("AddInstanceToExistingISMC: Failed to add instance for RepId=%d"), RepresentationId);
+		return false;
+	}
+
+	// Set custom data
+	ISMC->SetCustomDataValue(NewIndex, 0, static_cast<float>(Item.LocalId), /*bMarkRenderStateDirty=*/true);
+
+	// Update lookup maps
+	Group->InstanceToLocalId.Add(NewIndex, Item.LocalId);
+	Group->LocalIdToInstance.Add(Item.LocalId, NewIndex);
+	Group->InstanceCount++;
+
+	// Create proxy
+	FFragmentProxy Proxy;
+	Proxy.ISMC = ISMC;
+	Proxy.InstanceIndex = NewIndex;
+	Proxy.LocalId = Item.LocalId;
+	Proxy.GlobalId = Item.Guid;
+	Proxy.Category = Item.Category;
+	Proxy.ModelGuid = Item.ModelGuid;
+	Proxy.Attributes = Item.Attributes;
+	Proxy.WorldTransform = WorldTransform;
+	LocalIdToProxyMap.Add(Item.LocalId, Proxy);
+
+	return true;
+}
+
+FFindResult UFragmentsImporter::FindFragmentByLocalIdUnified(int32 LocalId, const FString& ModelGuid)
+{
+	// Check proxy map first (instanced fragments)
+	if (FFragmentProxy* Proxy = LocalIdToProxyMap.Find(LocalId))
+	{
+		if (Proxy->ModelGuid == ModelGuid)
+		{
+			return FFindResult::FromProxy(*Proxy);
+		}
+	}
+
+	// Check actor map (non-instanced fragments)
+	if (FFragmentLookup* Lookup = ModelFragmentsMap.Find(ModelGuid))
+	{
+		if (AFragment** Actor = Lookup->Fragments.Find(LocalId))
+		{
+			if (*Actor)
+			{
+				return FFindResult::FromActor(*Actor);
+			}
+		}
+	}
+
+	return FFindResult::NotFound();
 }
