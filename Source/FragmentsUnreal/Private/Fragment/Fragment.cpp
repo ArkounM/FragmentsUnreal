@@ -1,15 +1,36 @@
 
 
-
 #include "Fragment/Fragment.h"
+#include "Importer/FragmentsImporterSubsystem.h"
+#include "Utils/FragmentsLog.h"
 
 
 AFragment::AFragment()
 {
+	// Keep tick disabled — with 1000+ fragment actors, empty Tick wastes CPU
 	PrimaryActorTick.bCanEverTick = false;
 }
 
-AFragment* AFragment::FindFragmentByLocalId(int32 InLocalId)
+TArray<struct FItemAttribute> AFragment::GetAttributes()
+{
+	if (UWorld* W = GEngine->GetWorldFromContextObjectChecked(this))
+	{
+		if (auto* Sub = W->GetGameInstance()->GetSubsystem<UFragmentsImporterSubsystem>())
+		{
+			FFragmentItem* InItem = Sub->GetFragmentItemByLocalId(LocalId, ModelGuid);
+			if (!InItem) return TArray<FItemAttribute>();
+
+			if (!InItem->ModelGuid.IsEmpty())
+			{
+				Sub->GetItemData(InItem);
+				return InItem->Attributes;
+			}
+		}
+	}
+	return TArray<FItemAttribute>();
+}
+
+AFragment* AFragment::FindFragmentByLocalId(int64 InLocalId)
 {
 	if (InLocalId == LocalId) return this;
 
@@ -35,4 +56,342 @@ void AFragment::SetData(FFragmentItem InFragmentItem)
 	Samples = InFragmentItem.Samples;
 }
 
+// ==========================================
+// HISM API Implementation (from HOK fork)
+// ==========================================
 
+bool AFragment::SetHighlightedByLocalId(int64 InLocalId, bool bHighlighted)
+{
+	AFragment* Root = GetBucketRoot();
+	if (!Root) return false;
+
+	FFragInstanceArray* Arr = Root->LocalIdToInstance.Find(InLocalId);
+	if (!Arr) return false;
+
+	const float Value = bHighlighted ? 1.f : 0.f;
+
+	TSet<UHierarchicalInstancedStaticMeshComponent*> DirtyOnce;
+	for (const FFragInstanceRef& Ref : Arr->Items)
+	{
+		if (!Ref.Comp || Ref.InstanceIndex == INDEX_NONE) continue;
+		Ref.Comp->SetCustomDataValue(Ref.InstanceIndex, 0, Value, /*bMarkRenderStateDirty=*/false);
+		DirtyOnce.Add(Ref.Comp.Get());
+	}
+	for (UHierarchicalInstancedStaticMeshComponent* C : DirtyOnce)
+	{
+		if (IsValid(C)) C->MarkRenderStateDirty();
+	}
+	if (bHighlighted)
+	{
+		Root->HighlightedLocalIds.Add(InLocalId);
+	}
+	else
+	{
+		Root->HighlightedLocalIds.Remove(InLocalId);
+	}
+	return Arr->Items.Num() > 0;
+}
+
+void AFragment::ClearAllHISMHighlights()
+{
+	TSet<UHierarchicalInstancedStaticMeshComponent*> DirtyOnce;
+
+	for (int64 HighlightedId : HighlightedLocalIds)
+	{
+		if (FFragInstanceArray* Found = LocalIdToInstance.Find(HighlightedId))
+		{
+			for (const FFragInstanceRef& Ref : Found->Items)
+			{
+				if (!Ref.Comp || Ref.InstanceIndex == INDEX_NONE) continue;
+				Ref.Comp->SetCustomDataValue(Ref.InstanceIndex, 0, 0.0f, false);
+				DirtyOnce.Add(Ref.Comp.Get());
+			}
+		}
+	}
+	for (UHierarchicalInstancedStaticMeshComponent* C : DirtyOnce)
+	{
+		if (IsValid(C)) C->MarkRenderStateDirty();
+	}
+}
+
+bool AFragment::SetHiddenByLocalId(int64 InLocalId, bool bIsHidden)
+{
+	AFragment* Root = GetBucketRoot();
+	if (!Root) return false;
+
+	FFragInstanceArray* Arr = Root->LocalIdToInstance.Find(InLocalId);
+	if (!Arr) return false;
+
+	const float Value = bIsHidden ? 1.0f : 0.0f;
+
+	TSet<UHierarchicalInstancedStaticMeshComponent*> DirtyOnce;
+	for (const FFragInstanceRef& Ref : Arr->Items)
+	{
+		if (!Ref.Comp || Ref.InstanceIndex == INDEX_NONE) continue;
+		Ref.Comp->SetCustomDataValue(Ref.InstanceIndex, 1, Value, false);
+		DirtyOnce.Add(Ref.Comp.Get());
+	}
+	for (UHierarchicalInstancedStaticMeshComponent* C : DirtyOnce)
+	{
+		if (IsValid(C)) C->MarkRenderStateDirty();
+	}
+
+	if (bIsHidden)
+	{
+		Root->HiddenElementLocalIds.Add(InLocalId);
+	}
+	else
+	{
+		Root->HiddenElementLocalIds.Remove(InLocalId);
+	}
+
+	return Arr->Items.Num() > 0;
+}
+
+void AFragment::ClearAllHISMHidden()
+{
+	TSet<UHierarchicalInstancedStaticMeshComponent*> DirtyOnce;
+
+	for (int64 HiddenId : HiddenElementLocalIds)
+	{
+		if (FFragInstanceArray* Found = LocalIdToInstance.Find(HiddenId))
+		{
+			for (const FFragInstanceRef& Ref : Found->Items)
+			{
+				if (!Ref.Comp || Ref.InstanceIndex == INDEX_NONE) continue;
+				Ref.Comp->SetCustomDataValue(Ref.InstanceIndex, 1, 0.0f, false);
+				DirtyOnce.Add(Ref.Comp.Get());
+			}
+		}
+	}
+
+	for (UHierarchicalInstancedStaticMeshComponent* C : DirtyOnce)
+	{
+		if (IsValid(C)) C->MarkRenderStateDirty();
+	}
+
+	HiddenElementLocalIds.Empty();
+}
+
+void AFragment::ShowOnlyFloor(int64 InFloorId)
+{
+	HiddenLocalIds.Empty();
+	for (const auto& Pair : Buckets)
+	{
+		UHierarchicalInstancedStaticMeshComponent* C = Pair.Value;
+		const bool bVis = (Pair.Key.FloorId == InFloorId);
+		if (IsValid(C))
+		{
+			C->SetVisibility(bVis, true);
+			C->SetCollisionEnabled(bVis ? ECollisionEnabled::QueryOnly : ECollisionEnabled::NoCollision);
+			if (!bVis)
+				HiddenLocalIds.Add(Pair.Key.FloorId);
+		}
+	}
+}
+
+void AFragment::SetFloorVisible(int64 FloorKey, bool bVisible)
+{
+	for (const auto& Pair : Buckets)
+	{
+		if (Pair.Key.FloorId != FloorKey) continue;
+		if (auto* C = Pair.Value)
+		{
+			C->SetVisibility(bVisible, true);
+			C->SetCollisionEnabled(bVisible ? ECollisionEnabled::QueryOnly : ECollisionEnabled::NoCollision);
+		}
+	}
+	if (bVisible && HiddenLocalIds.Contains(FloorKey))
+	{
+		HiddenLocalIds.Remove(FloorKey);
+	}
+	else
+	{
+		HiddenLocalIds.Add(FloorKey);
+	}
+}
+
+void AFragment::ShowAllFloors()
+{
+	for (const auto& Pair : Buckets)
+	{
+		if (auto* C = Pair.Value)
+		{
+			C->SetVisibility(true, true);
+			C->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+		}
+	}
+	HiddenLocalIds.Empty();
+}
+
+bool AFragment::IsFloorVisible(int64 InFloorId)
+{
+	return !HiddenLocalIds.Contains(InFloorId);
+}
+
+void AFragment::EnableProximityCulling(float StartFadeCm, float EndCullCm, bool bAlsoApplytoNonHISM)
+{
+	StartFadeCm = FMath::Max(0.f, StartFadeCm);
+	EndCullCm = FMath::Max(StartFadeCm + 1.f, EndCullCm);
+
+	for (const auto& Pair : Buckets)
+	{
+		if (auto* HISM = Pair.Value)
+		{
+#if ENGINE_MAJOR_VERSION >= 5
+			HISM->SetCullDistances((int32)StartFadeCm, (int32)EndCullCm);
+#else
+			HISM->InstanceStartCullDistance = (int32)StartFadeCm;
+			HISM->InstanceEndCullDistance = (int32)EndCullCm;
+			HISM->MarkRenderStateDirty();
+#endif
+			HISM->bCastContactShadow = false;
+			HISM->SetReceivesDecals(false);
+			HISM->SetCanEverAffectNavigation(false);
+			HISM->SetGenerateOverlapEvents(false);
+			HISM->SetRenderInDepthPass(true);
+		}
+	}
+
+	if (!bAlsoApplytoNonHISM) return;
+
+	TInlineComponentArray<UStaticMeshComponent*> SMs(this);
+	for (UStaticMeshComponent* C : SMs)
+	{
+		if (!IsValid(C) || Cast<UInstancedStaticMeshComponent>(C)) continue;
+		C->LDMaxDrawDistance = EndCullCm;
+		C->SetReceivesDecals(false);
+		C->SetGenerateOverlapEvents(false);
+	}
+}
+
+bool AFragment::GetLocalIdForInstance(const UHierarchicalInstancedStaticMeshComponent* HISM, int32 InstanceIndex, int64& OutLocalId) const
+{
+	const AFragment* Root = const_cast<AFragment*>(this)->GetBucketRoot();
+	if (!Root) return false;
+
+	if (const FFragLocalids* Arr = Root->InstanceLocalIds.Find(const_cast<UHierarchicalInstancedStaticMeshComponent*>(HISM)))
+	{
+		if (Arr->LocalIds.IsValidIndex(InstanceIndex))
+		{
+			OutLocalId = Arr->LocalIds[InstanceIndex];
+			return true;
+		}
+	}
+	return false;
+}
+
+void AFragment::GetAllLocalIdsForBucket(const UHierarchicalInstancedStaticMeshComponent* HISM, TArray<int64>& OutLocalIds) const
+{
+	OutLocalIds.Reset();
+	const AFragment* Root = const_cast<AFragment*>(this)->GetBucketRoot();
+	if (!Root) return;
+
+	if (const FFragLocalids* Arr = Root->InstanceLocalIds.Find(const_cast<UHierarchicalInstancedStaticMeshComponent*>(HISM)))
+	{
+		OutLocalIds.Append(Arr->LocalIds);
+	}
+}
+
+#if WITH_EDITOR
+void AFragment::GetSelectedLocalIdsforBucket(const UHierarchicalInstancedStaticMeshComponent* HISM, TArray<int64>& OutLocalIds) const
+{
+	OutLocalIds.Reset();
+
+	const AFragment* Root = const_cast<AFragment*>(this)->GetBucketRoot();
+	if (!Root) return;
+
+	const FFragLocalids* Arr = Root->InstanceLocalIds.Find(const_cast<UHierarchicalInstancedStaticMeshComponent*>(HISM));
+	if (!Arr) return;
+
+	const int32 Count = HISM->GetInstanceCount();
+	for (int32 i = 0; i < Count; ++i)
+	{
+		if (!HISM->IsInstanceSelected(i)) continue;
+		if (Arr->LocalIds.IsValidIndex(i))
+		{
+			OutLocalIds.Add(Arr->LocalIds[i]);
+		}
+	}
+}
+#endif
+
+AFragment* AFragment::GetBucketRoot()
+{
+	AActor* Cur = this;
+	while (Cur)
+	{
+		if (AFragment* Frag = Cast<AFragment>(Cur))
+		{
+			if (Frag->bBucketRoot) return Frag;
+		}
+		Cur = Cur->GetAttachParentActor();
+	}
+	return this;
+}
+
+int32 AFragment::AddHISMInstance(UStaticMesh* Mesh, UMaterialInterface* Mat, const FTransform& WorldXd, int64 InLocalId, int64 InFloorId)
+{
+	AFragment* Root = GetBucketRoot();
+	if (!Root || !Root->bUseHISM) return INDEX_NONE;
+	UHierarchicalInstancedStaticMeshComponent* HISM = Root->GetOrCreateBucket(Mesh, Mat, InFloorId);
+
+	const FTransform BucketWorld = Root->GetActorTransform();
+	const FTransform LocalInst = WorldXd.GetRelativeTransform(BucketWorld);
+
+	const int32 NewIdx = HISM->AddInstance(LocalInst);
+	auto& LUT = Root->InstanceLocalIds.FindChecked(HISM);
+	if (LUT.LocalIds.Num() <= NewIdx) LUT.LocalIds.SetNum(NewIdx + 1);
+	LUT.LocalIds[NewIdx] = InLocalId;
+
+	Root->LocalIdToInstance.FindOrAdd(InLocalId).Items.Add({ HISM, NewIdx });
+
+	if (HISM->NumCustomDataFloats < 2) HISM->NumCustomDataFloats = 2;
+	HISM->SetCustomDataValue(NewIdx, 0, 0.0f, false);
+	HISM->SetCustomDataValue(NewIdx, 1, 0.0f, false);
+	return NewIdx;
+}
+
+bool AFragment::ResolveHitToLocalId(const FHitResult& Hit, int64& OutLocalId) const
+{
+	const auto* HISM = Cast<UHierarchicalInstancedStaticMeshComponent>(Hit.Component.Get());
+	if (!HISM) return false;
+	const int32 Idx = Hit.Item;
+	if (Idx == INDEX_NONE) return false;
+
+	const AFragment* Root = Cast<AFragment>(const_cast<AFragment*>(this)->GetBucketRoot());
+	if (!Root) return false;
+	if (const auto* Arr = Root->InstanceLocalIds.Find(HISM))
+	{
+		if (Arr->LocalIds.IsValidIndex(Idx)) { OutLocalId = Arr->LocalIds[Idx]; return true; }
+	}
+	return false;
+}
+
+UHierarchicalInstancedStaticMeshComponent* AFragment::GetOrCreateBucket(UStaticMesh* Mesh, UMaterialInterface* Mat, int64 InFloorId)
+{
+	check(bBucketRoot && "Buckets should only be created on the root fragment");
+	FFragBucketKey Key{ Mesh, Mat, InFloorId };
+	if (auto* Found = Buckets.FindRef(Key)) return Found;
+
+	auto* HISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(this);
+	HISM->SetupAttachment(GetRootComponent());
+	HISM->SetMobility(EComponentMobility::Movable);
+	HISM->SetRelativeTransform(FTransform::Identity);
+	HISM->SetStaticMesh(Mesh);
+	HISM->SetMaterial(0, Mat);
+	HISM->bAffectDistanceFieldLighting = false;
+
+	HISM->NumCustomDataFloats = FMath::Max<int32>(HISM->NumCustomDataFloats, 2);
+
+#if WITH_EDITOR
+	HISM->bHasPerInstanceHitProxies = true;
+#endif
+
+	HISM->RegisterComponent();
+
+	Buckets.Add(Key, HISM);
+	InstanceLocalIds.Add(HISM, FFragLocalids());
+
+	return HISM;
+}

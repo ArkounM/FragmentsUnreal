@@ -10,13 +10,17 @@
 #include "Importer/DeferredPackageSaveManager.h"
 #include "Importer/FragmentsAsyncLoader.h" // Added for async delegate
 #include "Utils/FragmentsLog.h"
+#include "UDynamicMesh.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "FragmentsImporter.generated.h"
 
 // Forward Declarations
 class UFragmentsAsyncLoader;
 class UFragmentTileManager;
+class UFragmentModelWrapper;
 class AFragment;
 class UHierarchicalInstancedStaticMeshComponent;
+class UDynamicMeshComponent;
 
 // Use FlatBuffers Model type
 using Model = ::Model;
@@ -44,13 +48,23 @@ public:
 
 	UFragmentsImporter();
 
-	FString Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes = true);
+	FString Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes = true,
+		bool bUseDynamicMesh = false, bool bUseHISM = false, AFragment* BucketRoot = nullptr);
 	void SetOwnerRef(AActor* NewOwnerRef) { OwnerRef = NewOwnerRef; }
 	void GetItemData(AFragment*& InFragment);
 	void GetItemData(FFragmentItem* InFragmentItem);
 	TArray<FItemAttribute> GetItemPropertySets(AFragment* InFragment);
-	AFragment* GetItemByLocalId(int32 LocalId, const FString& ModelGuid);
-	FFragmentItem* GetFragmentItemByLocalId(int32 LocalId, const FString& InModelGuid);
+	TArray<FItemAttribute> GetItemPropertySets(FFragmentItem* InFragment);
+	TArray<FItemAttribute> GetItemPropertySets(int64 LocalId, const FString& InModelGuid);
+	TArray<FItemAttribute> GetItemAttributes(int64 LocalId, const FString& InModelGuid);
+	AFragment* GetItemByLocalId(int64 LocalId, const FString& ModelGuid);
+	FFragmentItem* GetFragmentItemByLocalId(int64 LocalId, const FString& InModelGuid);
+	AFragment* GetModelFragment(const FString& ModelGuid);
+	FTransform GetBaseCoordinates() { return BaseCoordinates; }
+	void ResetBaseCoordinates();
+	void ResetAll();
+	void ReleaseRefToWorld(UWorld* World);
+	bool IsFragmentLoaded(const FString& ModelGuid);
 
 	// ==========================================
 	// GPU INSTANCING API (Phase 4)
@@ -63,7 +77,7 @@ public:
 	 * @return FFindResult containing either an actor or proxy data
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Fragments")
-	FFindResult FindFragmentByLocalIdUnified(int32 LocalId, const FString& ModelGuid);
+	FFindResult FindFragmentByLocalIdUnified(int64 LocalId, const FString& ModelGuid);
 
 	/**
 	 * Check if a representation+material combination should use GPU instancing.
@@ -125,8 +139,11 @@ public:
 		const FTransform& WorldTransform, const FFragmentItem& Item,
 		UStaticMesh* Mesh, UMaterialInstanceDynamic* Material, uint8 MaterialAlpha);
 	FString LoadFragment(const FString& FragPath);
-	void ProcessLoadedFragment(const FString& ModelGuid, AActor* InOwnerRef, bool bInSaveMesh);
-	TArray<int32> GetElementsByCategory(const FString& InCategory, const FString& ModelGuid);
+	void ProcessLoadedFragment(const FString& ModelGuid, AActor* InOwnerRef, bool bInSaveMesh,
+		bool bUseDynamicMesh = false, bool bUseHISM = false, AFragment* BucketRoot = nullptr);
+	void ProcessLoadedFragmentItem(int64 InLocalId, const FString& InModelGuid, AActor* InOwnerRef, bool bInSaveMesh,
+		bool bUseDynamicMesh = false, bool bUseHISM = false, AFragment* BucketRoot = nullptr);
+	TArray<int64> GetElementsByCategory(const FString& InCategory, const FString& ModelGuid);
 	void UnloadFragment(const FString& ModelGuid);
 
 	/**
@@ -159,7 +176,7 @@ public:
 	// Get owner actor reference
 	FORCEINLINE AActor* GetOwnerRef() const
 	{
-		return OwnerRef;
+		return OwnerRef.Get();
 	}
 
 	// Spawn a single fragment actor with its geometry (public for TileManager access)
@@ -189,24 +206,48 @@ protected:
 
 private:
 
-	void CollectPropertiesRecursive(const Model* InModel, int32 StartLocalId, TSet<int32>& Visited, TArray<FItemAttribute>& OutAttributes);
+	void CollectPropertiesRecursive(const Model* InModel, int64 StartLocalId, TSet<int64>& Visited, TArray<FItemAttribute>& OutAttributes);
 	void SpawnStaticMesh(UStaticMesh* StaticMesh, const Transform* LocalTransform, const Transform* GlobalTransform, AActor* Owner, FName OptionalTag = FName());
-	void SpawnFragmentModel(AFragment* InFragmentModel, AActor* InParent, const Meshes* MeshesRef, bool bSaveMeshes);
-	void SpawnFragmentModel(FFragmentItem InFragmentItem, AActor* InParent, const Meshes* MeshesRef, bool bSaveMeshes);
+
+	// Unified SpawnFragmentModel — supports default chunked path and HOK's direct recursive path
+	AFragment* SpawnFragmentModel(FFragmentItem InFragmentItem, AActor* InParent, const Meshes* MeshesRef,
+		bool bSaveMeshes, UFragmentModelWrapper* InWrapperRef = nullptr,
+		bool bUseDynamicMesh = false, bool bUseHISM = false, AFragment* BucketRoot = nullptr,
+		int64 ParentFloorKey = INDEX_NONE);
+
 	UStaticMesh* CreateStaticMeshFromShell(
 		const Shell* ShellRef,
 		const Material* RefMaterial,
 		const FString& AssetName,
-		UObject* OuterRef
+		UObject* OuterRef,
+		const FString& InModelGuid = FString()
 	);
 	UStaticMesh* CreateStaticMeshFromCircleExtrusion(
 		const CircleExtrusion* CircleExtrusion,
 		const Material* RefMaterial,
 		const FString& AssetName,
-		UObject* OuterRef
+		UObject* OuterRef,
+		const FString& InModelGuid = FString()
 	);
 
-	FName AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial);
+	// HOK DynamicMesh path
+	FDynamicMesh3 CreateDynamicMeshFromShell(
+		const Shell* ShellRef,
+		const Material* RefMaterial,
+		const FString& AssetName,
+		UObject* OuterRef
+	);
+	FDynamicMesh3 CreateDynamicMeshFromCircleExtrusion(
+		const CircleExtrusion* CircleExtrusion,
+		const Material* RefMaterial,
+		const FString& AssetName,
+		UObject* OuterRef
+	);
+	void AddMaterialToDynamicMesh(UDynamicMeshComponent* InDynComp, const Material* RefMaterial, UFragmentModelWrapper* InWrapperRef, int32 InMaterialIndex);
+
+	FName AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial, const FString& InModelGuid = FString());
+
+	static bool IsPlacementCarrier(const FString& Cat);
 
 	/** Add material to mesh from raw color data (used by pre-extracted geometry path) */
 	FName AddMaterialToMeshFromRawData(UStaticMesh*& CreatedMesh, uint8 R, uint8 G, uint8 B, uint8 A, bool bIsGlass);
@@ -271,7 +312,7 @@ private:
 	 * @param ItemLocalId The local ID of the containing fragment (for logging)
 	 * @return true if geometry was extracted successfully, false otherwise
 	 */
-	bool ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId);
+	bool ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int64 ItemLocalId);
 
 	/**
 	 * Create a static mesh from pre-extracted shell geometry.
@@ -290,13 +331,13 @@ private:
 private:
 
 	UPROPERTY()
-	AActor* OwnerRef = nullptr;
+	TWeakObjectPtr<AActor> OwnerRef = nullptr;
 
 	UPROPERTY()
-	UMaterialInterface* BaseMaterial = nullptr;
-	
+	TWeakObjectPtr<UMaterialInterface> BaseMaterial = nullptr;
+
 	UPROPERTY()
-	UMaterialInterface* BaseGlassMaterial = nullptr;
+	TWeakObjectPtr<UMaterialInterface> BaseGlassMaterial = nullptr;
 
 	UPROPERTY()
 	TMap<FString, class UFragmentModelWrapper*> FragmentModels;
@@ -312,10 +353,28 @@ private:
 	TMap<FString, UStaticMesh*> MeshCache;
 
 	// Representation-based mesh cache (Key = RepresentationId)
-	// More reliable than geometry hashing since all instances of the same
-	// RepresentationId share identical geometry in FlatBuffers format
 	UPROPERTY()
 	TMap<int32, UStaticMesh*> RepresentationMeshCache;
+
+	// HOK DynamicMesh cache (Key = RepresentationId)
+	TMap<uint32, FDynamicMesh3> DynamicMeshByRepId;
+
+	// HOK Materials cache
+	UPROPERTY()
+	TMap<FString, UMaterialInstanceConstant*> MaterialsCache;
+
+	// HOK BaseCoordinates tracking
+	UPROPERTY()
+	bool bBaseCoordinatesInitialized = false;
+
+	UPROPERTY()
+	bool bSaveMaterials = false;
+
+	UPROPERTY()
+	FTransform BaseCoordinates;
+
+	UPROPERTY()
+	FVector SceneZeroZOffset = FVector::ZeroVector;
 
 	UPROPERTY()
 	TArray<UPackage*> PackagesToSave;
@@ -445,7 +504,7 @@ private:
 	/** Proxy map for instanced fragments (LocalId -> proxy data).
 	 *  Used for lookups on fragments that don't have AFragment actors. */
 	UPROPERTY()
-	TMap<int32, FFragmentProxy> LocalIdToProxyMap;
+	TMap<int64, FFragmentProxy> LocalIdToProxyMap;
 
 	/** Host actor for ISMC components.
 	 *  All ISMCs are attached to this single actor for organization. */

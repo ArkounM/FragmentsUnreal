@@ -70,7 +70,7 @@ struct FFragmentVisibilityResult
 
 	/** Fragment local ID */
 	UPROPERTY(BlueprintReadOnly, Category = "Visibility")
-	int32 LocalId = -1;
+	int64 LocalId = -1;
 
 	/** Determined LOD level for this fragment */
 	UPROPERTY(BlueprintReadOnly, Category = "Visibility")
@@ -98,7 +98,7 @@ struct FFragmentVisibilityResult
 
 	FFragmentVisibilityResult() = default;
 
-	FFragmentVisibilityResult(int32 InLocalId, EFragmentLod InLod, float InScreenSize, float InDistance)
+	FFragmentVisibilityResult(int64 InLocalId, EFragmentLod InLod, float InScreenSize, float InDistance)
 		: LocalId(InLocalId)
 		, LodLevel(InLod)
 		, ScreenSize(InScreenSize)

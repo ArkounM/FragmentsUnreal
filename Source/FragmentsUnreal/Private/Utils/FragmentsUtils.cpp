@@ -5,7 +5,7 @@
 #include "Utils/FragmentsLog.h"
 #include "Fragment/Fragment.h"
 
-FTransform UFragmentsUtils::MakeTransform(const Transform* FragmentsTransform, bool bIsLocalTransform)
+FTransform UFragmentsUtils::MakeTransform(const Transform* FragmentsTransform, bool bIsLocalTransform, bool bIsRootCoordinates)
 {
 	if (!FragmentsTransform)
 	{
@@ -13,33 +13,46 @@ FTransform UFragmentsUtils::MakeTransform(const Transform* FragmentsTransform, b
 		return FTransform::Identity;
 	}
 
-	// Sanitize input vectors
-	FVector X = SafeVector(FVector(
+	// Axis swap (Fragments -> UE)
+	const FVector X = SafeAxis(FVector(
 		FragmentsTransform->x_direction().x(),
 		FragmentsTransform->x_direction().z(),
-		FragmentsTransform->x_direction().y()));
+		FragmentsTransform->x_direction().y()), FVector::ForwardVector);
 
-	FVector Z = SafeVector(FVector(
+	const FVector YRaw = SafeAxis(FVector(
 		FragmentsTransform->y_direction().x(),
 		FragmentsTransform->y_direction().z(),
-		FragmentsTransform->y_direction().y()));
+		FragmentsTransform->y_direction().y()), FVector::RightVector);
 
-	FVector Y = SafeVector(FVector::CrossProduct(Z, X)).GetSafeNormal(); // LH flip
-
-	FVector Pos = SafeVector(FVector(
+	const FVector Pos = SafeVector(FVector(
 		FragmentsTransform->position().x(),
 		FragmentsTransform->position().z(),
 		FragmentsTransform->position().y())) * 100.0f;
 
-	FMatrix RotMatrix(X, Y, Z, FVector::ZeroVector);
-	FRotator Rotator = RotMatrix.Rotator();
+	// Non-root: preserve legacy behavior to avoid unintended changes
+	if (!bIsRootCoordinates)
+	{
+		// Legacy path: treat y_direction as Z
+		return BuildFromXZ(X, YRaw, Pos);
+	}
 
-	// Sanitize rotator too
-	Rotator = SafeRotator(Rotator);
+	// Root-only auto detect:
+	// Option A: treat y_direction as Y
+	const FTransform Txy = BuildFromXY(X, YRaw, Pos);
 
-	FTransform OutTransform = FTransform(Rotator, Pos, FVector(1.0f));
-	UE_LOG(LogFragments, Verbose, TEXT("Final FTransform: %s"), *OutTransform.ToString());
-	return OutTransform;
+	// Option B: treat y_direction as Z (legacy)
+	const FTransform Txz = BuildFromXZ(X, YRaw, Pos);
+
+	// Pick whichever makes UE "Up" (Z axis) more aligned with +Z
+	const float ScoreXY = FVector::DotProduct(Txy.GetUnitAxis(EAxis::Z), FVector::UpVector);
+	const float ScoreXZ = FVector::DotProduct(Txz.GetUnitAxis(EAxis::Z), FVector::UpVector);
+
+	const FTransform Out = (ScoreXY >= ScoreXZ) ? Txy : Txz;
+
+	UE_LOG(LogFragments, Log, TEXT("Root basis auto-detect: ScoreXY=%.4f ScoreXZ=%.4f -> %s"),
+		ScoreXY, ScoreXZ, (ScoreXY >= ScoreXZ) ? TEXT("Use XY") : TEXT("Use XZ"));
+
+	return Out;
 }
 
 FPlaneProjection UFragmentsUtils::BuildProjectionPlane(const TArray<FVector>& Points, const TArray<int32>& Profile)
@@ -120,12 +133,12 @@ TArray<FItemAttribute> UFragmentsUtils::ParseItemAttribute(const Attribute* Attr
 		FString Value = Tokens[1].TrimStartAndEnd().Replace(TEXT("\""), TEXT(""));
 		int64 TypeHash = FCString::Atoi(*Tokens[2].TrimStartAndEnd());
 
-		Parsed.Add(FItemAttribute(Key, Value, TypeHash));
+		Parsed.Add(FItemAttribute(Key, Value, TEXT(""), TypeHash));
 	}
 	return Parsed;
 }
 
-AFragment* UFragmentsUtils::MapModelStructure(const SpatialStructure* InS, AFragment*& ParentActor, TMap<int32, AFragment*>& FragmentLookupMapRef, const FString& InheritedCategory)
+AFragment* UFragmentsUtils::MapModelStructure(const SpatialStructure* InS, AFragment*& ParentActor, TMap<int64, AFragment*>& FragmentLookupMapRef, const FString& InheritedCategory)
 {
 	// Determine if this node should spawn an actor
 	const bool bHasLocalId = InS->local_id().has_value();
@@ -143,7 +156,7 @@ AFragment* UFragmentsUtils::MapModelStructure(const SpatialStructure* InS, AFrag
 
 		if (bHasLocalId)
 		{
-			int32 LocalId = InS->local_id().value();
+			int64 LocalId = InS->local_id().value();
 			FragmentActor->SetLocalId(LocalId);
 			FragmentLookupMapRef.Add(LocalId, FragmentActor);
 		}
@@ -304,6 +317,22 @@ FVector UFragmentsUtils::SafeVector(const FVector& Vec)
 	);
 }
 
+FVector UFragmentsUtils::SafeAxis(const FVector& V, const FVector& Fallback, float Eps)
+{
+	FVector Out(
+		FMath::IsFinite(V.X) ? V.X : 0.f,
+		FMath::IsFinite(V.Y) ? V.Y : 0.f,
+		FMath::IsFinite(V.Z) ? V.Z : 0.f
+	);
+
+	if (Out.SizeSquared() < Eps)
+	{
+		return Fallback;
+	}
+
+	return Out;
+}
+
 FRotator UFragmentsUtils::SafeRotator(const FRotator& Rot)
 {
 	return FRotator(
@@ -313,7 +342,83 @@ FRotator UFragmentsUtils::SafeRotator(const FRotator& Rot)
 	);
 }
 
-int32 UFragmentsUtils::GetIndexForLocalId(const Model* InModelRef, int32 LocalId)
+bool UFragmentsUtils::IsValueKey(const FString& Key)
+{
+	return Key.Equals(TEXT("NominalValue"), ESearchCase::IgnoreCase)
+		|| Key.EndsWith(TEXT("Value"));
+}
+
+FTransform UFragmentsUtils::BuildFromXY(const FVector& XIn, const FVector& YIn, const FVector& PostCm)
+{
+	FVector X = XIn; FVector Y = YIn;
+
+	if (!X.Normalize()) X = FVector::ForwardVector;
+
+	// Orthonormalize Y vs X
+	Y = (Y - FVector::DotProduct(Y, X) * X);
+	if (!Y.Normalize()) Y = FVector::RightVector;
+
+	FVector Z = FVector::CrossProduct(X, Y);
+	if (!Z.Normalize()) Z = FVector::UpVector;
+
+	FMatrix M(X, Y, Z, FVector::ZeroVector);
+	FRotator R = SafeRotator(M.Rotator());
+	return FTransform(R, PostCm, FVector(1.0f));
+}
+
+FTransform UFragmentsUtils::BuildFromXZ(const FVector& XIn, const FVector& ZIn, const FVector& PostCm)
+{
+	FVector X = XIn; FVector Z = ZIn;
+
+	if (!X.Normalize()) X = FVector::ForwardVector;
+
+	// Orthonormalize Z vs X
+	Z = (Z - FVector::DotProduct(Z, X) * X);
+	if (!Z.Normalize()) Z = FVector::UpVector;
+
+	// Y = Z x X
+	FVector Y = FVector::CrossProduct(Z, X);
+	if (!Y.Normalize()) Y = FVector::RightVector;
+
+	FMatrix M(X, Y, Z, FVector::ZeroVector);
+	FRotator R = SafeRotator(M.Rotator());
+	return FTransform(R, PostCm, FVector(1.0f));
+}
+
+TArray<FItemAttribute> UFragmentsUtils::ParsePropertySets(const TArray<FItemAttribute>& InAttributes)
+{
+	FString CurrentPropertySet;
+	TArray<FItemAttribute> ParsedPropertySets;
+
+	for (int32 i = 0; i < InAttributes.Num(); ++i)
+	{
+		const FItemAttribute& A = InAttributes[i];
+		const FItemAttribute* Next = (i + 1 < InAttributes.Num()) ? &InAttributes[i + 1] : nullptr;
+
+		if (A.Key.Equals(TEXT("Name"), ESearchCase::IgnoreCase) &&
+			Next && Next->Key.Equals(TEXT("Name"), ESearchCase::IgnoreCase))
+		{
+			CurrentPropertySet = A.Value;
+			continue;
+		}
+		if (A.Key.Equals(TEXT("Name"), ESearchCase::IgnoreCase) &&
+			Next && IsValueKey(Next->Key))
+		{
+			FItemAttribute pa;
+			pa.Key = A.Value;
+			pa.Value = Next->Value;
+			pa.PropertySet = CurrentPropertySet;
+
+			ParsedPropertySets.Add(MoveTemp(pa));
+			++i;
+			continue;
+		}
+	}
+
+	return ParsedPropertySets;
+}
+
+int64 UFragmentsUtils::GetIndexForLocalId(const Model* InModelRef, int64 LocalId)
 {
 	if (!InModelRef || !InModelRef->local_ids()) return INDEX_NONE;
 
@@ -332,7 +437,7 @@ int32 UFragmentsUtils::GetIndexForLocalId(const Model* InModelRef, int32 LocalId
 // FFindResult Implementation (GPU Instancing Phase 4)
 // ==========================================
 
-int32 FFindResult::GetLocalId() const
+int64 FFindResult::GetLocalId() const
 {
 	if (bIsInstanced)
 	{

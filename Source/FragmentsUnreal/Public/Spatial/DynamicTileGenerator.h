@@ -20,7 +20,7 @@ struct FDynamicRenderTile
 
 	/** Fragment local IDs belonging to this tile */
 	UPROPERTY(BlueprintReadOnly, Category = "Tile")
-	TArray<int32> FragmentLocalIds;
+	TArray<int64> FragmentLocalIds;
 
 	/** Material index shared by fragments in this tile */
 	UPROPERTY(BlueprintReadOnly, Category = "Tile")
@@ -104,21 +104,21 @@ public:
 	 * @param LocalId Fragment local ID
 	 * @return Tile ID containing fragment, or 0 if not found
 	 */
-	uint32 FindTileForFragment(int32 LocalId) const;
+	uint32 FindTileForFragment(int64 LocalId) const;
 
 	/**
 	 * Get fragments that need to be spawned (not yet spawned).
 	 * @param SpawnedFragments Set of already-spawned fragment IDs
 	 * @return Array of fragment IDs that need spawning
 	 */
-	TArray<int32> GetFragmentsToSpawn(const TSet<int32>& SpawnedFragments) const;
+	TArray<int64> GetFragmentsToSpawn(const TSet<int64>& SpawnedFragments) const;
 
 	/**
 	 * Get fragments that should be unloaded (no longer in any tile).
 	 * @param SpawnedFragments Set of currently spawned fragment IDs
 	 * @return Array of fragment IDs that should be unloaded
 	 */
-	TArray<int32> GetFragmentsToUnload(const TSet<int32>& SpawnedFragments) const;
+	TArray<int64> GetFragmentsToUnload(const TSet<int64>& SpawnedFragments) const;
 
 	// --- Configuration ---
 
@@ -139,10 +139,10 @@ private:
 	TMap<uint32, FDynamicRenderTile> Tiles;
 
 	/** Reverse lookup (fragment ID -> tile ID) */
-	TMap<int32, uint32> FragmentToTileId;
+	TMap<int64, uint32> FragmentToTileId;
 
 	/** All fragments currently in tiles */
-	TSet<int32> AllTiledFragments;
+	TSet<int64> AllTiledFragments;
 
 	/**
 	 * Compute CRC-32 tile ID for a fragment.

@@ -191,7 +191,7 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 			if (Index < 5)
 			{
 				UE_LOG(LogFragmentRegistry, Log,
-				       TEXT("Fragment %d bounds: Min=%s Max=%s Center=%s MaxDim=%.1f OcclusionRole=%s"),
+				       TEXT("Fragment %lld bounds: Min=%s Max=%s Center=%s MaxDim=%.1f OcclusionRole=%s"),
 				       Item.LocalId,
 				       *VisData.WorldBounds.Min.ToString(),
 				       *VisData.WorldBounds.Max.ToString(),
@@ -221,7 +221,7 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 			Fragments.Add(VisData);
 			LocalIdToIndex.Add(Item.LocalId, Index);
 
-			UE_LOG(LogFragmentRegistry, Warning, TEXT("Fragment %d has no valid bbox, using position fallback"),
+			UE_LOG(LogFragmentRegistry, Warning, TEXT("Fragment %lld has no valid bbox, using position fallback"),
 			       Item.LocalId);
 		}
 	}
@@ -236,7 +236,7 @@ void UFragmentRegistry::CollectFragmentData(const FFragmentItem& Item, const Mod
 	}
 }
 
-const FFragmentVisibilityData* UFragmentRegistry::FindFragment(int32 LocalId) const
+const FFragmentVisibilityData* UFragmentRegistry::FindFragment(int64 LocalId) const
 {
 	const int32* IndexPtr = LocalIdToIndex.Find(LocalId);
 	if (IndexPtr && *IndexPtr >= 0 && *IndexPtr < Fragments.Num())
@@ -246,7 +246,7 @@ const FFragmentVisibilityData* UFragmentRegistry::FindFragment(int32 LocalId) co
 	return nullptr;
 }
 
-int32 UFragmentRegistry::GetFragmentIndex(int32 LocalId) const
+int32 UFragmentRegistry::GetFragmentIndex(int64 LocalId) const
 {
 	const int32* IndexPtr = LocalIdToIndex.Find(LocalId);
 	return IndexPtr ? *IndexPtr : INDEX_NONE;

@@ -156,7 +156,7 @@ struct FFragmentLookup
 public:
 
 	UPROPERTY()
-	TMap<int32, class AFragment*> Fragments;
+	TMap<int64, class AFragment*> Fragments;
 };
 
 USTRUCT(BlueprintType)
@@ -166,13 +166,13 @@ struct FFragmentSample
 
 	// Original indices (kept for debugging and backward compatibility)
 	UPROPERTY()
-	int32 SampleIndex = -1;
+	int64 SampleIndex = -1;
 	UPROPERTY()
-	int32 LocalTransformIndex = -1;
+	int64 LocalTransformIndex = -1;
 	UPROPERTY()
-	int32 RepresentationIndex = -1;
+	int64 RepresentationIndex = -1;
 	UPROPERTY()
-	int32 MaterialIndex = -1;
+	int64 MaterialIndex = -1;
 
 	// Pre-extracted geometry data (populated at load time)
 	// This eliminates FlatBuffer access during spawn phase
@@ -193,11 +193,16 @@ struct FItemAttribute
 	FString Value;
 
 	UPROPERTY(BlueprintReadOnly)
+	FString PropertySet;
+
+	UPROPERTY(BlueprintReadOnly)
 	int64 TypeHash;
 
-	FItemAttribute() : Key(TEXT("")), Value(TEXT("")), TypeHash(0) {}
+	FItemAttribute() : Key(TEXT("")), Value(TEXT("")), PropertySet(TEXT("")), TypeHash(0) {}
+	FItemAttribute(const FString& InKey, const FString& InValue, const FString& InPropertySet, int64 InTypeHash)
+		:Key(InKey), Value(InValue), PropertySet(InPropertySet), TypeHash(InTypeHash) {}
 	FItemAttribute(const FString& InKey, const FString& InValue, int64 InTypeHash)
-		:Key(InKey), Value(InValue), TypeHash(InTypeHash) {}
+		:Key(InKey), Value(InValue), PropertySet(TEXT("")), TypeHash(InTypeHash) {}
 };
 
 USTRUCT()
@@ -207,7 +212,7 @@ struct FFragmentItem
 	GENERATED_BODY()
 
 	FString ModelGuid;
-	int32 LocalId;
+	int64 LocalId;
 	FString Category;
 	FString Guid;
 	TArray<FItemAttribute> Attributes;  // List of attributes for the fragment
@@ -215,7 +220,7 @@ struct FFragmentItem
 	TArray<FFragmentSample> Samples;
 	FTransform GlobalTransform;
 
-	bool FindFragmentByLocalId(int32 InLocalId, FFragmentItem*& OutItem)
+	bool FindFragmentByLocalId(int64 InLocalId, FFragmentItem*& OutItem)
 	{
 		// Check if the current item matches the LocalId
 		if (LocalId == InLocalId)
@@ -238,7 +243,7 @@ struct FFragmentItem
 	}
 
 	// Const version
-	bool FindFragmentByLocalId(int32 InLocalId, FFragmentItem*& OutItem) const
+	bool FindFragmentByLocalId(int64 InLocalId, FFragmentItem*& OutItem) const
 	{
 		// Check if the current item matches the LocalId
 		if (LocalId == InLocalId)
@@ -284,7 +289,7 @@ struct FFragmentProxy
 
 	/** LocalId of the fragment in the BIM model */
 	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
-	int32 LocalId = INDEX_NONE;
+	int64 LocalId = INDEX_NONE;
 
 	/** Global unique ID (GUID) of the fragment */
 	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
@@ -304,11 +309,11 @@ struct FFragmentProxy
 
 	/** Parent fragment LocalId (INDEX_NONE if root) */
 	UPROPERTY()
-	int32 ParentLocalId = INDEX_NONE;
+	int64 ParentLocalId = INDEX_NONE;
 
 	/** Child fragment LocalIds */
 	UPROPERTY()
-	TArray<int32> ChildLocalIds;
+	TArray<int64> ChildLocalIds;
 
 	/** Cached world transform of this instance */
 	UPROPERTY()
@@ -324,14 +329,14 @@ struct FFragmentProxy
 struct FPendingInstanceData
 {
 	FTransform WorldTransform;
-	int32 LocalId = INDEX_NONE;
+	int64 LocalId = INDEX_NONE;
 	FString GlobalId;
 	FString Category;
 	FString ModelGuid;
 	TArray<FItemAttribute> Attributes;
 
 	FPendingInstanceData() = default;
-	FPendingInstanceData(const FTransform& InTransform, int32 InLocalId, const FString& InGlobalId,
+	FPendingInstanceData(const FTransform& InTransform, int64 InLocalId, const FString& InGlobalId,
 		const FString& InCategory, const FString& InModelGuid, const TArray<FItemAttribute>& InAttributes)
 		: WorldTransform(InTransform), LocalId(InLocalId), GlobalId(InGlobalId),
 		  Category(InCategory), ModelGuid(InModelGuid), Attributes(InAttributes) {}
@@ -364,10 +369,10 @@ struct FInstancedMeshGroup
 	int32 InstanceCount = 0;
 
 	/** Map from ISMC instance index to BIM LocalId */
-	TMap<int32, int32> InstanceToLocalId;
+	TMap<int32, int64> InstanceToLocalId;
 
 	/** Map from BIM LocalId to ISMC instance index */
-	TMap<int32, int32> LocalIdToInstance;
+	TMap<int64, int32> LocalIdToInstance;
 
 	/** Pending instances to be batch-added (collected during spawn phase) */
 	TArray<FPendingInstanceData> PendingInstances;
@@ -416,7 +421,7 @@ struct FRAGMENTSUNREAL_API FFindResult
 	FFragmentProxy Proxy;
 
 	/** Get LocalId regardless of instancing */
-	int32 GetLocalId() const;
+	int64 GetLocalId() const;
 
 	/** Get Category regardless of instancing */
 	FString GetCategory() const;
@@ -447,20 +452,23 @@ class FRAGMENTSUNREAL_API UFragmentsUtils : public UBlueprintFunctionLibrary
 public:
 
 	//UFUNCTION(BlueprintCallable, Category = "Fragments")
-	static FTransform MakeTransform(const Transform* FragmentsTransform, bool bIsLocalTransform = false);
+	static FTransform MakeTransform(const Transform* FragmentsTransform, bool bIsLocalTransform = false, bool bIsRootCoordinates = false);
 	static FPlaneProjection BuildProjectionPlane(const TArray<FVector>& Points, const TArray<int32>& Profile);
 	static bool IsClockwise(const TArray<FVector2D>& Points);
 	static TArray<FItemAttribute> ParseItemAttribute(const Attribute* Attr);
-	static class AFragment* MapModelStructure(const SpatialStructure* InS, AFragment*& ParentActor, TMap<int32, AFragment*>& FragmentLookupMapRef, const FString& InheritedCategory);
+	static class AFragment* MapModelStructure(const SpatialStructure* InS, AFragment*& ParentActor, TMap<int64, AFragment*>& FragmentLookupMapRef, const FString& InheritedCategory);
 	static void MapModelStructureToData(const SpatialStructure* InS, FFragmentItem& ParentItem, const FString& InheritedCategory);
 	static FString GetIfcCategory(const int64 InTypeHash);
 	static float SafeComponent(float Value);
 	static FVector SafeVector(const FVector& Vec);
+	static FVector SafeAxis(const FVector& V, const FVector& Fallback, float Eps = 1e-8f);
 	static FRotator SafeRotator(const FRotator& Rot);
-	static int32 GetIndexForLocalId(const Model* InModelRef, int32 LocalId);
+	static int64 GetIndexForLocalId(const Model* InModelRef, int64 LocalId);
+	static TArray<FItemAttribute> ParsePropertySets(const TArray<FItemAttribute>& InAttributes);
 
 private:
-
-	//void MapSpatialStructureRecursive(const SpatialStructure* Node, int32 ParentId, TArray<FSpatialStructure>& OutList);
+	static bool IsValueKey(const FString& Key);
+	static FTransform BuildFromXY(const FVector& XIn, const FVector& YIn, const FVector& PostCm);
+	static FTransform BuildFromXZ(const FVector& XIn, const FVector& ZIn, const FVector& PostCm);
 
 };

@@ -24,6 +24,9 @@
 #include "Spatial/FragmentTileManager.h"
 #include "Utils/FragmentOcclusionClassifier.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "UDynamicMesh.h"
+#include "DynamicMesh/DynamicMesh3.h"
+#include "Components/DynamicMeshComponent.h"
 
 
 void UFragmentsImporter::ProcessFragmentAsync(const FString& FragmentPath, AActor* Owner, FOnFragmentLoadComplete OnComplete)
@@ -89,13 +92,14 @@ UFragmentsImporter::UFragmentsImporter()
 {
 }
 
-FString UFragmentsImporter::Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes)
+FString UFragmentsImporter::Process(AActor* OwnerA, const FString& FragPath, TArray<AFragment*>& OutFragments, bool bSaveMeshes,
+	bool bUseDynamicMesh, bool bUseHISM, AFragment* BucketRoot)
 {
 	SetOwnerRef(OwnerA);
 	FString ModelGuidStr = LoadFragment(FragPath);
 
 	if (ModelGuidStr.IsEmpty())	return FString();
-	
+
 	UFragmentModelWrapper* Wrapper = *FragmentModels.Find(ModelGuidStr);
 	const Model* ModelRef = Wrapper->GetParsedModel();
 
@@ -103,14 +107,15 @@ FString UFragmentsImporter::Process(AActor* OwnerA, const FString& FragPath, TAr
 	BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
 
 	FDateTime StartTime = FDateTime::Now();
-	SpawnFragmentModel(Wrapper->GetModelItem(), OwnerRef, ModelRef->meshes(), bSaveMeshes);
+	SpawnFragmentModel(Wrapper->GetModelItem(), OwnerRef.Get(), ModelRef->meshes(), bSaveMeshes,
+		Wrapper, bUseDynamicMesh, bUseHISM, BucketRoot);
 	UE_LOG(LogFragments, Warning, TEXT("Loaded model in [%s]s -> %s"), *(FDateTime::Now() - StartTime).ToString(), *ModelGuidStr);
 	if (PackagesToSave.Num() > 0)
 	{
 		DeferredSaveManager.AddPackagesToSave(PackagesToSave);
 		PackagesToSave.Empty();
 	}
-	
+
 	return ModelGuidStr;
 }
 
@@ -123,7 +128,7 @@ void UFragmentsImporter::GetItemData(AFragment*& InFragment)
 		UFragmentModelWrapper* Wrapper = *FragmentModels.Find(InFragment->GetModelGuid());
 		const Model* InModel = Wrapper->GetParsedModel();
 		
-		int32 ItemIndex = UFragmentsUtils::GetIndexForLocalId(InModel, InFragment->GetLocalId());
+		int64 ItemIndex = UFragmentsUtils::GetIndexForLocalId(InModel, InFragment->GetLocalId());
 		if (ItemIndex == INDEX_NONE) return;
 	
 		// Attributes
@@ -155,8 +160,8 @@ void UFragmentsImporter::GetItemData(FFragmentItem* InFragmentItem)
 		UFragmentModelWrapper* Wrapper = *FragmentModels.Find(InFragmentItem->ModelGuid);
 		const Model* InModel = Wrapper->GetParsedModel();
 
-		int32 ItemIndex = UFragmentsUtils::GetIndexForLocalId(InModel, InFragmentItem->LocalId);
-		flatbuffers::uoffset_t ii = ItemIndex;
+		int64 ItemIndex = UFragmentsUtils::GetIndexForLocalId(InModel, InFragmentItem->LocalId);
+		flatbuffers::uoffset_t ii = static_cast<flatbuffers::uoffset_t>(ItemIndex);
 		if (ItemIndex == INDEX_NONE) return;
 
 		// Attributes
@@ -203,14 +208,203 @@ TArray<FItemAttribute> UFragmentsImporter::GetItemPropertySets(AFragment* InFrag
 	const Model* InModel = Wrapper->GetParsedModel();
 	if (!InModel) return CollectedAttributes;
 
-	TSet<int32> Visited;
+	TSet<int64> Visited;
 	CollectPropertiesRecursive(InModel, InFragment->GetLocalId(), Visited, CollectedAttributes);
 
+	return UFragmentsUtils::ParsePropertySets(CollectedAttributes);
+}
+
+TArray<FItemAttribute> UFragmentsImporter::GetItemPropertySets(FFragmentItem* InFragment)
+{
+	TArray<FItemAttribute> CollectedAttributes;
+	if (!InFragment || InFragment->ModelGuid.IsEmpty()) return CollectedAttributes;
+	if (!FragmentModels.Contains(InFragment->ModelGuid)) return CollectedAttributes;
+
+	UFragmentModelWrapper* Wrapper = *FragmentModels.Find(InFragment->ModelGuid);
+	const Model* InModel = Wrapper->GetParsedModel();
+	if (!InModel) return CollectedAttributes;
+
+	TSet<int64> Visited;
+	CollectPropertiesRecursive(InModel, InFragment->LocalId, Visited, CollectedAttributes);
+
+	return UFragmentsUtils::ParsePropertySets(CollectedAttributes);
+}
+
+TArray<FItemAttribute> UFragmentsImporter::GetItemPropertySets(int64 LocalId, const FString& InModelGuid)
+{
+	TArray<FItemAttribute> CollectedAttributes;
+	if (InModelGuid.IsEmpty()) return CollectedAttributes;
+	if (!FragmentModels.Contains(InModelGuid)) return CollectedAttributes;
+
+	UFragmentModelWrapper* Wrapper = *FragmentModels.Find(InModelGuid);
+	if (!Wrapper) return CollectedAttributes;
+
+	const Model* InModel = Wrapper->GetParsedModel();
+	if (!InModel) return CollectedAttributes;
+
+	TSet<int64> Visited;
+	CollectPropertiesRecursive(InModel, LocalId, Visited, CollectedAttributes);
+
+	return UFragmentsUtils::ParsePropertySets(CollectedAttributes);
+}
+
+TArray<FItemAttribute> UFragmentsImporter::GetItemAttributes(int64 LocalId, const FString& InModelGuid)
+{
+	TArray<FItemAttribute> CollectedAttributes;
+	if (InModelGuid.IsEmpty()) return CollectedAttributes;
+	if (!FragmentModels.Contains(InModelGuid)) return CollectedAttributes;
+
+	UFragmentModelWrapper* Wrapper = *FragmentModels.Find(InModelGuid);
+	if (!Wrapper) return CollectedAttributes;
+
+	const Model* InModel = Wrapper->GetParsedModel();
+	if (!InModel) return CollectedAttributes;
+
+	int64 ItemIndex = UFragmentsUtils::GetIndexForLocalId(InModel, LocalId);
+	flatbuffers::uoffset_t ii = static_cast<flatbuffers::uoffset_t>(ItemIndex);
+	if (ItemIndex == INDEX_NONE) return CollectedAttributes;
+
+	if (ii < InModel->attributes()->size())
+	{
+		const auto* attribute = InModel->attributes()->Get(ii);
+		CollectedAttributes = UFragmentsUtils::ParseItemAttribute(attribute);
+	}
 	return CollectedAttributes;
 }
 
+AFragment* UFragmentsImporter::GetModelFragment(const FString& ModelGuid)
+{
+	if (FragmentModels.Contains(ModelGuid))
+	{
+		UFragmentModelWrapper* Wrapper = *FragmentModels.Find(ModelGuid);
+		return Wrapper->GetSpawnedFragment();
+	}
+	return nullptr;
+}
 
-AFragment* UFragmentsImporter::GetItemByLocalId(int32 LocalId, const FString& ModelGuid)
+void UFragmentsImporter::ResetBaseCoordinates()
+{
+	BaseCoordinates = FTransform::Identity;
+	bBaseCoordinatesInitialized = false;
+}
+
+void UFragmentsImporter::ResetAll()
+{
+	for (AFragment* Frag : FragmentActors)
+	{
+		if (IsValid(Frag))
+		{
+			Frag->Destroy();
+		}
+	}
+	FragmentActors.Empty();
+
+	// Tell wrappers to release cached state
+	for (auto& KV : FragmentModels)
+	{
+		if (KV.Value)
+		{
+			KV.Value->ResetWrapper();
+		}
+	}
+
+	FragmentModels.Empty();
+	ModelFragmentsMap.Empty();
+	MeshCache.Empty();
+	RepresentationMeshCache.Empty();
+	DynamicMeshByRepId.Empty();
+	MaterialsCache.Empty();
+	MaterialPool.Empty();
+	PackagesToSave.Empty();
+	InstancedMeshGroups.Empty();
+	LocalIdToProxyMap.Empty();
+
+	// Clean up tile managers
+	for (auto& Pair : TileManagers)
+	{
+		// TileManagers are UObjects, GC handles them
+	}
+	TileManagers.Empty();
+
+	OwnerRef = nullptr;
+	ISMCHostActor = nullptr;
+	bBaseCoordinatesInitialized = false;
+	BaseCoordinates = FTransform::Identity;
+	TotalPendingInstances = 0;
+}
+
+void UFragmentsImporter::ReleaseRefToWorld(UWorld* World)
+{
+	if (!World) return;
+
+	// Remove/destroy fragment actors in that world
+	for (int32 i = FragmentActors.Num() - 1; i >= 0; --i)
+	{
+		AFragment* Frag = FragmentActors[i];
+		if (!IsValid(Frag) || Frag->GetWorld() == World)
+		{
+			if (IsValid(Frag))
+			{
+				Frag->Destroy();
+			}
+			FragmentActors.RemoveAtSwap(i);
+		}
+	}
+
+	// Remove model wrappers referencing this world
+	for (auto It = FragmentModels.CreateIterator(); It; ++It)
+	{
+		UFragmentModelWrapper* Wrapper = It->Value;
+		if (!Wrapper || Wrapper->ReferencesWorld(World))
+		{
+			if (Wrapper)
+			{
+				Wrapper->ResetWrapper();
+			}
+			It.RemoveCurrent();
+		}
+	}
+}
+
+bool UFragmentsImporter::IsFragmentLoaded(const FString& InModelGuid)
+{
+	return FragmentModels.Contains(InModelGuid);
+}
+
+bool UFragmentsImporter::IsPlacementCarrier(const FString& Cat)
+{
+	return Cat.Equals(TEXT("IFCSITE"), ESearchCase::IgnoreCase);
+}
+
+void UFragmentsImporter::ProcessLoadedFragmentItem(int64 InLocalId, const FString& InModelGuid, AActor* InOwnerRef, bool bInSaveMesh,
+	bool bUseDynamicMesh, bool bUseHISM, AFragment* BucketRoot)
+{
+	FFragmentItem* Item = GetFragmentItemByLocalId(InLocalId, InModelGuid);
+
+	if (!InOwnerRef || !Item) return;
+
+	SetOwnerRef(InOwnerRef);
+
+	UFragmentModelWrapper* Wrapper = *FragmentModels.Find(InModelGuid);
+	const Model* ModelRef = Wrapper->GetParsedModel();
+
+	BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
+	BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
+
+	FDateTime StartTime = FDateTime::Now();
+	AFragment* SpawnedFrag = SpawnFragmentModel(*Item, OwnerRef.Get(), ModelRef->meshes(), bInSaveMesh,
+		Wrapper, bUseDynamicMesh, bUseHISM, BucketRoot);
+	Wrapper->SetSpawnedFragment(SpawnedFrag);
+	UE_LOG(LogFragments, Warning, TEXT("Loaded fragment item in [%s]s -> %s"), *(FDateTime::Now() - StartTime).ToString(), *InModelGuid);
+
+	if (PackagesToSave.Num() > 0)
+	{
+		DeferredSaveManager.AddPackagesToSave(PackagesToSave);
+		PackagesToSave.Empty();
+	}
+}
+
+AFragment* UFragmentsImporter::GetItemByLocalId(int64 LocalId, const FString& ModelGuid)
 {
 	if (ModelFragmentsMap.Contains(ModelGuid))
 	{
@@ -224,7 +418,7 @@ AFragment* UFragmentsImporter::GetItemByLocalId(int32 LocalId, const FString& Mo
 	return nullptr;
 }
 
-FFragmentItem* UFragmentsImporter::GetFragmentItemByLocalId(int32 LocalId, const FString& InModelGuid)
+FFragmentItem* UFragmentsImporter::GetFragmentItemByLocalId(int64 LocalId, const FString& InModelGuid)
 {
 	if (FragmentModels.Contains(InModelGuid))
 	{
@@ -413,7 +607,8 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 	return ModelGuidStr;
 }
 
-void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActor* InOwnerRef, bool bInSaveMesh)
+void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActor* InOwnerRef, bool bInSaveMesh,
+	bool bUseDynamicMesh, bool bUseHISM, AFragment* BucketRoot)
 {
 	UE_LOG(LogFragments, Log, TEXT("ProcessLoadedFragment START - ModelGuid: %s, Owner: %p"), *InModelGuid, InOwnerRef);
 
@@ -433,6 +628,29 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 
 	BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
 	BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
+
+	// ==========================================
+	// HOK DIRECT PATH: DynamicMesh or HISM
+	// ==========================================
+	if (bUseDynamicMesh || bUseHISM)
+	{
+		FDateTime StartTime = FDateTime::Now();
+		SpawnFragmentModel(Wrapper->GetModelItem(), InOwnerRef, ModelRef->meshes(), bInSaveMesh,
+			Wrapper, bUseDynamicMesh, bUseHISM, BucketRoot);
+		UE_LOG(LogFragments, Log, TEXT("HOK path: Loaded model in [%s]s -> %s"),
+			*(FDateTime::Now() - StartTime).ToString(), *InModelGuid);
+
+		if (PackagesToSave.Num() > 0)
+		{
+			DeferredSaveManager.AddPackagesToSave(PackagesToSave);
+			PackagesToSave.Empty();
+		}
+		return;
+	}
+
+	// ==========================================
+	// OUR STREAMING PATH: Tile-based per-sample visibility
+	// ==========================================
 
 	// Build fragment registry for per-sample visibility
 	Wrapper->BuildFragmentRegistry(InModelGuid);
@@ -470,9 +688,9 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 }
 
 
-TArray<int32> UFragmentsImporter::GetElementsByCategory(const FString& InCategory, const FString& ModelGuid)
+TArray<int64> UFragmentsImporter::GetElementsByCategory(const FString& InCategory, const FString& ModelGuid)
 {
-	TArray<int32> LocalIds;
+	TArray<int64> LocalIds;
 
 	if (FragmentModels.Contains(ModelGuid))
 	{
@@ -495,7 +713,7 @@ TArray<int32> UFragmentsImporter::GetElementsByCategory(const FString& InCategor
 
 			if (CategoryName.Equals(InCategory, ESearchCase::IgnoreCase))
 			{
-				int32 LocalId = local_ids->Get(i);
+				int64 LocalId = local_ids->Get(i);
 				LocalIds.Add(LocalId);
 			}
 		}
@@ -507,7 +725,7 @@ void UFragmentsImporter::UnloadFragment(const FString& ModelGuid)
 {
 	if (FFragmentLookup* Lookup = ModelFragmentsMap.Find(ModelGuid))
 	{
-		for (TPair<int32, AFragment*> Obj : Lookup->Fragments)
+		for (TPair<int64, AFragment*> Obj : Lookup->Fragments)
 		{
 			Obj.Value->Destroy();
 		}
@@ -525,8 +743,8 @@ void UFragmentsImporter::UnloadFragment(const FString& ModelGuid)
 
 void UFragmentsImporter::CollectPropertiesRecursive(
 	const Model* InModel,
-	int32 StartLocalId,
-	TSet<int32>& Visited,
+	int64 StartLocalId,
+	TSet<int64>& Visited,
 	TArray<FItemAttribute>& OutAttributes)
 {
 	if (!InModel || Visited.Contains(StartLocalId)) return;
@@ -563,7 +781,7 @@ void UFragmentsImporter::CollectPropertiesRecursive(
 
 			for (int32 k = 1; k < Tokens.Num(); ++k)
 			{
-				int32 RelatedLocalId = FCString::Atoi(*Tokens[k].TrimStartAndEnd());
+				int64 RelatedLocalId = FCString::Atoi64(*Tokens[k].TrimStartAndEnd());
 				if (Visited.Contains(RelatedLocalId)) continue;
 
 				// Try resolving RelatedLocalId to attribute
@@ -657,120 +875,6 @@ void UFragmentsImporter::SpawnStaticMesh(UStaticMesh* StaticMesh,const Transform
 
 	// Add Optional tag
 	MeshActor->Tags.Add(OptionalTag);
-}
-
-void UFragmentsImporter::SpawnFragmentModel(AFragment* InFragmentModel, AActor* InParent, const Meshes* MeshesRef, bool bSaveMeshes)
-{
-	if (!InFragmentModel || !InParent || !MeshesRef) return;
-
-	// 1. Root Component
-	USceneComponent* RootSceneComponent = NewObject<USceneComponent>(InFragmentModel);
-	RootSceneComponent->RegisterComponent();
-	InFragmentModel->SetRootComponent(RootSceneComponent);
-	RootSceneComponent->SetMobility(EComponentMobility::Movable);
-
-	// 2. Set Transform and info
-	InFragmentModel->SetActorTransform(InFragmentModel->GetGlobalTransform());
-	InFragmentModel->AttachToActor(InParent, FAttachmentTransformRules::KeepWorldTransform);
-
-#if WITH_EDITOR
-	if (!InFragmentModel->GetCategory().IsEmpty())
-		InFragmentModel->SetActorLabel(InFragmentModel->GetCategory());
-#endif
-
-	// 3. Create Meshes If Sample Exists
-	const TArray<FFragmentSample>& Samples = InFragmentModel->GetSamples();
-	if (Samples.Num() > 0)
-	{
-		for (int32 i = 0; i < Samples.Num(); i++)
-		{
-			const FFragmentSample& Sample = Samples[i];
-
-			FString MeshName = FString::Printf(TEXT("%d_%d"), InFragmentModel->GetLocalId(), i);
-			FString PackagePath = TEXT("/Game/Buildings") / InFragmentModel->GetModelGuid()/ MeshName;
-			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
-
-			FString UniquePackageName = FPackageName::ObjectPathToPackageName(PackagePath);
-			FString PackageFileName = FPackageName::LongPackageNameToFilename(UniquePackageName, FPackageName::GetAssetPackageExtension());
-
-			const Material* material = MeshesRef->materials()->Get(Sample.MaterialIndex);
-			const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
-			const Transform* local_transform = MeshesRef->local_transforms()->Get(Sample.LocalTransformIndex);
-
-			FTransform LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
-
-			UStaticMesh* Mesh = nullptr;
-			if (MeshCache.Contains(SamplePath))
-			{
-				Mesh = MeshCache[SamplePath];
-			}
-			else if (FPaths::FileExists(PackageFileName))
-			{
-				UPackage* ExistingPackage = LoadPackage(nullptr, *PackagePath, LOAD_None);
-				if (ExistingPackage)
-				{
-					Mesh = FindObject<UStaticMesh>(ExistingPackage, *MeshName);
-				}
-			}
-			else
-			{
-				UPackage* MeshPackage = CreatePackage(*PackagePath);
-				if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
-				{
-					const auto* shell = MeshesRef->shells()->Get(representation->id());
-					Mesh = CreateStaticMeshFromShell(shell, material, *MeshName, MeshPackage);
-
-				}
-				else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
-				{
-					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-					Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
-				}
-
-				if (Mesh)
-				{
-					if (!FPaths::FileExists(PackageFileName) && bSaveMeshes)
-					{
-#if WITH_EDITOR
-						MeshPackage->FullyLoad();
-
-						Mesh->Rename(*MeshName, MeshPackage);
-						Mesh->SetFlags(RF_Public | RF_Standalone);
-						//Mesh->Build();
-						MeshPackage->MarkPackageDirty();
-						FAssetRegistryModule::AssetCreated(Mesh);
-
-						FSavePackageArgs SaveArgs;
-						SaveArgs.SaveFlags = RF_Public | RF_Standalone;
-
-						PackagesToSave.Add(MeshPackage);
-#endif
-						//UPackage::SavePackage(MeshPackage, Mesh, *PackageFileName, SaveArgs);
-					}
-				}
-
-				MeshCache.Add(SamplePath, Mesh);
-			}
-
-			if (Mesh)
-			{
-
-				// Add StaticMeshComponent to parent actor
-				UStaticMeshComponent* MeshComp = NewObject<UStaticMeshComponent>(InFragmentModel);
-				MeshComp->SetStaticMesh(Mesh);
-				MeshComp->SetRelativeTransform(LocalTransform); // local to parent
-				MeshComp->AttachToComponent(RootSceneComponent, FAttachmentTransformRules::KeepRelativeTransform);
-				MeshComp->RegisterComponent();
-				InFragmentModel->AddInstanceComponent(MeshComp);
-			}
-		}
-	}
-
-	// 4. Recursively spawn child fragments
-	for (AFragment* Child : InFragmentModel->GetChildren())
-	{
-		SpawnFragmentModel(Child, InFragmentModel, MeshesRef, bSaveMeshes);
-	}
 }
 
 void UFragmentsImporter::ExtractShellGeometry(
@@ -953,14 +1057,17 @@ void UFragmentsImporter::ExtractCircleExtrusionGeometry(
 	// Leave arrays empty - the calling code will skip if Vertices.Num() == 0
 }
 
-void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor* InParent, const Meshes* MeshesRef, bool bSaveMeshes)
+AFragment* UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor* InParent, const Meshes* MeshesRef,
+	bool bSaveMeshes, UFragmentModelWrapper* InWrapperRef,
+	bool bUseDynamicMesh, bool bUseHISM, AFragment* BucketRoot,
+	int64 ParentFloorKey)
 {
-	UE_LOG(LogFragments, Log, TEXT("SpawnFragmentModel Start - In Parent: %p, OwnerRef: %p"), InParent, OwnerRef);
+	UE_LOG(LogFragments, Log, TEXT("SpawnFragmentModel Start - In Parent: %p, OwnerRef: %p"), InParent, OwnerRef.Get());
 
 	if (!InParent)
 	{
 		UE_LOG(LogFragments, Error, TEXT("SpawnFragmentModel: InParent is NULL! Early return. "));
-		return;
+		return nullptr;
 	}
 
 	// Create AFragment
@@ -971,7 +1078,7 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 	if (!FragmentModel)
 	{
 		UE_LOG(LogFragments, Error, TEXT("Failed to spawn FragmentModel actor!"));
-		return;
+		return nullptr;
 	}
 
 	UE_LOG(LogFragments, Log, TEXT("Spawned FragmentModel: %s at %s"), *FragmentModel->GetName(),*InFragmentItem.GlobalTransform.ToString());
@@ -997,13 +1104,20 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 	const TArray<FFragmentSample>& Samples = FragmentModel->GetSamples();
 	UE_LOG(LogFragments, Log, TEXT("Processing %d samples for FragmentModel"), Samples.Num());
 
+	// Determine floor key for HISM path
+	int64 CurrentFloorKey = ParentFloorKey;
+	if (CurrentFloorKey == INDEX_NONE && IsPlacementCarrier(InFragmentItem.Category))
+	{
+		CurrentFloorKey = InFragmentItem.LocalId;
+	}
+
 	if (Samples.Num() > 0)
 	{
 		for (int32 i = 0; i < Samples.Num(); i++)
 		{
 			const FFragmentSample& Sample = Samples[i];
 
-			FString MeshName = FString::Printf(TEXT("%d_%d"), FragmentModel->GetLocalId(), i);
+			FString MeshName = FString::Printf(TEXT("%lld_%d"), FragmentModel->GetLocalId(), i);
 			FString PackagePath = TEXT("/Game/Buildings") / FragmentModel->GetModelGuid() / MeshName;
 			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
 
@@ -1013,9 +1127,58 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 			const Material* material = MeshesRef->materials()->Get(Sample.MaterialIndex);
 			const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
 			const Transform* local_transform = MeshesRef->local_transforms()->Get(Sample.LocalTransformIndex);
+			const uint32 repId = representation->id();
 
 			FTransform LocalTransform = UFragmentsUtils::MakeTransform(local_transform);
 
+			// ==========================================
+			// DYNAMIC MESH PATH (HOK fast preview)
+			// ==========================================
+			if (bUseDynamicMesh)
+			{
+				FDynamicMesh3 DynamicMesh;
+
+				if (FDynamicMesh3* FoundDyn = DynamicMeshByRepId.Find(repId))
+				{
+					DynamicMesh = *FoundDyn;
+				}
+				else
+				{
+					UPackage* MeshPackage = CreatePackage(*PackagePath);
+					if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
+					{
+						const auto* shell = MeshesRef->shells()->Get(repId);
+						DynamicMesh = CreateDynamicMeshFromShell(shell, material, *MeshName, MeshPackage);
+						DynamicMeshByRepId.Add(repId, DynamicMesh);
+					}
+					else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
+					{
+						const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(repId);
+						DynamicMesh = CreateDynamicMeshFromCircleExtrusion(circleExtrusion, material, *MeshName, MeshPackage);
+						DynamicMeshByRepId.Add(repId, DynamicMesh);
+					}
+				}
+
+				UDynamicMeshComponent* DynamicMeshComponent = NewObject<UDynamicMeshComponent>(FragmentModel);
+				DynamicMeshComponent->SetMesh(MoveTemp(DynamicMesh));
+				if (InWrapperRef)
+				{
+					AddMaterialToDynamicMesh(DynamicMeshComponent, material, InWrapperRef, Sample.MaterialIndex);
+				}
+				DynamicMeshComponent->SetRelativeTransform(LocalTransform);
+				DynamicMeshComponent->AttachToComponent(RootSceneComponent, FAttachmentTransformRules::KeepRelativeTransform);
+				DynamicMeshComponent->RegisterComponent();
+				DynamicMeshComponent->SetComplexAsSimpleCollisionEnabled(true);
+				DynamicMeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+				DynamicMeshComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
+
+				FragmentModel->AddInstanceComponent(DynamicMeshComponent);
+				continue;
+			}
+
+			// ==========================================
+			// STATIC MESH PATH (standard + HISM routing)
+			// ==========================================
 			UStaticMesh* Mesh = nullptr;
 			if (MeshCache.Contains(SamplePath))
 			{
@@ -1035,13 +1198,13 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 
 				if (representation->representation_class() == RepresentationClass::RepresentationClass_SHELL)
 				{
-					const auto* shell = MeshesRef->shells()->Get(representation->id());
-					Mesh = CreateStaticMeshFromShell(shell, material, MeshName, MeshPackage);
+					const auto* shell = MeshesRef->shells()->Get(repId);
+					Mesh = CreateStaticMeshFromShell(shell, material, MeshName, MeshPackage, InFragmentItem.ModelGuid);
 				}
 				else if (representation->representation_class() == RepresentationClass_CIRCLE_EXTRUSION)
 				{
-					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(representation->id());
-					Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, MeshName, MeshPackage);
+					const auto* circleExtrusion = MeshesRef->circle_extrusions()->Get(repId);
+					Mesh = CreateStaticMeshFromCircleExtrusion(circleExtrusion, material, MeshName, MeshPackage, InFragmentItem.ModelGuid);
 				}
 
 				if (Mesh && !FPaths::FileExists(PackageFileName) && bSaveMeshes)
@@ -1059,13 +1222,27 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 				MeshCache.Add(SamplePath, Mesh);
 			}
 
-			if (Mesh)
-			{
+			if (!Mesh) continue;
 
-				// Add StaticMeshComponent to parent actor
+			// ==========================================
+			// HISM INSTANCING PATH (HOK bucket system)
+			// ==========================================
+			if (bUseHISM && BucketRoot && material)
+			{
+				UMaterialInterface* MatIF = Mesh->GetMaterial(0);
+				if (!MatIF)
+				{
+					MatIF = GetPooledMaterial(material->r(), material->g(), material->b(), material->a(), material->a() < 255);
+				}
+				const FTransform WorldXf = LocalTransform * FragmentModel->GetActorTransform();
+				BucketRoot->AddHISMInstance(Mesh, MatIF, WorldXf, InFragmentItem.LocalId, CurrentFloorKey);
+			}
+			else
+			{
+				// Standard StaticMeshComponent path
 				UStaticMeshComponent* MeshComp = NewObject<UStaticMeshComponent>(FragmentModel);
 				MeshComp->SetStaticMesh(Mesh);
-				MeshComp->SetRelativeTransform(LocalTransform); // local to parent
+				MeshComp->SetRelativeTransform(LocalTransform);
 				MeshComp->AttachToComponent(RootSceneComponent, FAttachmentTransformRules::KeepRelativeTransform);
 				MeshComp->RegisterComponent();
 				FragmentModel->AddInstanceComponent(MeshComp);
@@ -1078,11 +1255,25 @@ void UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, AActor
 		ModelFragmentsMap[InFragmentItem.ModelGuid].Fragments.Add(InFragmentItem.LocalId, FragmentModel);
 	}
 
+	// Store spawned fragment on wrapper for HOK lifecycle
+	if (InWrapperRef && !InWrapperRef->GetSpawnedFragment())
+	{
+		InWrapperRef->SetSpawnedFragment(FragmentModel);
+	}
+
 	// Recursively spawn child fragments
+	int64 ChildFloorKey = ParentFloorKey;
+	if (IsPlacementCarrier(InFragmentItem.Category))
+	{
+		ChildFloorKey = InFragmentItem.LocalId;
+	}
 	for (FFragmentItem* Child : InFragmentItem.FragmentChildren)
 	{
-		SpawnFragmentModel(*Child, FragmentModel, MeshesRef, bSaveMeshes);
+		SpawnFragmentModel(*Child, FragmentModel, MeshesRef, bSaveMeshes,
+			InWrapperRef, bUseDynamicMesh, bUseHISM, BucketRoot, ChildFloorKey);
 	}
+
+	return FragmentModel;
 }
 
 void UFragmentsImporter::BuildSpawnQueue(const FFragmentItem& Item, AActor* ParentActor, TArray<FFragmentSpawnTask>& OutQueue)
@@ -1271,7 +1462,7 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 			// Skip samples with invalid pre-extracted geometry
 			if (!ExtractedGeom.bIsValid)
 			{
-				UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Skipping sample %d with invalid geometry (LocalId: %d)"),
+				UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Skipping sample %d with invalid geometry (LocalId: %lld)"),
 					i, FragmentModel->GetLocalId());
 				continue;
 			}
@@ -1325,7 +1516,7 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 			// ==========================================
 			// STANDARD COMPONENT CREATION PATH
 			// ==========================================
-			FString MeshName = FString::Printf(TEXT("%d_%d"), FragmentModel->GetLocalId(), i);
+			FString MeshName = FString::Printf(TEXT("%lld_%d"), FragmentModel->GetLocalId(), i);
 			FString PackagePath = TEXT("/Game/Buildings") / FragmentModel->GetModelGuid() / MeshName;
 			const FString SamplePath = PackagePath + TEXT(".") + MeshName;
 
@@ -1366,7 +1557,7 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					{
 						// Reuse existing mesh for this representation (cache hit - no limit)
 						Mesh = *CachedMesh;
-						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Reusing cached mesh for RepId %d (LocalId: %d)"),
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Reusing cached mesh for RepId %d (LocalId: %lld)"),
 							RepresentationId, FragmentModel->GetLocalId());
 					}
 					else if (CanCreateNewMesh())
@@ -1396,7 +1587,7 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 #endif
 							}
 
-							UE_LOG(LogFragments, Log, TEXT("SpawnSingleFragment: Created and cached mesh for RepId %d (LocalId: %d) [%d/%d this frame]"),
+							UE_LOG(LogFragments, Log, TEXT("SpawnSingleFragment: Created and cached mesh for RepId %d (LocalId: %lld) [%d/%d this frame]"),
 								RepresentationId, FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
 						}
 					}
@@ -1404,7 +1595,7 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					{
 						// Mesh creation limit reached - skip this sample for now
 						// It will be created on a future frame when this fragment is visible again
-						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Deferred mesh creation for RepId %d (LocalId: %d) - limit reached [%d/%d]"),
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Deferred mesh creation for RepId %d (LocalId: %lld) - limit reached [%d/%d]"),
 							RepresentationId, FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
 						continue;  // Skip to next sample
 					}
@@ -1417,7 +1608,7 @@ AFragment* UFragmentsImporter::SpawnSingleFragment(const FFragmentItem& Item, AA
 					// Check mesh creation limit first
 					if (!CanCreateNewMesh())
 					{
-						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Deferred CircleExtrusion mesh creation (LocalId: %d) - limit reached [%d/%d]"),
+						UE_LOG(LogFragments, Verbose, TEXT("SpawnSingleFragment: Deferred CircleExtrusion mesh creation (LocalId: %lld) - limit reached [%d/%d]"),
 							FragmentModel->GetLocalId(), NewMeshCreationsThisFrame, MaxNewMeshCreationsPerFrame);
 						continue;  // Skip to next sample
 					}
@@ -1728,7 +1919,7 @@ void UFragmentsImporter::StartChunkedSpawning(const FFragmentItem& RootItem, AAc
 	UE_LOG(LogFragments, Log, TEXT("Chunked Spawning Started. Processing %d fragments per frame."), FragmentsPerChunk);
 }
 
-UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef, const Material* RefMaterial, const FString& AssetName, UObject* OuterRef)
+UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef, const Material* RefMaterial, const FString& AssetName, UObject* OuterRef, const FString& InModelGuid)
 {
 	// Create StaticMesh object
 	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(OuterRef, FName(*AssetName), RF_Public | RF_Standalone /*| RF_Transient*/);
@@ -1906,7 +2097,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromShell(const Shell* ShellRef
 	return StaticMesh;
 }
 
-UStaticMesh* UFragmentsImporter::CreateStaticMeshFromCircleExtrusion(const CircleExtrusion* CircleExtrusion, const Material* RefMaterial, const FString& AssetName, UObject* OuterRef)
+UStaticMesh* UFragmentsImporter::CreateStaticMeshFromCircleExtrusion(const CircleExtrusion* CircleExtrusion, const Material* RefMaterial, const FString& AssetName, UObject* OuterRef, const FString& InModelGuid)
 {
 	if (!CircleExtrusion || !CircleExtrusion->axes() || CircleExtrusion->axes()->size() == 0)
 		return nullptr;
@@ -1968,7 +2159,7 @@ UStaticMesh* UFragmentsImporter::CreateStaticMeshFromCircleExtrusion(const Circl
 	return StaticMesh;
 }
 
-FName UFragmentsImporter::AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial)
+FName UFragmentsImporter::AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Material* RefMaterial, const FString& InModelGuid)
 {
 	if (!RefMaterial || !CreatedMesh) return FName();
 
@@ -2550,13 +2741,13 @@ UMaterialInstanceDynamic* UFragmentsImporter::GetPooledMaterial(uint8 R, uint8 G
 	}
 
 	// Create new material instance
-	UMaterialInterface* BaseMat = bIsGlass ? BaseGlassMaterial : BaseMaterial;
+	UMaterialInterface* BaseMat = bIsGlass ? BaseGlassMaterial.Get() : BaseMaterial.Get();
 	if (!BaseMat)
 	{
 		// Load materials if not already loaded
 		BaseGlassMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentGlassMaterial.M_BaseFragmentGlassMaterial"));
 		BaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/FragmentsUnreal/Materials/M_BaseFragmentMaterial.M_BaseFragmentMaterial"));
-		BaseMat = bIsGlass ? BaseGlassMaterial : BaseMaterial;
+		BaseMat = bIsGlass ? BaseGlassMaterial.Get() : BaseMaterial.Get();
 	}
 
 	if (!BaseMat)
@@ -2939,7 +3130,7 @@ void UFragmentsImporter::PreExtractAllGeometry(FFragmentItem& RootItem, const Me
 		InstanceableCount > 0 ? ((float)(InstanceableCount - UniqueInstanceableGroups) / SuccessfulExtractions * 100.0f) : 0.0f);
 }
 
-bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int32 ItemLocalId)
+bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Meshes* MeshesRef, int64 ItemLocalId)
 {
 	// Reset the extracted geometry to ensure clean state
 	Sample.ExtractedGeometry = FPreExtractedGeometry();
@@ -2947,7 +3138,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	// Validate indices are valid
 	if (Sample.RepresentationIndex < 0 || Sample.MaterialIndex < 0 || Sample.LocalTransformIndex < 0)
 	{
-		UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: Invalid indices for item %d, sample %d"),
+		UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: Invalid indices for item %lld, sample %d"),
 			ItemLocalId, Sample.SampleIndex);
 		return false;
 	}
@@ -2955,7 +3146,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	// Validate FlatBuffer arrays exist
 	if (!MeshesRef->representations() || !MeshesRef->materials() || !MeshesRef->local_transforms())
 	{
-		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Missing FlatBuffer arrays for item %d"), ItemLocalId);
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Missing FlatBuffer arrays for item %lld"), ItemLocalId);
 		return false;
 	}
 
@@ -2963,7 +3154,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	const uint32 RepCount = MeshesRef->representations()->size();
 	if (static_cast<uint32>(Sample.RepresentationIndex) >= RepCount)
 	{
-		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: RepresentationIndex %d >= count %u for item %d"),
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: RepresentationIndex %d >= count %u for item %lld"),
 			Sample.RepresentationIndex, RepCount, ItemLocalId);
 		return false;
 	}
@@ -2972,7 +3163,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	const Representation* representation = MeshesRef->representations()->Get(Sample.RepresentationIndex);
 	if (!representation)
 	{
-		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Representation is null for item %d"), ItemLocalId);
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Representation is null for item %lld"), ItemLocalId);
 		return false;
 	}
 
@@ -2980,7 +3171,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	const uint32 MatCount = MeshesRef->materials()->size();
 	if (static_cast<uint32>(Sample.MaterialIndex) >= MatCount)
 	{
-		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: MaterialIndex %d >= count %u for item %d"),
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: MaterialIndex %d >= count %u for item %lld"),
 			Sample.MaterialIndex, MatCount, ItemLocalId);
 		return false;
 	}
@@ -2990,7 +3181,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	const uint32 TransformCount = MeshesRef->local_transforms()->size();
 	if (static_cast<uint32>(Sample.LocalTransformIndex) >= TransformCount)
 	{
-		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: LocalTransformIndex %d >= count %u for item %d"),
+		UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: LocalTransformIndex %d >= count %u for item %lld"),
 			Sample.LocalTransformIndex, TransformCount, ItemLocalId);
 		return false;
 	}
@@ -3022,7 +3213,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 
 		if (!MeshesRef->shells())
 		{
-			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: shells() is null for item %d"), ItemLocalId);
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: shells() is null for item %lld"), ItemLocalId);
 			return false;
 		}
 
@@ -3031,7 +3222,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 
 		if (ShellId >= ShellCount)
 		{
-			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell id %u >= count %u for item %d"),
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell id %u >= count %u for item %lld"),
 				ShellId, ShellCount, ItemLocalId);
 			return false;
 		}
@@ -3039,14 +3230,14 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 		const Shell* shell = MeshesRef->shells()->Get(ShellId);
 		if (!shell)
 		{
-			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u is null for item %d"), ShellId, ItemLocalId);
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u is null for item %lld"), ShellId, ItemLocalId);
 			return false;
 		}
 
 		// Validate and extract points
 		if (!shell->points() || shell->points()->size() == 0)
 		{
-			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u has no points for item %d"), ShellId, ItemLocalId);
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u has no points for item %lld"), ShellId, ItemLocalId);
 			return false;
 		}
 
@@ -3057,7 +3248,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 		constexpr uint32 MaxPointCount = 1000000;
 		if (PointCount > MaxPointCount)
 		{
-			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Point count %u exceeds limit for item %d"), PointCount, ItemLocalId);
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Point count %u exceeds limit for item %lld"), PointCount, ItemLocalId);
 			return false;
 		}
 
@@ -3076,7 +3267,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 		const auto* Profiles = shell->profiles();
 		if (!Profiles)
 		{
-			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u has no profiles for item %d"), ShellId, ItemLocalId);
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Shell %u has no profiles for item %lld"), ShellId, ItemLocalId);
 			return false;
 		}
 
@@ -3084,7 +3275,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 		constexpr uint32 MaxProfileCount = 100000;
 		if (ProfileCount > MaxProfileCount)
 		{
-			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Profile count %u exceeds limit for item %d"), ProfileCount, ItemLocalId);
+			UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Profile count %u exceeds limit for item %lld"), ProfileCount, ItemLocalId);
 			return false;
 		}
 
@@ -3168,7 +3359,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 
 		if (!bHasValidProfile)
 		{
-			UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: No valid profiles for Shell %u, item %d"), ShellId, ItemLocalId);
+			UE_LOG(LogFragments, Verbose, TEXT("ExtractSampleGeometry: No valid profiles for Shell %u, item %lld"), ShellId, ItemLocalId);
 			return false;
 		}
 
@@ -3190,7 +3381,7 @@ bool UFragmentsImporter::ExtractSampleGeometry(FFragmentSample& Sample, const Me
 	}
 
 	// Unknown representation class
-	UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Unknown representation class %d for item %d"),
+	UE_LOG(LogFragments, Warning, TEXT("ExtractSampleGeometry: Unknown representation class %d for item %lld"),
 		static_cast<int32>(representation->representation_class()), ItemLocalId);
 	return false;
 }
@@ -3233,10 +3424,10 @@ UHierarchicalInstancedStaticMeshComponent* UFragmentsImporter::GetOrCreateISMC(
 	}
 
 	// Create host actor if needed (single actor holds all HISMCs for organization)
-	if (!ISMCHostActor && OwnerRef)
+	if (!ISMCHostActor && OwnerRef.IsValid())
 	{
 		FActorSpawnParameters SpawnParams;
-		SpawnParams.Owner = OwnerRef;
+		SpawnParams.Owner = OwnerRef.Get();
 		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
 			FTransform::Identity, SpawnParams);
 
@@ -3397,10 +3588,10 @@ void UFragmentsImporter::FinalizeAllISMCs()
 	}
 
 	// Create host actor if needed
-	if (!ISMCHostActor && OwnerRef)
+	if (!ISMCHostActor && OwnerRef.IsValid())
 	{
 		FActorSpawnParameters SpawnParams;
-		SpawnParams.Owner = OwnerRef;
+		SpawnParams.Owner = OwnerRef.Get();
 		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
 			FTransform::Identity, SpawnParams);
 		if (ISMCHostActor)
@@ -3578,10 +3769,10 @@ int32 UFragmentsImporter::FinalizeISMCGroup(int64 ComboKey, FInstancedMeshGroup&
 	}
 
 	// Ensure host actor exists
-	if (!ISMCHostActor && OwnerRef)
+	if (!ISMCHostActor && OwnerRef.IsValid())
 	{
 		FActorSpawnParameters SpawnParams;
-		SpawnParams.Owner = OwnerRef;
+		SpawnParams.Owner = OwnerRef.Get();
 		ISMCHostActor = OwnerRef->GetWorld()->SpawnActor<AActor>(AActor::StaticClass(),
 			FTransform::Identity, SpawnParams);
 		if (ISMCHostActor)
@@ -3780,7 +3971,7 @@ bool UFragmentsImporter::AddInstanceToExistingISMC(int32 RepresentationId, uint3
 	return true;
 }
 
-FFindResult UFragmentsImporter::FindFragmentByLocalIdUnified(int32 LocalId, const FString& ModelGuid)
+FFindResult UFragmentsImporter::FindFragmentByLocalIdUnified(int64 LocalId, const FString& ModelGuid)
 {
 	// Check proxy map first (instanced fragments)
 	if (FFragmentProxy* Proxy = LocalIdToProxyMap.Find(LocalId))
@@ -3804,4 +3995,369 @@ FFindResult UFragmentsImporter::FindFragmentByLocalIdUnified(int32 LocalId, cons
 	}
 
 	return FFindResult::NotFound();
+}
+
+// ==========================================
+// HOK DynamicMesh Methods
+// ==========================================
+
+FDynamicMesh3 UFragmentsImporter::CreateDynamicMeshFromShell(const Shell* ShellRef, const Material* RefMaterial, const FString& AssetName, UObject* OuterRef)
+{
+	FDynamicMesh3 DynamicMesh;
+	if (!ShellRef || !ShellRef->points()) return DynamicMesh;
+
+	// 1) Extract shell points
+	TArray<FVector> ShellPoints;
+	{
+		const auto* PointsFB = ShellRef->points();
+		ShellPoints.Reserve(PointsFB->size());
+		for (flatbuffers::uoffset_t i = 0; i < PointsFB->size(); ++i)
+		{
+			const auto& P = *PointsFB->Get(i);
+			ShellPoints.Add(FVector(P.x() * 100, P.z() * 100, P.y() * 100));
+		}
+	}
+
+	// 2) Build the hole map
+	TMap<int32, TArray<TArray<int32>>> ProfileHolesIdx;
+	{
+		const auto* HolesFB = ShellRef->holes();
+		if (HolesFB)
+		{
+			for (flatbuffers::uoffset_t h = 0; h < HolesFB->size(); ++h)
+			{
+				const auto* Hole = HolesFB->Get(h);
+				const auto* Indices = Hole->indices();
+				int32 ProfileId = Hole->profile_id();
+
+				TArray<int32> HoleIdx;
+				for (flatbuffers::uoffset_t k = 0; k < Indices->size(); ++k)
+				{
+					HoleIdx.Add(Indices->Get(k));
+				}
+				ProfileHolesIdx.FindOrAdd(ProfileId).Add(HoleIdx);
+			}
+		}
+	}
+
+	// 3) Process profiles and fill dynamic mesh
+	const auto* ProfilesFB = ShellRef->profiles();
+	if (!ProfilesFB) return DynamicMesh;
+
+	for (flatbuffers::uoffset_t pi = 0; pi < ProfilesFB->size(); ++pi)
+	{
+		const auto* ProfileFB = ProfilesFB->Get(pi);
+		const auto* IdxFB = ProfileFB->indices();
+		int32 NumPts = IdxFB->size();
+		if (NumPts < 3) continue;
+
+		TArray<int32> OuterLoop;
+		OuterLoop.Reserve(NumPts);
+		for (int32 j = 0; j < NumPts; ++j)
+		{
+			OuterLoop.Add(IdxFB->Get(j));
+		}
+
+		TArray<TArray<int32>> Holes = ProfileHolesIdx.Contains(pi)
+			? ProfileHolesIdx[pi]
+			: TArray<TArray<int32>>();
+
+		TArray<FVector> OutVerts;
+		TArray<int32> OutIndices;
+		bool bOK = TriangulatePolygonWithHoles(ShellPoints, OuterLoop, Holes, OutVerts, OutIndices);
+
+		if (!bOK)
+		{
+			UE_LOG(LogFragments, Warning, TEXT("DynamicMesh: Triangulation failed on profile %d"), pi);
+			continue;
+		}
+
+		TArray<int32> NewVIDs;
+		NewVIDs.SetNum(OutVerts.Num());
+		for (int32 v = 0; v < OutVerts.Num(); ++v)
+		{
+			NewVIDs[v] = DynamicMesh.AppendVertex(OutVerts[v]);
+		}
+
+		for (int32 t = 0; t < OutIndices.Num(); t += 3)
+		{
+			int32 a = NewVIDs[OutIndices[t + 0]];
+			int32 b = NewVIDs[OutIndices[t + 1]];
+			int32 c = NewVIDs[OutIndices[t + 2]];
+			DynamicMesh.AppendTriangle(a, b, c);
+		}
+	}
+
+	return DynamicMesh;
+}
+
+FDynamicMesh3 UFragmentsImporter::CreateDynamicMeshFromCircleExtrusion(const CircleExtrusion* CircleExtrusionRef, const Material* RefMaterial, const FString& AssetName, UObject* OuterRef)
+{
+	FDynamicMesh3 Mesh;
+	if (!CircleExtrusionRef || !CircleExtrusionRef->axes() || CircleExtrusionRef->axes()->size() == 0)
+	{
+		return Mesh;
+	}
+
+	const auto* Axes = CircleExtrusionRef->axes();
+	const auto* Radii = CircleExtrusionRef->radius();
+	const int32 SegmentCount = 16;
+
+	for (flatbuffers::uoffset_t axisIndex = 0; axisIndex < Axes->size(); axisIndex++)
+	{
+		const auto* Axis = Axes->Get(axisIndex);
+		const auto* Orders = Axis->order();
+		const auto* Parts = Axis->parts();
+		const auto* Wires = Axis->wires();
+		const auto* WireSets = Axis->wire_sets();
+		const auto* Curves = Axis->circle_curves();
+
+		for (flatbuffers::uoffset_t i = 0; i < Orders->size(); i++)
+		{
+			int32 OrderIndex = Orders->Get(i);
+			int32 PartIndex = Parts->Get(i);
+
+			TArray<TArray<int32>> AllRings;
+
+			if (PartIndex == (int)AxisPartClass::AxisPartClass_CIRCLE_CURVE && Curves)
+			{
+				const float Radius = Radii->Get(axisIndex) * 100.0f;
+
+				TArray<FVector> ArcCenters;
+				TArray<FVector> ArcTangents;
+
+				for (flatbuffers::uoffset_t c = 0; c < Curves->size(); ++c)
+				{
+					const auto* Circle = Curves->Get(c);
+					FVector Center = FVector(Circle->position().x(), Circle->position().z(), Circle->position().y()) * 100.0f;
+					FVector XDir = FVector(Circle->x_direction().x(), Circle->x_direction().z(), Circle->x_direction().y());
+					FVector YDir = FVector(Circle->y_direction().x(), Circle->y_direction().z(), Circle->y_direction().y());
+					float ApertureRad = FMath::DegreesToRadians(Circle->aperture());
+					float ArcRadius = Circle->radius() * 100.0f;
+
+					int32 ArcDivs = FMath::Clamp(FMath::RoundToInt(ApertureRad * ArcRadius * 0.05f), 4, 32);
+					for (int32 j = 0; j <= ArcDivs; ++j)
+					{
+						float t = static_cast<float>(j) / ArcDivs;
+						float angle = -ApertureRad / 2.0f + t * ApertureRad;
+						FVector Pos = Center + ArcRadius * (FMath::Cos(angle) * XDir + FMath::Sin(angle) * YDir);
+						ArcCenters.Add(Pos);
+					}
+				}
+
+				// Compute tangents
+				for (int32 j = 0; j < ArcCenters.Num(); ++j)
+				{
+					if (j == 0)
+						ArcTangents.Add((ArcCenters[1] - ArcCenters[0]).GetSafeNormal());
+					else if (j == ArcCenters.Num() - 1)
+						ArcTangents.Add((ArcCenters.Last() - ArcCenters[j - 1]).GetSafeNormal());
+					else
+						ArcTangents.Add((ArcCenters[j + 1] - ArcCenters[j - 1]).GetSafeNormal());
+				}
+
+				FVector PrevTangent = ArcTangents[0];
+				FVector PrevX, PrevY;
+				PrevTangent.FindBestAxisVectors(PrevX, PrevY);
+
+				for (int32 k = 0; k < ArcCenters.Num(); ++k)
+				{
+					const FVector& Tangent = ArcTangents[k];
+					FQuat AlignQuat = FQuat::FindBetweenNormals(PrevTangent, Tangent);
+					FVector CurrX = AlignQuat.RotateVector(PrevX);
+					FVector CurrY = AlignQuat.RotateVector(PrevY);
+
+					TArray<int32> Ring;
+					for (int32 j = 0; j < SegmentCount; ++j)
+					{
+						float Angle = 2.0f * PI * j / SegmentCount;
+						FVector Offset = FMath::Cos(Angle) * CurrX + FMath::Sin(Angle) * CurrY;
+						FVector Pos = ArcCenters[k] + Offset * Radius;
+						if (Pos.ContainsNaN()) continue;
+
+						int32 vid = Mesh.AppendVertex(Pos);
+						Ring.Add(vid);
+					}
+
+					if (Ring.Num() == SegmentCount)
+					{
+						AllRings.Add(Ring);
+					}
+					PrevTangent = Tangent;
+					PrevX = CurrX;
+					PrevY = CurrY;
+				}
+
+				// Stitch rings
+				for (int32 k = 0; k < AllRings.Num() - 1; ++k)
+				{
+					const auto& RingA = AllRings[k];
+					const auto& RingB = AllRings[k + 1];
+
+					for (int32 j = 0; j < SegmentCount; ++j)
+					{
+						int32 Next = (j + 1) % SegmentCount;
+						Mesh.AppendTriangle(RingA[j], RingB[j], RingA[Next]);
+						Mesh.AppendTriangle(RingA[Next], RingB[j], RingB[Next]);
+					}
+				}
+
+				AllRings.Reset();
+			}
+			else if (PartIndex == (int)AxisPartClass::AxisPartClass_WIRE && Wires)
+			{
+				const auto* Wire = Wires->Get(OrderIndex);
+				FVector P1 = FVector(Wire->p1().x(), Wire->p1().z(), Wire->p1().y()) * 100.0f;
+				FVector P2 = FVector(Wire->p2().x(), Wire->p2().z(), Wire->p2().y()) * 100.0f;
+
+				FVector Direction = (P2 - P1).GetSafeNormal();
+				FVector XDir, YDir;
+				Direction.FindBestAxisVectors(XDir, YDir);
+
+				TArray<int32> Ring1, Ring2;
+
+				for (int32 j = 0; j < SegmentCount; j++)
+				{
+					float Angle = 2.0f * PI * j / SegmentCount;
+					FVector Offset = FMath::Cos(Angle) * XDir + FMath::Sin(Angle) * YDir;
+					FVector V1 = P1 + Offset * Radii->Get(OrderIndex) * 100.0f;
+					FVector V2 = P2 + Offset * Radii->Get(OrderIndex) * 100.0f;
+
+					if (V1.ContainsNaN() || V2.ContainsNaN()) continue;
+
+					int32 ID1 = Mesh.AppendVertex(V1);
+					int32 ID2 = Mesh.AppendVertex(V2);
+
+					Ring1.Add(ID1);
+					Ring2.Add(ID2);
+				}
+
+				if (Ring1.Num() == SegmentCount && Ring2.Num() == SegmentCount)
+				{
+					for (int32 j = 0; j < SegmentCount; ++j)
+					{
+						int32 Next = (j + 1) % SegmentCount;
+						Mesh.AppendTriangle(Ring1[j], Ring2[j], Ring1[Next]);
+						Mesh.AppendTriangle(Ring1[Next], Ring2[j], Ring2[Next]);
+					}
+				}
+			}
+			else if (PartIndex == (int)AxisPartClass::AxisPartClass_WIRE_SET && WireSets)
+			{
+				const auto* WSet = WireSets->Get(OrderIndex);
+				const auto* Points = WSet->ps();
+
+				if (!Points || Points->size() < 2)
+					continue;
+
+				TArray<TArray<int32>> Rings;
+
+				for (flatbuffers::uoffset_t p = 0; p < Points->size(); p++)
+				{
+					const auto& Pt = Points->Get(p);
+					FVector Pos = FVector(Pt->x(), Pt->z(), Pt->y()) * 100.0f;
+
+					FVector Tangent;
+					if (p == 0)
+					{
+						const auto& Next = Points->Get(p + 1);
+						Tangent = (FVector(Next->x(), Next->z(), Next->y()) * 100.0f - Pos).GetSafeNormal();
+					}
+					else if (p == Points->size() - 1)
+					{
+						const auto& Prev = Points->Get(p - 1);
+						Tangent = (Pos - FVector(Prev->x(), Prev->z(), Prev->y()) * 100.0f).GetSafeNormal();
+					}
+					else
+					{
+						const auto& Prev = Points->Get(p - 1);
+						const auto& Next = Points->Get(p + 1);
+						Tangent = (FVector(Next->x(), Next->z(), Next->y()) * 100.0f - FVector(Prev->x(), Prev->z(), Prev->y()) * 100.0f).GetSafeNormal();
+					}
+
+					FVector XDir, YDir;
+					Tangent.FindBestAxisVectors(XDir, YDir);
+
+					TArray<int32> Ring;
+					for (int32 j = 0; j < SegmentCount; j++)
+					{
+						float Angle = 2.0f * PI * j / SegmentCount;
+						FVector Offset = FMath::Cos(Angle) * XDir + FMath::Sin(Angle) * YDir;
+						FVector RingPos = Pos + Offset * Radii->Get(OrderIndex) * 100.0f;
+						if (RingPos.ContainsNaN()) continue;
+
+						int32 Vtx = Mesh.AppendVertex(RingPos);
+						Ring.Add(Vtx);
+					}
+
+					if (Ring.Num() == SegmentCount)
+					{
+						Rings.Add(Ring);
+					}
+				}
+
+				// Connect rings
+				for (int32 k = 0; k < Rings.Num() - 1; ++k)
+				{
+					const auto& RingA = Rings[k];
+					const auto& RingB = Rings[k + 1];
+
+					if (RingA.Num() == SegmentCount && RingB.Num() == SegmentCount)
+					{
+						for (int32 j = 0; j < SegmentCount; ++j)
+						{
+							int32 Next = (j + 1) % SegmentCount;
+							Mesh.AppendTriangle(RingA[j], RingB[j], RingA[Next]);
+							Mesh.AppendTriangle(RingA[Next], RingB[j], RingB[Next]);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return Mesh;
+}
+
+void UFragmentsImporter::AddMaterialToDynamicMesh(UDynamicMeshComponent* InDynComp, const Material* RefMaterial, UFragmentModelWrapper* InWrapperRef, int32 InMaterialIndex)
+{
+	if (!RefMaterial || !InDynComp || !InWrapperRef) return;
+
+	UMaterialInstanceDynamic** FoundMid = InWrapperRef->GetMaterialsMap().Find(InMaterialIndex);
+	UMaterialInstanceDynamic* Mid = nullptr;
+
+	if (FoundMid)
+	{
+		Mid = *FoundMid;
+	}
+	else
+	{
+		float R = RefMaterial->r() / 255.f;
+		float G = RefMaterial->g() / 255.f;
+		float B = RefMaterial->b() / 255.f;
+		float A = RefMaterial->a() / 255.f;
+
+		UMaterialInterface* BaseMat = (A < 1.0f) ? BaseGlassMaterial.Get() : BaseMaterial.Get();
+		if (!BaseMat)
+		{
+			UE_LOG(LogFragments, Error, TEXT("Unable to load base material for dynamic mesh"));
+			return;
+		}
+
+		Mid = UMaterialInstanceDynamic::Create(BaseMat, InDynComp);
+		if (!Mid)
+		{
+			UE_LOG(LogFragments, Error, TEXT("Failed to create Dynamic Material Instance"));
+			return;
+		}
+
+		if (A < 1.0f)
+		{
+			Mid->SetScalarParameterValue(TEXT("Opacity"), A);
+		}
+		Mid->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor(R, G, B, A));
+		InWrapperRef->GetMaterialsMap().Add(InMaterialIndex, Mid);
+	}
+
+	InDynComp->SetMaterial(0, Mid);
 }

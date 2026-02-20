@@ -7,8 +7,11 @@
 #include "Spatial/FragmentRegistry.h"
 #include "FragmentModelWrapper.generated.h"
 
+// Forward declarations
+class AFragment;
+
 /**
- * 
+ *
  */
 UCLASS()
 class FRAGMENTSUNREAL_API UFragmentModelWrapper : public UObject
@@ -28,6 +31,14 @@ private:
 	/** Fragment registry for per-sample visibility (Phase 1 optimization) */
 	UPROPERTY()
 	UFragmentRegistry* FragmentRegistry = nullptr;
+
+	/** Root fragment actor spawned from this model (HOK lifecycle) */
+	UPROPERTY()
+	AFragment* SpawnedFragment = nullptr;
+
+	/** Material instances by representation index (HOK material caching) */
+	UPROPERTY()
+	TMap<int32, UMaterialInstanceDynamic*> MaterialsMap;
 
 
 public:
@@ -54,5 +65,18 @@ public:
 	 * Get the fragment registry
 	 */
 	UFragmentRegistry* GetFragmentRegistry() const { return FragmentRegistry; }
+
+	/** Reset wrapper state when changing worlds (HOK lifecycle) */
+	void ResetWrapper();
+
+	/** Check if this wrapper references actors/materials in the given world */
+	bool ReferencesWorld(const UWorld* World) const;
+
+	/** Set/Get the root fragment actor spawned from this model */
+	void SetSpawnedFragment(AFragment* InSpawnedFragment) { SpawnedFragment = InSpawnedFragment; }
+	AFragment* GetSpawnedFragment() const { return SpawnedFragment; }
+
+	/** Get materials map */
+	TMap<int32, UMaterialInstanceDynamic*>& GetMaterialsMap() { return MaterialsMap; }
 
 };

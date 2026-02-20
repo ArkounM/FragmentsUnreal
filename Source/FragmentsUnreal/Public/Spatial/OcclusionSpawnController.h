@@ -60,8 +60,8 @@ public:
 	 * @param AllVisibleFragments Set of LocalIds that are currently visible (spawned and not hidden)
 	 */
 	void UpdateOcclusionTracking(
-		const TSet<int32>& RenderedFragments,
-		const TSet<int32>& AllVisibleFragments);
+		const TSet<int64>& RenderedFragments,
+		const TSet<int64>& AllVisibleFragments);
 
 	/**
 	 * Check if a fragment should be deprioritized in the spawn queue.
@@ -71,7 +71,7 @@ public:
 	 * @return true if the fragment should be spawned later
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Occlusion")
-	bool ShouldDeferSpawn(int32 LocalId) const;
+	bool ShouldDeferSpawn(int64 LocalId) const;
 
 	/**
 	 * Get adjusted spawn priority for a fragment.
@@ -82,7 +82,7 @@ public:
 	 * @return Adjusted priority (lower = spawn first)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Occlusion")
-	float GetSpawnPriority(int32 LocalId, float BaseDistance) const;
+	float GetSpawnPriority(int64 LocalId, float BaseDistance) const;
 
 	/**
 	 * Check if a fragment is currently marked as deferred.
@@ -90,7 +90,7 @@ public:
 	 * @return true if deferred
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Occlusion")
-	bool IsFragmentDeferred(int32 LocalId) const;
+	bool IsFragmentDeferred(int64 LocalId) const;
 
 	/**
 	 * Get the number of currently deferred fragments.
@@ -132,10 +132,10 @@ private:
 	UFragmentRegistry* FragmentRegistry = nullptr;
 
 	/** Per-fragment occlusion tracking data */
-	TMap<int32, FOcclusionTrackingData> OcclusionTracking;
+	TMap<int64, FOcclusionTrackingData> OcclusionTracking;
 
 	/** Set of currently deferred fragments */
-	TSet<int32> DeferredFragments;
+	TSet<int64> DeferredFragments;
 
 	/**
 	 * Update tracking for a single fragment.
@@ -143,5 +143,5 @@ private:
 	 * @param bWasRendered Whether fragment was rendered this frame
 	 * @param bWasVisible Whether fragment was visible (spawned and not hidden)
 	 */
-	void UpdateFragmentTracking(int32 LocalId, bool bWasRendered, bool bWasVisible);
+	void UpdateFragmentTracking(int64 LocalId, bool bWasRendered, bool bWasVisible);
 };

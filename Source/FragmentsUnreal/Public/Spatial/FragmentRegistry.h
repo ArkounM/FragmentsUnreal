@@ -18,7 +18,7 @@ struct FFragmentVisibilityData
 
 	/** Fragment local ID (unique within model) */
 	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
-	int32 LocalId = -1;
+	int64 LocalId = -1;
 
 	/** Pre-computed world-space axis-aligned bounding box */
 	UPROPERTY(BlueprintReadOnly, Category = "Fragment")
@@ -110,14 +110,14 @@ public:
 	 * @param LocalId Fragment local ID to find
 	 * @return Pointer to visibility data, or nullptr if not found
 	 */
-	const FFragmentVisibilityData* FindFragment(int32 LocalId) const;
+	const FFragmentVisibilityData* FindFragment(int64 LocalId) const;
 
 	/**
 	 * Get index of fragment by local ID.
 	 * @param LocalId Fragment local ID
 	 * @return Index in Fragments array, or INDEX_NONE if not found
 	 */
-	int32 GetFragmentIndex(int32 LocalId) const;
+	int32 GetFragmentIndex(int64 LocalId) const;
 
 	/**
 	 * Get total memory usage estimate for the registry.
@@ -151,7 +151,7 @@ private:
 
 	/** Fast lookup from LocalId to array index */
 	UPROPERTY()
-	TMap<int32, int32> LocalIdToIndex;
+	TMap<int64, int32> LocalIdToIndex;
 
 	/** World bounds encompassing all fragments */
 	FBox WorldBounds;

@@ -18,8 +18,8 @@ void UOcclusionSpawnController::Initialize(UFragmentRegistry* InRegistry)
 }
 
 void UOcclusionSpawnController::UpdateOcclusionTracking(
-	const TSet<int32>& RenderedFragments,
-	const TSet<int32>& AllVisibleFragments)
+	const TSet<int64>& RenderedFragments,
+	const TSet<int64>& AllVisibleFragments)
 {
 	if (!bEnableOcclusionDeferral)
 	{
@@ -27,7 +27,7 @@ void UOcclusionSpawnController::UpdateOcclusionTracking(
 	}
 
 	// Update tracking for all visible fragments
-	for (int32 LocalId : AllVisibleFragments)
+	for (int64 LocalId : AllVisibleFragments)
 	{
 		const bool bWasRendered = RenderedFragments.Contains(LocalId);
 		UpdateFragmentTracking(LocalId, bWasRendered, true);
@@ -35,7 +35,7 @@ void UOcclusionSpawnController::UpdateOcclusionTracking(
 
 	// Clean up tracking for fragments that are no longer visible
 	// (This prevents stale data accumulation)
-	TArray<int32> ToRemove;
+	TArray<int64> ToRemove;
 	for (auto& Pair : OcclusionTracking)
 	{
 		if (!AllVisibleFragments.Contains(Pair.Key))
@@ -58,7 +58,7 @@ void UOcclusionSpawnController::UpdateOcclusionTracking(
 	       RenderedFragments.Num(), AllVisibleFragments.Num(), DeferredFragments.Num());
 }
 
-void UOcclusionSpawnController::UpdateFragmentTracking(int32 LocalId, bool bWasRendered, bool bWasVisible)
+void UOcclusionSpawnController::UpdateFragmentTracking(int64 LocalId, bool bWasRendered, bool bWasVisible)
 {
 	FOcclusionTrackingData& Data = OcclusionTracking.FindOrAdd(LocalId);
 
@@ -75,7 +75,7 @@ void UOcclusionSpawnController::UpdateFragmentTracking(int32 LocalId, bool bWasR
 			DeferredFragments.Remove(LocalId);
 
 			UE_LOG(LogOcclusionController, Verbose,
-			       TEXT("Fragment %d restored from deferred state (visible for %d frames)"),
+			       TEXT("Fragment %lld restored from deferred state (visible for %d frames)"),
 			       LocalId, Data.VisibleFrameCount);
 		}
 	}
@@ -92,13 +92,13 @@ void UOcclusionSpawnController::UpdateFragmentTracking(int32 LocalId, bool bWasR
 			DeferredFragments.Add(LocalId);
 
 			UE_LOG(LogOcclusionController, Verbose,
-			       TEXT("Fragment %d deferred (occluded for %d frames)"),
+			       TEXT("Fragment %lld deferred (occluded for %d frames)"),
 			       LocalId, Data.OccludedFrameCount);
 		}
 	}
 }
 
-bool UOcclusionSpawnController::ShouldDeferSpawn(int32 LocalId) const
+bool UOcclusionSpawnController::ShouldDeferSpawn(int64 LocalId) const
 {
 	if (!bEnableOcclusionDeferral)
 	{
@@ -108,7 +108,7 @@ bool UOcclusionSpawnController::ShouldDeferSpawn(int32 LocalId) const
 	return DeferredFragments.Contains(LocalId);
 }
 
-float UOcclusionSpawnController::GetSpawnPriority(int32 LocalId, float BaseDistance) const
+float UOcclusionSpawnController::GetSpawnPriority(int64 LocalId, float BaseDistance) const
 {
 	if (!bEnableOcclusionDeferral)
 	{
@@ -124,7 +124,7 @@ float UOcclusionSpawnController::GetSpawnPriority(int32 LocalId, float BaseDista
 	return BaseDistance;
 }
 
-bool UOcclusionSpawnController::IsFragmentDeferred(int32 LocalId) const
+bool UOcclusionSpawnController::IsFragmentDeferred(int64 LocalId) const
 {
 	return DeferredFragments.Contains(LocalId);
 }

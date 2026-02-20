@@ -41,7 +41,7 @@ public:
 	TArray<FItemAttribute> GetItemPropertySets(AFragment* InFragment);
 
 	UFUNCTION(BlueprintCallable, Category = "Fragments|Importer")
-	AFragment* GetItemByLocalId(int32 LocalId, const FString& ModelGuid);
+	AFragment* GetItemByLocalId(int64 LocalId, const FString& ModelGuid);
 
 	/**
 	 * Load fragment asynchronously with automatic tile streaming

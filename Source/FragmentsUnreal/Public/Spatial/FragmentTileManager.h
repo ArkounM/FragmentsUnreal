@@ -190,20 +190,20 @@ private:
 	UOcclusionSpawnController* OcclusionController = nullptr;
 
 	/** Set of currently spawned (visible) fragments */
-	TSet<int32> SpawnedFragments;
+	TSet<int64> SpawnedFragments;
 
 	/** Set of currently hidden (but cached) fragments */
-	TSet<int32> HiddenFragments;
+	TSet<int64> HiddenFragments;
 
 	/** Map of spawned fragment actors (LocalId -> Actor) */
 	UPROPERTY()
-	TMap<int32, class AFragment*> SpawnedFragmentActors;
+	TMap<int64, class AFragment*> SpawnedFragmentActors;
 
 	/** Current memory used by per-sample cached fragments (bytes) */
 	int64 PerSampleCacheBytes = 0;
 
 	/** Last used time for each fragment (for LRU eviction) */
-	TMap<int32, double> FragmentLastUsedTime;
+	TMap<int64, double> FragmentLastUsedTime;
 
 	/** Last camera position used for update */
 	FVector LastCameraPosition = FVector::ZeroVector;
@@ -262,28 +262,28 @@ private:
 	 * @param LocalId Fragment local ID to spawn
 	 * @return true if fragment was spawned successfully
 	 */
-	bool SpawnFragmentById(int32 LocalId);
+	bool SpawnFragmentById(int64 LocalId);
 
 	/**
 	 * Hide a single fragment (per-sample mode) - keeps in cache.
 	 * Matches engine_fragment behavior: visibility toggle instead of destroy.
 	 * @param LocalId Fragment local ID to hide
 	 */
-	void HideFragmentById(int32 LocalId);
+	void HideFragmentById(int64 LocalId);
 
 	/**
 	 * Show a previously hidden fragment (per-sample mode) - cache hit.
 	 * @param LocalId Fragment local ID to show
 	 * @return true if fragment was shown (existed in cache)
 	 */
-	bool ShowFragmentById(int32 LocalId);
+	bool ShowFragmentById(int64 LocalId);
 
 	/**
 	 * Destroy and unload a single fragment (per-sample mode).
 	 * Only called during memory pressure eviction.
 	 * @param LocalId Fragment local ID to unload
 	 */
-	void UnloadFragmentById(int32 LocalId);
+	void UnloadFragmentById(int64 LocalId);
 
 	/**
 	 * Calculate approximate memory usage of a single fragment actor.
@@ -302,7 +302,7 @@ private:
 	 * Mark fragment as recently used (updates LRU tracking).
 	 * @param LocalId Fragment that was accessed
 	 */
-	void TouchFragment(int32 LocalId);
+	void TouchFragment(int64 LocalId);
 
 	/**
 	 * Check if memory is over budget (per-sample mode).
@@ -315,7 +315,7 @@ private:
 	 * Uses GetLastRenderTimeOnScreen() to detect GPU-rendered fragments.
 	 * @return Set of LocalIds that were rendered
 	 */
-	TSet<int32> CollectRenderedFragments() const;
+	TSet<int64> CollectRenderedFragments() const;
 
 	/**
 	 * Update occlusion tracking for deferred spawning.

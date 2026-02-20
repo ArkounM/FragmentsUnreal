@@ -192,17 +192,17 @@ int32 UDynamicTileGenerator::GetTotalFragmentCount() const
 	return Total;
 }
 
-uint32 UDynamicTileGenerator::FindTileForFragment(int32 LocalId) const
+uint32 UDynamicTileGenerator::FindTileForFragment(int64 LocalId) const
 {
 	const uint32* TileIdPtr = FragmentToTileId.Find(LocalId);
 	return TileIdPtr ? *TileIdPtr : 0;
 }
 
-TArray<int32> UDynamicTileGenerator::GetFragmentsToSpawn(const TSet<int32>& SpawnedFragments) const
+TArray<int64> UDynamicTileGenerator::GetFragmentsToSpawn(const TSet<int64>& SpawnedFragments) const
 {
-	TArray<int32> ToSpawn;
+	TArray<int64> ToSpawn;
 
-	for (int32 LocalId : AllTiledFragments)
+	for (int64 LocalId : AllTiledFragments)
 	{
 		if (!SpawnedFragments.Contains(LocalId))
 		{
@@ -213,11 +213,11 @@ TArray<int32> UDynamicTileGenerator::GetFragmentsToSpawn(const TSet<int32>& Spaw
 	return ToSpawn;
 }
 
-TArray<int32> UDynamicTileGenerator::GetFragmentsToUnload(const TSet<int32>& SpawnedFragments) const
+TArray<int64> UDynamicTileGenerator::GetFragmentsToUnload(const TSet<int64>& SpawnedFragments) const
 {
-	TArray<int32> ToUnload;
+	TArray<int64> ToUnload;
 
-	for (int32 LocalId : SpawnedFragments)
+	for (int64 LocalId : SpawnedFragments)
 	{
 		if (!AllTiledFragments.Contains(LocalId))
 		{

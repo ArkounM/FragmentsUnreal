@@ -90,7 +90,8 @@ FString UFragmentsComponent::TestImportFragmentFile(const FString& Path, TArray<
 FString UFragmentsComponent::ProcessFragment(const FString& Path, TArray<AFragment*>& OutFragments, bool bSaveMeshes)
 {
 	if (FragmentsImporter)
-		return FragmentsImporter->Process(GetOwner(), Path, OutFragments, bSaveMeshes);
+		return FragmentsImporter->Process(GetOwner(), Path, OutFragments, bSaveMeshes,
+			/*bUseDynamicMesh=*/false, /*bUseHISM=*/false, /*BucketRoot=*/nullptr);
 
 	return FString();
 }
@@ -110,7 +111,7 @@ TArray<FItemAttribute> UFragmentsComponent::GetItemPropertySets(AFragment* InFra
 	return TArray<FItemAttribute>();
 }
 
-AFragment* UFragmentsComponent::GetItemByLocalId(int32 LocalId, const FString& ModelGuid)
+AFragment* UFragmentsComponent::GetItemByLocalId(int64 LocalId, const FString& ModelGuid)
 {
 	if (FragmentsImporter) return FragmentsImporter->GetItemByLocalId(LocalId, ModelGuid);
 	return nullptr;

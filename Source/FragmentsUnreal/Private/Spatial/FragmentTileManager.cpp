@@ -111,13 +111,13 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 	TileGenerator->GenerateTiles(VisibleSamples, FragmentRegistry);
 
 	// === STEP 3: Determine fragments to spawn/show/hide ===
-	TArray<int32> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
-	TArray<int32> ToHide = TileGenerator->GetFragmentsToUnload(SpawnedFragments);
+	TArray<int64> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
+	TArray<int64> ToHide = TileGenerator->GetFragmentsToUnload(SpawnedFragments);
 
 	// Check how many can be shown from cache vs need actual spawning
 	int32 CacheHits = 0;
-	TArray<int32> ActuallyNeedSpawn;
-	for (int32 LocalId : ToSpawn)
+	TArray<int64> ActuallyNeedSpawn;
+	for (int64 LocalId : ToSpawn)
 	{
 		if (HiddenFragments.Contains(LocalId))
 		{
@@ -138,7 +138,7 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 	       VisibleSamples.Num(), TileGenerator->GetTileCount(), ToSpawn.Num(), CacheHits, ToHide.Num());
 
 	// === STEP 4: Show cached fragments immediately (cache hits) ===
-	for (int32 LocalId : ToSpawn)
+	for (int64 LocalId : ToSpawn)
 	{
 		if (HiddenFragments.Contains(LocalId))
 		{
@@ -147,7 +147,7 @@ void UFragmentTileManager::UpdateVisibleTiles(const FVector& CameraLocation, con
 	}
 
 	// === STEP 5: Hide fragments that left frustum (don't destroy - keep in cache) ===
-	for (int32 LocalId : ToHide)
+	for (int64 LocalId : ToHide)
 	{
 		HideFragmentById(LocalId);
 	}
@@ -185,11 +185,11 @@ float UFragmentTileManager::ProcessSpawnChunkWithBudget(float BudgetMs)
 	}
 
 	// Get fragments to spawn - filter out those already spawned or in hidden cache
-	TArray<int32> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
+	TArray<int64> ToSpawn = TileGenerator->GetFragmentsToSpawn(SpawnedFragments);
 
 	// Filter out fragments that are in hidden cache (already handled)
-	TArray<int32> ActuallyNeedSpawn;
-	for (int32 LocalId : ToSpawn)
+	TArray<int64> ActuallyNeedSpawn;
+	for (int64 LocalId : ToSpawn)
 	{
 		if (!HiddenFragments.Contains(LocalId))
 		{
@@ -212,7 +212,7 @@ float UFragmentTileManager::ProcessSpawnChunkWithBudget(float BudgetMs)
 	}
 
 	// Sort by priority: non-deferred first, then by distance (closest first)
-	ActuallyNeedSpawn.Sort([this](const int32& A, const int32& B)
+	ActuallyNeedSpawn.Sort([this](const int64& A, const int64& B)
 	{
 		const FFragmentVisibilityData* DataA = FragmentRegistry ? FragmentRegistry->FindFragment(A) : nullptr;
 		const FFragmentVisibilityData* DataB = FragmentRegistry ? FragmentRegistry->FindFragment(B) : nullptr;
@@ -240,7 +240,7 @@ float UFragmentTileManager::ProcessSpawnChunkWithBudget(float BudgetMs)
 	const double MaxSpawnTimeSec = BudgetMs / 1000.0;
 	int32 SpawnedThisFrame = 0;
 
-	for (int32 LocalId : ActuallyNeedSpawn)
+	for (int64 LocalId : ActuallyNeedSpawn)
 	{
 		// Check time budget
 		const double ElapsedTime = FPlatformTime::Seconds() - StartTime;
@@ -325,7 +325,7 @@ void UFragmentTileManager::InitializePerSampleVisibility(UFragmentRegistry* InRe
 	       bEnableOcclusionDeferral ? TEXT("Enabled") : TEXT("Disabled"));
 }
 
-bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
+bool UFragmentTileManager::SpawnFragmentById(int64 LocalId)
 {
 	// Skip if already spawned (visible)
 	if (SpawnedFragments.Contains(LocalId))
@@ -356,7 +356,7 @@ bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
 	FFragmentItem* FragmentItem = nullptr;
 	if (!Wrapper->GetModelItemRef().FindFragmentByLocalId(LocalId, FragmentItem))
 	{
-		UE_LOG(LogFragmentTileManager, Warning, TEXT("SpawnFragmentById: Could not find fragment LocalId %d"), LocalId);
+		UE_LOG(LogFragmentTileManager, Warning, TEXT("SpawnFragmentById: Could not find fragment LocalId %lld"), LocalId);
 		return false;
 	}
 
@@ -417,7 +417,7 @@ bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
 		// Update LRU tracking
 		TouchFragment(LocalId);
 
-		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Spawned fragment LocalId %d (%lld KB)"),
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Spawned fragment LocalId %lld (%lld KB)"),
 		       LocalId, FragmentMemory / 1024);
 		return true;
 	}
@@ -429,14 +429,14 @@ bool UFragmentTileManager::SpawnFragmentById(int32 LocalId)
 		// Don't add to SpawnedFragmentActors since there's no actor
 		// Memory is tracked by the ISMC, not per-fragment
 
-		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Spawned GPU-instanced fragment LocalId %d (no actor)"), LocalId);
+		UE_LOG(LogFragmentTileManager, Verbose, TEXT("Spawned GPU-instanced fragment LocalId %lld (no actor)"), LocalId);
 		return true;
 	}
 
 	return false;
 }
 
-void UFragmentTileManager::HideFragmentById(int32 LocalId)
+void UFragmentTileManager::HideFragmentById(int64 LocalId)
 {
 	AFragment** ActorPtr = SpawnedFragmentActors.Find(LocalId);
 	if (!ActorPtr || !*ActorPtr)
@@ -453,10 +453,10 @@ void UFragmentTileManager::HideFragmentById(int32 LocalId)
 	SpawnedFragments.Remove(LocalId);
 	HiddenFragments.Add(LocalId);
 
-	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Hid fragment LocalId %d (cached)"), LocalId);
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Hid fragment LocalId %lld (cached)"), LocalId);
 }
 
-bool UFragmentTileManager::ShowFragmentById(int32 LocalId)
+bool UFragmentTileManager::ShowFragmentById(int64 LocalId)
 {
 	// Check if fragment is in hidden cache
 	if (!HiddenFragments.Contains(LocalId))
@@ -482,11 +482,11 @@ bool UFragmentTileManager::ShowFragmentById(int32 LocalId)
 	// Update LRU tracking
 	TouchFragment(LocalId);
 
-	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Showed fragment LocalId %d (cache hit)"), LocalId);
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Showed fragment LocalId %lld (cache hit)"), LocalId);
 	return true;
 }
 
-void UFragmentTileManager::UnloadFragmentById(int32 LocalId)
+void UFragmentTileManager::UnloadFragmentById(int64 LocalId)
 {
 	AFragment** ActorPtr = SpawnedFragmentActors.Find(LocalId);
 	if (!ActorPtr || !*ActorPtr)
@@ -515,7 +515,7 @@ void UFragmentTileManager::UnloadFragmentById(int32 LocalId)
 	// Update cache memory tracking
 	PerSampleCacheBytes = FMath::Max((int64)0, PerSampleCacheBytes - FragmentMemory);
 
-	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Unloaded fragment LocalId %d (%lld KB freed)"), LocalId, FragmentMemory / 1024);
+	UE_LOG(LogFragmentTileManager, Verbose, TEXT("Unloaded fragment LocalId %lld (%lld KB freed)"), LocalId, FragmentMemory / 1024);
 }
 
 int64 UFragmentTileManager::CalculateFragmentMemoryUsage(AFragment* Actor) const
@@ -607,7 +607,7 @@ bool UFragmentTileManager::IsLoading() const
 	return TotalFragmentsToSpawn > 0 && FragmentsSpawned < TotalFragmentsToSpawn;
 }
 
-void UFragmentTileManager::TouchFragment(int32 LocalId)
+void UFragmentTileManager::TouchFragment(int64 LocalId)
 {
 	if (!Importer)
 	{
@@ -651,9 +651,9 @@ void UFragmentTileManager::EvictFragmentsToFitBudget()
 	       PerSampleCacheBytes / (1024 * 1024), MaxCachedBytes / (1024 * 1024));
 
 	// Build list of eviction candidates from HIDDEN fragments only
-	TArray<int32> EvictionCandidates;
+	TArray<int64> EvictionCandidates;
 
-	for (int32 LocalId : HiddenFragments)
+	for (int64 LocalId : HiddenFragments)
 	{
 		double* LastUsedPtr = FragmentLastUsedTime.Find(LocalId);
 		double TimeSinceUsed = CurrentTime - (LastUsedPtr ? *LastUsedPtr : 0.0);
@@ -665,7 +665,7 @@ void UFragmentTileManager::EvictFragmentsToFitBudget()
 	}
 
 	// Sort by last used time (LRU first)
-	EvictionCandidates.Sort([this](const int32& A, const int32& B)
+	EvictionCandidates.Sort([this](const int64& A, const int64& B)
 	{
 		double TimeA = FragmentLastUsedTime.FindRef(A);
 		double TimeB = FragmentLastUsedTime.FindRef(B);
@@ -674,7 +674,7 @@ void UFragmentTileManager::EvictFragmentsToFitBudget()
 
 	// Evict fragments until under budget
 	int32 EvictedCount = 0;
-	for (int32 LocalId : EvictionCandidates)
+	for (int64 LocalId : EvictionCandidates)
 	{
 		if (!IsPerSampleMemoryOverBudget())
 		{
@@ -692,9 +692,9 @@ void UFragmentTileManager::EvictFragmentsToFitBudget()
 	}
 }
 
-TSet<int32> UFragmentTileManager::CollectRenderedFragments() const
+TSet<int64> UFragmentTileManager::CollectRenderedFragments() const
 {
-	TSet<int32> RenderedFragments;
+	TSet<int64> RenderedFragments;
 
 	if (!Importer)
 	{
@@ -751,6 +751,6 @@ void UFragmentTileManager::UpdateOcclusionTracking()
 		return;
 	}
 
-	TSet<int32> RenderedFragments = CollectRenderedFragments();
+	TSet<int64> RenderedFragments = CollectRenderedFragments();
 	OcclusionController->UpdateOcclusionTracking(RenderedFragments, SpawnedFragments);
 }

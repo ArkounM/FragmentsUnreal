@@ -23,6 +23,11 @@
 				"GeometryScriptingCore",
 				"GeometryCore"
 			]
+		},
+		{
+			"Name": "FragmentsEditor",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
 		}
 	],
 	"Plugins": [
