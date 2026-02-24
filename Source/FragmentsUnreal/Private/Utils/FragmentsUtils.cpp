@@ -196,11 +196,10 @@ void UFragmentsUtils::MapModelStructureToData(const SpatialStructure* InS, FFrag
 	const bool bEffectiveCategory = bHasCategory || !InheritedCategory.IsEmpty();
 	const bool bShouldStore = bHasLocalId && bEffectiveCategory;
 
-	FFragmentItem* FragmentItem = new FFragmentItem();
-	// Only proceed if we need to store the fragment data
+	// Only allocate and store when this node qualifies as a fragment
 	if (bShouldStore)
 	{
-		// Create a new FFragmentItem
+		FFragmentItem* FragmentItem = new FFragmentItem();
 
 		// Populate the fragment item with data from the SpatialStructure
 		FragmentItem->ModelGuid = ParentItem.ModelGuid;
@@ -209,7 +208,6 @@ void UFragmentsUtils::MapModelStructureToData(const SpatialStructure* InS, FFrag
 
 		// Store this FragmentItem as a child of the parent fragment item
 		ParentItem.FragmentChildren.Add(FragmentItem);
-
 	}
 
 

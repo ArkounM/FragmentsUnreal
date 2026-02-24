@@ -562,7 +562,30 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 	FragmentItem.Guid = ModelGuidStr;
 	FragmentItem.ModelGuid = ModelGuidStr;
 	FragmentItem.GlobalTransform = RootWorld;
+	UE_LOG(LogFragments, Log, TEXT("[DIAG] spatial_structure ptr: %p, has children: %s, children count: %d"),
+		spatial_structure,
+		(spatial_structure && spatial_structure->children()) ? TEXT("YES") : TEXT("NO"),
+		(spatial_structure && spatial_structure->children()) ? spatial_structure->children()->size() : 0);
+
 	UFragmentsUtils::MapModelStructureToData(spatial_structure, FragmentItem, TEXT(""));
+
+	UE_LOG(LogFragments, Log, TEXT("[DIAG] After MapModelStructureToData: FragmentChildren count = %d"),
+		FragmentItem.FragmentChildren.Num());
+	for (int32 ci = 0; ci < FMath::Min(FragmentItem.FragmentChildren.Num(), 5); ++ci)
+	{
+		FFragmentItem* C = FragmentItem.FragmentChildren[ci];
+		UE_LOG(LogFragments, Log, TEXT("[DIAG]   Child[%d]: LocalId=%lld, Category=%s, Children=%d"),
+			ci, C->LocalId, *C->Category, C->FragmentChildren.Num());
+	}
+
+	// Count total items recursively to verify hierarchy depth
+	int32 TotalItems = 0;
+	TFunction<void(const FFragmentItem&)> CountItems = [&](const FFragmentItem& Item) {
+		TotalItems++;
+		for (FFragmentItem* Child : Item.FragmentChildren) { CountItems(*Child); }
+	};
+	CountItems(FragmentItem);
+	UE_LOG(LogFragments, Log, TEXT("[DIAG] Total hierarchy items: %d"), TotalItems);
 
 	Wrapper->SetModelItem(FragmentItem);
 	FragmentModels.Add(ModelGuidStr, Wrapper);
@@ -598,9 +621,10 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 			const auto local_id = local_ids->Get(ItemId);
 
 			FFragmentItem* FoundFragmentItem = nullptr;
-			if (!Wrapper->GetModelItem().FindFragmentByLocalId(local_id, FoundFragmentItem))
+			if (!Wrapper->GetModelItemRef().FindFragmentByLocalId(local_id, FoundFragmentItem))
 			{
-				return FString();
+				UE_LOG(LogFragments, Warning, TEXT("[DIAG] FindFragmentByLocalId FAILED for local_id=%lld (ItemId=%lld) - skipping"), (int64)local_id, ItemId);
+				continue;
 			}
 
 			GetItemData(FoundFragmentItem);
@@ -627,6 +651,17 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 			}
 
 		}
+
+		UE_LOG(LogFragments, Log, TEXT("[DIAG] Sample mapping complete: %d sample groups processed"), SamplesByItem.Num());
+
+		// Recount items with samples after population
+		int32 PopulatedItems = 0;
+		TFunction<void(const FFragmentItem&)> CountPopulated = [&](const FFragmentItem& Item) {
+			if (Item.Samples.Num() > 0) PopulatedItems++;
+			for (FFragmentItem* Child : Item.FragmentChildren) { CountPopulated(*Child); }
+		};
+		CountPopulated(Wrapper->GetModelItemRef());
+		UE_LOG(LogFragments, Log, TEXT("[DIAG] Items with samples after mapping: %d / %d total"), PopulatedItems, TotalItems);
 
 		// Pre-extract all geometry data from FlatBuffers at load time
 		// This eliminates FlatBuffer access during spawn phase and prevents crashes
@@ -673,31 +708,39 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 
 		// Diagnostic counts for verification
 		AFragment* RootFrag = Wrapper->GetSpawnedFragment();
+		int32 FragmentActorCount = 0;
 		int32 BucketRootCount = 0;
 		int32 HISMCompCount = 0;
 		int32 TotalInstances = 0;
 		if (RootFrag)
 		{
-			TArray<AActor*> AttachedActors;
-			RootFrag->GetAttachedActors(AttachedActors, true);
-			for (AActor* A : AttachedActors)
+			// Collect RootFrag + all descendants into one list
+			TArray<AActor*> AllActors;
+			AllActors.Add(RootFrag);
+			RootFrag->GetAttachedActors(AllActors, false, true);
+			// bResetArray=false preserves RootFrag; bRecursive=true gets ALL descendants
+
+			for (AActor* A : AllActors)
 			{
 				if (AFragment* F = Cast<AFragment>(A))
 				{
-					if (F->GetBucketRoot() == F) BucketRootCount++;
-					const auto& Buckets = F->GetBuckets();
-					HISMCompCount += Buckets.Num();
-					for (const auto& Pair : Buckets)
+					FragmentActorCount++;
+					if (F->GetBucketRoot() == F)
 					{
-						if (Pair.Value) TotalInstances += Pair.Value->GetInstanceCount();
+						BucketRootCount++;
+						// Buckets TMap only lives on the BucketRoot
+						const auto& Buckets = F->GetBuckets();
+						HISMCompCount += Buckets.Num();
+						for (const auto& Pair : Buckets)
+						{
+							if (Pair.Value) TotalInstances += Pair.Value->GetInstanceCount();
+						}
 					}
 				}
 			}
 		}
-		UE_LOG(LogFragments, Log, TEXT("[COUNTS] %s: AFragment roots=%d, BucketRoots=%d, HISM components=%d, Total instances=%d"),
-			*InModelGuid,
-			ModelFragmentsMap.Contains(InModelGuid) ? ModelFragmentsMap[InModelGuid].Fragments.Num() : 0,
-			BucketRootCount, HISMCompCount, TotalInstances);
+		UE_LOG(LogFragments, Log, TEXT("[COUNTS] %s: AFragment actors=%d, BucketRoots=%d, HISM components=%d, Total instances=%d"),
+			*InModelGuid, FragmentActorCount, BucketRootCount, HISMCompCount, TotalInstances);
 
 		if (PackagesToSave.Num() > 0)
 		{
@@ -1121,7 +1164,9 @@ AFragment* UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, 
 	bool bUseDynamicMesh, bool bUseHISM, AFragment* BucketRoot,
 	int64 ParentFloorKey)
 {
-	UE_LOG(LogFragments, Log, TEXT("SpawnFragmentModel Start - In Parent: %p, OwnerRef: %p"), InParent, OwnerRef.Get());
+	UE_LOG(LogFragments, Log, TEXT("SpawnFragmentModel Start - LocalId=%lld, Category=%s, Children=%d, Samples=%d, bUseHISM=%d, BucketRoot=%p"),
+		InFragmentItem.LocalId, *InFragmentItem.Category, InFragmentItem.FragmentChildren.Num(),
+		InFragmentItem.Samples.Num(), (int32)bUseHISM, BucketRoot);
 
 	if (!InParent)
 	{
