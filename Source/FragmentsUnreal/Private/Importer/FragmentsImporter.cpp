@@ -523,19 +523,49 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 	const char* RawModelGuid = guid->c_str();
 	FString ModelGuidStr = UTF8_TO_TCHAR(RawModelGuid);
 
+	const auto* local_ids = ModelRef->local_ids();
+	const auto* _meshes = ModelRef->meshes();
+
+	// Root coordinate auto-detection: compute root transform from mesh coordinates
+	// Uses MakeTransform with bIsRootCoordinates=true to pick best XY vs XZ basis
 	const auto* spatial_structure = ModelRef->spatial_structure();
-	FTransform RootTransform = FTransform::Identity;
+	FTransform RootTransform = (_meshes && _meshes->coordinates())
+		? UFragmentsUtils::MakeTransform(_meshes->coordinates(), false, true)
+		: FTransform::Identity;
+
+	FVector RootOffset = FVector::ZeroVector;
+	if (!bBaseCoordinatesInitialized)
+	{
+		BaseCoordinates = RootTransform;
+		bBaseCoordinatesInitialized = true;
+		SceneZeroZOffset = -BaseCoordinates.GetLocation();
+	}
+
+	RootOffset = BaseCoordinates.GetLocation() - RootTransform.GetLocation();
+
+	FTransform RootWorld = RootTransform;
+	RootWorld.AddToTranslation(2 * RootOffset);
+	RootWorld.AddToTranslation(SceneZeroZOffset);
+
+	// Diagnostic logging for coordinate verification (Jairo's verification requirement)
+	UE_LOG(LogFragments, Log, TEXT("[COORD] ModelGuid: %s"), *ModelGuidStr);
+	UE_LOG(LogFragments, Log, TEXT("[COORD]   RootTransform Location: %s  Rotation: %s"),
+		*RootTransform.GetLocation().ToString(), *RootTransform.GetRotation().Rotator().ToString());
+	UE_LOG(LogFragments, Log, TEXT("[COORD]   BaseCoordinates Location: %s  Rotation: %s"),
+		*BaseCoordinates.GetLocation().ToString(), *BaseCoordinates.GetRotation().Rotator().ToString());
+	UE_LOG(LogFragments, Log, TEXT("[COORD]   SceneZeroZOffset: %s"), *SceneZeroZOffset.ToString());
+	UE_LOG(LogFragments, Log, TEXT("[COORD]   RootOffset: %s"), *RootOffset.ToString());
+	UE_LOG(LogFragments, Log, TEXT("[COORD]   Final RootWorld Location: %s  Rotation: %s"),
+		*RootWorld.GetLocation().ToString(), *RootWorld.GetRotation().Rotator().ToString());
+
 	FFragmentItem FragmentItem;
 	FragmentItem.Guid = ModelGuidStr;
 	FragmentItem.ModelGuid = ModelGuidStr;
-	FragmentItem.GlobalTransform = RootTransform;
+	FragmentItem.GlobalTransform = RootWorld;
 	UFragmentsUtils::MapModelStructureToData(spatial_structure, FragmentItem, TEXT(""));
 
 	Wrapper->SetModelItem(FragmentItem);
 	FragmentModels.Add(ModelGuidStr, Wrapper);
-
-	const auto* local_ids = ModelRef->local_ids();
-	const auto* _meshes = ModelRef->meshes();
 
 	// Loop through samples and spawn meshes
 	if (_meshes)
@@ -551,7 +581,7 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 		const auto* global_transforms = _meshes->global_transforms();
 
 		// Grouping samples by Item ID
-		TMap<int32, TArray<const Sample*>> SamplesByItem;
+		TMap<int64, TArray<const Sample*>> SamplesByItem;
 		for (flatbuffers::uoffset_t i = 0; i < samples->size(); i++)
 		{
 			const auto* sample = samples->Get(i);
@@ -560,7 +590,7 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 
 		for (const auto& Item : SamplesByItem)
 		{
-			int32 ItemId = Item.Key;
+			int64 ItemId = Item.Key;
 
 			const TArray<const Sample*> ItemSamples = Item.Value;
 
@@ -576,8 +606,9 @@ FString UFragmentsImporter::LoadFragment(const FString& FragPath)
 			GetItemData(FoundFragmentItem);
 
 			const auto* global_transform = global_transforms->Get(mesh);
-			FTransform GlobalTransform = UFragmentsUtils::MakeTransform(global_transform);
-			FoundFragmentItem->GlobalTransform = GlobalTransform;
+			FTransform ItemGlobal = UFragmentsUtils::MakeTransform(global_transform);
+			FTransform ItemWorld = ItemGlobal * RootWorld;
+			FoundFragmentItem->GlobalTransform = ItemWorld;
 
 			for (int32 i = 0; i < ItemSamples.Num(); i++)
 			{
@@ -639,6 +670,34 @@ void UFragmentsImporter::ProcessLoadedFragment(const FString& InModelGuid, AActo
 			Wrapper, bUseDynamicMesh, bUseHISM, BucketRoot);
 		UE_LOG(LogFragments, Log, TEXT("HOK path: Loaded model in [%s]s -> %s"),
 			*(FDateTime::Now() - StartTime).ToString(), *InModelGuid);
+
+		// Diagnostic counts for verification
+		AFragment* RootFrag = Wrapper->GetSpawnedFragment();
+		int32 BucketRootCount = 0;
+		int32 HISMCompCount = 0;
+		int32 TotalInstances = 0;
+		if (RootFrag)
+		{
+			TArray<AActor*> AttachedActors;
+			RootFrag->GetAttachedActors(AttachedActors, true);
+			for (AActor* A : AttachedActors)
+			{
+				if (AFragment* F = Cast<AFragment>(A))
+				{
+					if (F->GetBucketRoot() == F) BucketRootCount++;
+					const auto& Buckets = F->GetBuckets();
+					HISMCompCount += Buckets.Num();
+					for (const auto& Pair : Buckets)
+					{
+						if (Pair.Value) TotalInstances += Pair.Value->GetInstanceCount();
+					}
+				}
+			}
+		}
+		UE_LOG(LogFragments, Log, TEXT("[COUNTS] %s: AFragment roots=%d, BucketRoots=%d, HISM components=%d, Total instances=%d"),
+			*InModelGuid,
+			ModelFragmentsMap.Contains(InModelGuid) ? ModelFragmentsMap[InModelGuid].Fragments.Num() : 0,
+			BucketRootCount, HISMCompCount, TotalInstances);
 
 		if (PackagesToSave.Num() > 0)
 		{
@@ -1100,6 +1159,14 @@ AFragment* UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, 
 		FragmentModel->SetActorLabel(FragmentModel->GetCategory());
 #endif
 
+	// Auto-initialize HISM bucket root if needed (HOK convention)
+	if (bUseHISM && !BucketRoot)
+	{
+		BucketRoot = FragmentModel;
+		BucketRoot->SetAsBucketRoot(true);
+		BucketRoot->SetHISMEnabled(true);
+	}
+
 	// Create Meshes If Sample Exists
 	const TArray<FFragmentSample>& Samples = FragmentModel->GetSamples();
 	UE_LOG(LogFragments, Log, TEXT("Processing %d samples for FragmentModel"), Samples.Num());
@@ -1229,11 +1296,34 @@ AFragment* UFragmentsImporter::SpawnFragmentModel(FFragmentItem InFragmentItem, 
 			// ==========================================
 			if (bUseHISM && BucketRoot && material)
 			{
-				UMaterialInterface* MatIF = Mesh->GetMaterial(0);
+				UMaterialInterface* MatIF = nullptr;
+#if WITH_EDITOR
+				// Editor: static meshes carry a MIC on slot 0 via AddMaterialToMesh
+				MatIF = Mesh->GetMaterial(0);
+#else
+				// Runtime: reuse/create a MID per material index on the wrapper
+				if (InWrapperRef)
+				{
+					if (UMaterialInstanceDynamic** FoundMid = InWrapperRef->GetMaterialsMap().Find(Sample.MaterialIndex))
+					{
+						MatIF = *FoundMid;
+					}
+					else
+					{
+						uint8 R = material->r(), G = material->g(), B = material->b(), A = material->a();
+						UMaterialInterface* BaseMat = (A < 255) ? BaseGlassMaterial.Get() : BaseMaterial.Get();
+						UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(BaseMat, BucketRoot);
+						MID->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor(R / 255.f, G / 255.f, B / 255.f, A / 255.f));
+						if (A < 255) MID->SetScalarParameterValue(TEXT("Opacity"), A / 255.f);
+						InWrapperRef->GetMaterialsMap().Add(Sample.MaterialIndex, MID);
+						MatIF = MID;
+					}
+				}
 				if (!MatIF)
 				{
 					MatIF = GetPooledMaterial(material->r(), material->g(), material->b(), material->a(), material->a() < 255);
 				}
+#endif
 				const FTransform WorldXf = LocalTransform * FragmentModel->GetActorTransform();
 				BucketRoot->AddHISMInstance(Mesh, MatIF, WorldXf, InFragmentItem.LocalId, CurrentFloorKey);
 			}
@@ -2163,23 +2253,79 @@ FName UFragmentsImporter::AddMaterialToMesh(UStaticMesh*& CreatedMesh, const Mat
 {
 	if (!RefMaterial || !CreatedMesh) return FName();
 
-	// Extract material properties
-	uint8 R = RefMaterial->r();
-	uint8 G = RefMaterial->g();
-	uint8 B = RefMaterial->b();
-	uint8 A = RefMaterial->a();
-	bool bIsGlass = A < 255; // Glass is determined by transparency
+	float R = RefMaterial->r() / 255.f;
+	float G = RefMaterial->g() / 255.f;
+	float B = RefMaterial->b() / 255.f;
+	float A = RefMaterial->a() / 255.f;
+	bool bHasTransparency = A < 1.0f;
 
-	// Use pooled material for CRC-based deduplication
-	UMaterialInstanceDynamic* DynamicMaterial = GetPooledMaterial(R, G, B, A, bIsGlass);
+	UMaterialInterface* BaseMat = bHasTransparency ? BaseGlassMaterial.Get() : BaseMaterial.Get();
+	if (!BaseMat)
+	{
+		UE_LOG(LogFragments, Error, TEXT("Unable to load Base Material"));
+		return FName();
+	}
+
+#if WITH_EDITOR
+	// Editor path: create UMaterialInstanceConstant for disk persistence
+	FString MaterialName = FString::Printf(TEXT("mat_%d_%d_%d_%d"),
+		FMath::RoundToInt(R * 255), FMath::RoundToInt(G * 255),
+		FMath::RoundToInt(B * 255), FMath::RoundToInt(A * 255));
+	FString PackagePath = TEXT("/Game/Buildings") / InModelGuid / MaterialName;
+	FString UniquePackageName = FPackageName::ObjectPathToPackageName(PackagePath);
+	FString PackageFileName = FPackageName::LongPackageNameToFilename(UniquePackageName, FPackageName::GetAssetPackageExtension());
+	const FString SamplePath = PackagePath + TEXT(".") + MaterialName;
+
+	UMaterialInstanceConstant* MaterialInstance = nullptr;
+	if (MaterialsCache.Contains(SamplePath))
+	{
+		MaterialInstance = MaterialsCache[SamplePath];
+	}
+	else if (FPaths::FileExists(PackageFileName))
+	{
+		UPackage* ExistingPackage = LoadPackage(nullptr, *PackagePath, LOAD_None);
+		if (ExistingPackage)
+		{
+			MaterialInstance = FindObject<UMaterialInstanceConstant>(ExistingPackage, *MaterialName);
+		}
+	}
+	else
+	{
+		UPackage* MaterialPackage = CreatePackage(*PackagePath);
+		MaterialInstance = NewObject<UMaterialInstanceConstant>(UMaterialInstanceConstant::StaticClass());
+		MaterialInstance->SetParentEditorOnly(BaseMat);
+		MaterialInstance->SetVectorParameterValueEditorOnly(TEXT("BaseColor"), FLinearColor(R, G, B, A));
+		if (bHasTransparency)
+		{
+			MaterialInstance->SetScalarParameterValueEditorOnly(TEXT("Opacity"), A);
+		}
+
+		if (!FPaths::FileExists(PackageFileName))
+		{
+			MaterialPackage->FullyLoad();
+			MaterialInstance->Rename(*MaterialName, MaterialPackage);
+			MaterialInstance->SetFlags(RF_Public | RF_Standalone);
+			MaterialPackage->MarkPackageDirty();
+			FAssetRegistryModule::AssetCreated(MaterialInstance);
+			PackagesToSave.Add(MaterialPackage);
+		}
+
+		MaterialsCache.Add(SamplePath, MaterialInstance);
+	}
+
+	return CreatedMesh->AddMaterial(MaterialInstance);
+#else
+	// Runtime path: use CRC-pooled MID for deduplication
+	UMaterialInstanceDynamic* DynamicMaterial = GetPooledMaterial(
+		RefMaterial->r(), RefMaterial->g(), RefMaterial->b(), RefMaterial->a(), bHasTransparency);
 	if (!DynamicMaterial)
 	{
 		UE_LOG(LogFragments, Error, TEXT("Failed to get pooled material"));
 		return FName();
 	}
 
-	// Add Material
 	return CreatedMesh->AddMaterial(DynamicMaterial);
+#endif
 }
 
 bool UFragmentsImporter::TriangulatePolygonWithHoles(const TArray<FVector>& Points,
